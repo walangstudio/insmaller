@@ -1,0 +1,158 @@
+# Recipe-pack plugin: language package managers. Parse = versioned_pkg →
+# {{ name }} + {{ version }} ("" if absent). Namespaced `lang-pkg/<name>`.
+
+[[desugar]]
+prefix = "pip:"
+recipe = "pip"
+parse  = "versioned_pkg"
+[[desugar]]
+prefix = "pipx:"
+recipe = "pipx"
+parse  = "versioned_pkg"
+[[desugar]]
+prefix = "cargo:"
+recipe = "cargo"
+parse  = "versioned_pkg"
+[[desugar]]
+prefix = "gem:"
+recipe = "gem"
+parse  = "versioned_pkg"
+[[desugar]]
+prefix = "dotnet-tool:"
+recipe = "dotnet-tool"
+parse  = "versioned_pkg"
+[[desugar]]
+prefix = "pnpm:"
+recipe = "pnpm"
+parse  = "versioned_pkg"
+[[desugar]]
+prefix = "yarn:"
+recipe = "yarn"
+parse  = "versioned_pkg"
+[[desugar]]
+prefix = "go-install:"
+recipe = "go-install"
+parse  = "versioned_pkg"
+[[desugar]]
+prefix = "rustup:"
+recipe = "rustup"
+parse  = "versioned_pkg"
+[[desugar]]
+prefix = "asdf:"
+recipe = "asdf"
+parse  = "versioned_pkg"
+[[desugar]]
+prefix = "mise:"
+recipe = "mise"
+parse  = "versioned_pkg"
+[[desugar]]
+prefix = "composer:"
+recipe = "composer"
+parse  = "versioned_pkg"
+[[desugar]]
+prefix = "deno:"
+recipe = "deno"
+parse  = "versioned_pkg"
+[[desugar]]
+prefix = "bun:"
+recipe = "bun"
+parse  = "versioned_pkg"
+
+[[recipe]]
+name = "pip"
+[[recipe.install]]
+type = "shell"
+script = "python3 -m pip install --user {{ name }}{% if version %}=={{ version }}{% endif %}"
+
+[[recipe]]
+name = "pipx"
+[[recipe.install]]
+type = "exec"
+program = "pipx"
+argline = "install {{ name }}{% if version %}=={{ version }}{% endif %}"
+
+[[recipe]]
+name = "cargo"
+[[recipe.install]]
+type = "exec"
+program = "cargo"
+argline = "install {{ name }}{% if version %} --version {{ version }}{% endif %}"
+
+[[recipe]]
+name = "gem"
+[[recipe.install]]
+type = "exec"
+program = "gem"
+argline = "install {{ name }}{% if version %} -v {{ version }}{% endif %} --user-install"
+
+[[recipe]]
+name = "dotnet-tool"
+[[recipe.install]]
+type = "exec"
+program = "dotnet"
+argline = "tool install -g {{ name }}{% if version %} --version {{ version }}{% endif %}"
+
+[[recipe]]
+name = "pnpm"
+[[recipe.install]]
+type = "exec"
+program = "pnpm"
+argline = "add -g {{ name }}{% if version %}@{{ version }}{% endif %}"
+
+[[recipe]]
+name = "yarn"
+[[recipe.install]]
+type = "exec"
+program = "yarn"
+argline = "global add {{ name }}{% if version %}@{{ version }}{% endif %}"
+
+[[recipe]]
+name = "go-install"
+[[recipe.install]]
+type = "exec"
+program = "go"
+argline = "install {{ name }}{% if version %}@{{ version }}{% else %}@latest{% endif %}"
+
+# rustup manages toolchains, not packages: {{ name }} is a toolchain spec
+# (e.g. `stable`, `1.79.0`); {{ version }} is unused.
+[[recipe]]
+name = "rustup"
+[[recipe.install]]
+type = "exec"
+program = "rustup"
+argline = "toolchain install {{ name }}"
+
+[[recipe]]
+name = "asdf"
+[[recipe.install]]
+type = "exec"
+program = "asdf"
+argline = "install {{ name }} {% if version %}{{ version }}{% else %}latest{% endif %}"
+
+[[recipe]]
+name = "mise"
+[[recipe.install]]
+type = "exec"
+program = "mise"
+argline = "use -g {{ name }}{% if version %}@{{ version }}{% endif %}"
+
+[[recipe]]
+name = "composer"
+[[recipe.install]]
+type = "exec"
+program = "composer"
+argline = "global require {{ name }}{% if version %}:{{ version }}{% endif %}"
+
+[[recipe]]
+name = "deno"
+[[recipe.install]]
+type = "exec"
+program = "deno"
+argline = "install -gA {{ name }}"
+
+[[recipe]]
+name = "bun"
+[[recipe.install]]
+type = "exec"
+program = "bun"
+argline = "add -g {{ name }}{% if version %}@{{ version }}{% endif %}"

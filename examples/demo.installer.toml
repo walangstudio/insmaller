@@ -1,0 +1,24 @@
+# Minimal, self-contained engine config for the demo (NO plugin packs, NO
+# network). Inline-steps catalog entries need only [settings]; the `hello:`
+# desugar below additionally shows the terse spec path.
+[settings]
+sentinel_dir_name = "insmaller-demo"
+# Setup-TUI palette. "high-contrast" so `insmaller setup` visibly differs
+# from the default. Override at runtime with NO_COLOR=1 or
+# INSMALLER_THEME=mono, or uncomment `colors` for per-role hex.
+theme = "high-contrast"
+# colors = { accent = "#00afaf", accent_fg = "#000000", muted = "#5f5f5f", error = "#d70000" }
+# Sibling files (relative to this toml) so callers pass only --config:
+catalog = "demo.catalog.json"
+wizard  = "demo.wizard.toml"
+
+[[desugar]]
+prefix = "hello:"
+recipe = "hello"
+parse  = "single_arg"
+
+[[recipe]]
+name = "hello"
+[[recipe.install]]
+type = "shell"
+script = "echo hello-from-recipe {{ arg }}"

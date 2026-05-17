@@ -1,0 +1,108 @@
+# Recipe-pack plugin: OS package managers (Linux + macOS + Windows).
+# Recipes are namespaced `sys-pkg/<name>` by the engine; prefixes are global.
+# Parse = rest_verbatim → {{ packages }} (whitespace-split by exec).
+
+[[desugar]]
+prefix = "apt:"
+recipe = "apt"
+parse  = "rest_verbatim"
+[[desugar]]
+prefix = "apk:"
+recipe = "apk"
+parse  = "rest_verbatim"
+[[desugar]]
+prefix = "dnf:"
+recipe = "dnf"
+parse  = "rest_verbatim"
+[[desugar]]
+prefix = "pacman:"
+recipe = "pacman"
+parse  = "rest_verbatim"
+[[desugar]]
+prefix = "brew:"
+recipe = "brew"
+parse  = "rest_verbatim"
+[[desugar]]
+prefix = "winget:"
+recipe = "winget"
+parse  = "rest_verbatim"
+[[desugar]]
+prefix = "scoop:"
+recipe = "scoop"
+parse  = "rest_verbatim"
+[[desugar]]
+prefix = "choco:"
+recipe = "choco"
+parse  = "rest_verbatim"
+[[desugar]]
+prefix = "zypper:"
+recipe = "zypper"
+parse  = "rest_verbatim"
+
+[[recipe]]
+name = "apt"
+[[recipe.install]]
+type = "shell"
+script = "sudo DEBIAN_FRONTEND=noninteractive apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y {{ packages }}"
+[[recipe.uninstall]]
+type = "shell"
+script = "sudo apt-get remove -y {{ packages }}"
+
+[[recipe]]
+name = "apk"
+[[recipe.install]]
+type = "exec"
+program = "apk"
+argline = "add {{ packages }}"
+
+[[recipe]]
+name = "dnf"
+[[recipe.install]]
+type = "exec"
+program = "dnf"
+argline = "install -y {{ packages }}"
+
+[[recipe]]
+name = "pacman"
+[[recipe.install]]
+type = "exec"
+program = "pacman"
+argline = "-S --noconfirm {{ packages }}"
+
+[[recipe]]
+name = "brew"
+[[recipe.install]]
+type = "exec"
+program = "brew"
+argline = "install {{ packages }}"
+
+[[recipe]]
+name = "winget"
+[[recipe.install]]
+type = "exec"
+program = "winget"
+argline = "install --silent --accept-package-agreements {{ packages }}"
+
+[[recipe]]
+name = "scoop"
+[[recipe.install]]
+type = "exec"
+program = "scoop"
+argline = "install {{ packages }}"
+
+[[recipe]]
+name = "choco"
+[[recipe.install]]
+type = "exec"
+program = "choco"
+argline = "install -y {{ packages }}"
+
+[[recipe]]
+name = "zypper"
+[[recipe.install]]
+type = "exec"
+program = "zypper"
+argline = "install -y {{ packages }}"
+[[recipe.uninstall]]
+type = "shell"
+script = "sudo zypper remove -y {{ packages }}"

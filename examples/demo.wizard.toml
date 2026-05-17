@@ -1,0 +1,21 @@
+# Demo wizard: page 1 picks tools from the catalog, page 2 collects the
+# output dir. Interactive (TTY) = the ratatui progress TUI; unattended
+# (--answers / no TTY) = the non-blocking StaticAnswerer.
+
+[[page]]
+id = "tools"
+title = "Pick demo tools"
+description = "Space to toggle, Enter for Next."
+[[page.field]]
+id = "INSTALL_TOOLS"
+type = "multiselect"
+source = "catalog.tools"
+
+[[page]]
+id = "out"
+title = "Output location"
+[[page.field]]
+id = "DEMO_DIR"
+type = "text"
+prompt = "Directory to write demo files into"
+required = true

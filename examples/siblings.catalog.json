@@ -1,0 +1,63 @@
+{
+  "_comment": "Real, runnable insmaller catalog for the F:/opt/projs/ai/claude sibling apps, using the fully-generic inline `steps` path (no tool-specific engine code, no new desugar prefixes). Load with: insmaller install <key> --config installer.toml --catalog examples/siblings.catalog.json",
+
+  "tools": [
+    { "key": "node",  "install": "nvm:lts" },
+    { "key": "uv",    "install": "curl -LsSf https://astral.sh/uv/install.sh | sh" },
+    { "key": "cargo", "install": "curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh" },
+
+    {
+      "key": "mememo",
+      "dependencies": ["uv"],
+      "steps": [
+        { "type": "shell", "script": "git clone --depth=1 https://example/mememo.git mememo", "dir": "~/.insmaller-src" },
+        { "type": "shell", "dir": "~/.insmaller-src/mememo", "script": "uv venv && uv pip install -e ." },
+        { "type": "exec", "program": "claude", "argline": "mcp add mememo -- python -m mememo" }
+      ]
+    },
+
+    {
+      "key": "chatgipite",
+      "dependencies": ["node"],
+      "steps": [
+        { "type": "shell", "script": "git clone --depth=1 https://example/chatgipite.git chatgipite", "dir": "~/.insmaller-src" },
+        { "type": "exec", "program": "npm", "argline": "ci --omit=dev", "dir": "~/.insmaller-src/chatgipite" },
+        { "type": "merge_json", "target": "~/.claude.json",
+          "command": "echo {\"mcpServers\":{\"chatgipite\":{\"command\":\"node\",\"args\":[\"server.js\"]}}}" },
+        { "type": "symlink", "src": "~/.insmaller-src/chatgipite/skill", "dest": "~/.claude/skills/chatgipite" }
+      ]
+    },
+
+    {
+      "key": "gd-skills",
+      "steps": [
+        { "type": "shell", "script": "git clone --depth=1 https://example/gd-skills.git gd-skills", "dir": "~/.insmaller-src" },
+        { "type": "copy", "src": "~/.insmaller-src/gd-skills/skills",   "dest": "~/.claude/skills" },
+        { "type": "copy", "src": "~/.insmaller-src/gd-skills/agents",   "dest": "~/.claude/agents" },
+        { "type": "copy", "src": "~/.insmaller-src/gd-skills/commands", "dest": "~/.claude/commands" }
+      ]
+    },
+
+    {
+      "key": "borch",
+      "dependencies": ["cargo"],
+      "steps": [
+        { "type": "shell", "script": "git clone --depth=1 https://example/borch.git borch", "dir": "~/.insmaller-src" },
+        { "type": "exec", "program": "cargo", "argline": "build --release", "dir": "~/.insmaller-src/borch" },
+        { "type": "copy", "src": "~/.insmaller-src/borch/target/release/borch", "dest": "~/.local/bin/borch" }
+      ]
+    },
+
+    {
+      "key": "pair-pressure",
+      "dependencies": ["uv"],
+      "steps": [
+        { "type": "prompt", "name": "PP_AUTHOR", "message": "Author name:", "required": true },
+        { "type": "exec", "program": "uv", "argline": "tool install pair-pressure" },
+        { "type": "symlink", "src": "~/.local/share/pair-pressure/skill", "dest": "~/.claude/skills/pair-pressure" },
+        { "type": "save_input", "name": "PP_AUTHOR", "file": "~/.config/pair-pressure/.env" },
+        { "type": "ensure_line", "file": "~/.bashrc", "line": "export PAIR_PRESSURE_AUTHOR={{ PP_AUTHOR }}", "requires": ["PP_AUTHOR"] }
+      ]
+    }
+  ]
+}
