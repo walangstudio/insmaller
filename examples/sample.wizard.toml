@@ -1,0 +1,43 @@
+# Sample insmaller wizard. Run: insmaller setup --wizard examples/sample.wizard.toml
+#   --catalog examples/siblings.catalog.json --config installer.toml [--answers F]
+# Pages run top-to-bottom; a page/field with a failing `condition` is skipped.
+# multiselect/single_select with source="catalog.<kind>" -> the answers ARE
+# the catalog keys to install; their options carry group/description/default.
+
+[[page]]
+id = "cli"
+title = "AI coding CLI"
+description = "Pick the assistant to install."
+[[page.field]]
+id = "CODING_CLI"
+type = "single_select"
+source = "catalog.clis"
+
+[[page]]
+id = "tools"
+title = "Developer tools"
+description = "Space-grouped; blank picks the defaults."
+[[page.field]]
+id = "INSTALL_TOOLS"
+type = "multiselect"
+source = "catalog.tools"
+
+[[page]]
+id = "keys"
+title = "API keys"
+description = "Only asked if a tool that needs one was selected."
+condition = "'pair-pressure' in ${INSTALL_TOOLS}"
+[[page.field]]
+id = "PP_AUTHOR"
+type = "text"
+prompt = "Your author name"
+required = true
+
+[[page]]
+id = "git"
+title = "Git identity"
+[[page.field]]
+id = "GIT_AUTHOR_EMAIL"
+type = "text"
+prompt = "Commit email (blank to skip)"
+required = false

@@ -1,0 +1,284 @@
+# insmaller engine config. Processors are built-in code; this file declares
+# settings, the default lifecycle, the desugar table (terse spec -> recipe),
+# and the recipes. Recipes reproduce each codetainyrrr handler VERBATIM so the
+# existing e2e suite stays the regression oracle.
+#
+# expand_home note: params named `dest` / `target` are home-expanded by the
+# engine (orchestrator, B4) before rendering — mirroring the handlers, which
+# call expand_home() in Rust before substituting into the shell script.
+#
+# script_file note: recipes whose verbatim body uses shell command
+# substitution load the script from recipes/<name>.sh via the shell
+# processor's `script_file` option (B3), not inline (the data-file write guard
+# rejects shell substitution syntax inline). gh-release and go-toolchain are
+# the only such recipes; their bodies are the verbatim github_release.rs /
+# go_lang.rs scripts.
+
+[settings]
+sentinel_dir_name = "codetainyrrr"
+# Replaces the hardcoded enriched_path() list (handlers/mod.rs). Globs are
+# expanded fresh on every PATH resolve so nvm-then-npm works with no PATH step.
+path_globs = [
+  "~/.local/bin",
+  "~/.cargo/bin",
+  "~/.deno/bin",
+  "~/.bun/bin",
+  "~/.dotnet",
+  "~/go/sdk/bin",
+  "~/.sdkman/candidates/java/current/bin",
+  "~/.nvm/versions/node/*/bin",
+]
+
+# Setup-TUI palette. Preset: "default" | "mono" | "high-contrast".
+# Env overrides config: NO_COLOR (any value) forces mono; INSMALLER_THEME
+# overrides this preset. Optional per-color hex overrides layer on top.
+# theme = "default"
+# colors = { accent = "#00afaf", accent_fg = "#000000", muted = "#5f5f5f", error = "#d70000" }
+
+# ── desugar: terse spec prefix -> recipe + remainder parser ────────────────
+# Order is priority. shell_literal is the catch-all (matched only when no
+# prefix rule fits), mirroring codetainyrrr registry's curl|bash path.
+
+[[desugar]]
+prefix = "npm:"
+recipe = "npm-global"
+parse  = "rest_verbatim"
+
+[[desugar]]
+prefix = "apt:"
+recipe = "apt-get"
+parse  = "rest_verbatim"
+
+[[desugar]]
+prefix = "uv:"
+recipe = "uv-tool"
+parse  = "uv_spec"
+
+[[desugar]]
+prefix = "nvm:"
+recipe = "nvm-node"
+parse  = "nvm_version"
+
+[[desugar]]
+prefix = "sdkman:"
+recipe = "sdkman-candidate"
+parse  = "single_arg"
+
+[[desugar]]
+prefix = "corepack:"
+recipe = "corepack-prepare"
+parse  = "single_arg"
+
+[[desugar]]
+prefix = "go:"
+recipe = "go-toolchain"
+parse  = "single_arg"
+
+[[desugar]]
+prefix = "python:"
+recipe = "python-tools"
+parse  = "single_arg"
+
+[[desugar]]
+prefix = "gh:"
+recipe = "gh-release"
+parse  = "gh_repo_asset"
+
+[[desugar]]
+prefix = "git:"
+recipe = "git-clone"
+parse  = "git_url_dest"
+
+[[desugar]]
+prefix = "merge-json:"
+recipe = "merge-json"
+parse  = "merge_json_spec"
+
+[[desugar]]
+prefix = "marketplace:"
+recipe = "marketplace"
+parse  = "marketplace_spec"
+
+# catch-all (curl ... | bash). prefix empty + shell_literal => last resort.
+[[desugar]]
+prefix = ""
+recipe = "shell-pipe"
+parse  = "shell_literal"
+
+# ── recipes ────────────────────────────────────────────────────────────────
+
+# npm.rs: npm install -g <pkgs...> (handler splits packages on whitespace;
+# the exec processor whitespace-splits argline, identical behavior).
+[[recipe]]
+name = "npm-global"
+[[recipe.install]]
+type = "exec"
+program = "npm"
+argline = "install -g {{ packages }}"
+[[recipe.uninstall]]
+type = "exec"
+program = "npm"
+argline = "uninstall -g {{ packages }}"
+
+# apt.rs
+[[recipe]]
+name = "apt-get"
+[[recipe.install]]
+type = "shell"
+script = "sudo DEBIAN_FRONTEND=noninteractive apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y {{ packages }}"
+[[recipe.uninstall]]
+type = "shell"
+script = "sudo apt-get remove -y {{ packages }}"
+
+# uv.rs: uv tool install <pkg> [--from <src>]. from is "" when absent;
+# the {% if from %} guard reproduces the optional --from exactly.
+[[recipe]]
+name = "uv-tool"
+[[recipe.install]]
+type = "exec"
+program = "uv"
+argline = "tool install {{ package }}{% if from %} --from {{ from }}{% endif %}"
+[[recipe.uninstall]]
+type = "exec"
+program = "uv"
+argline = "tool uninstall {{ package }}"
+
+# nvm.rs — install script verbatim (no command substitution; safe inline).
+[[recipe]]
+name = "nvm-node"
+[[recipe.install]]
+type = "shell"
+script = """
+set -e
+export NVM_DIR="$HOME/.nvm"
+if [ ! -f "$NVM_DIR/nvm.sh" ]; then
+    curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+fi
+. "$NVM_DIR/nvm.sh"
+nvm install {{ install_arg }}
+nvm alias default '{{ alias_target }}'
+nvm use default
+node --version
+npm --version
+"""
+[[recipe.uninstall]]
+type = "shell"
+script = """
+export NVM_DIR="$HOME/.nvm"
+[ -f "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" && nvm uninstall '{{ alias_target }}' || true
+"""
+
+# sdkman: install candidate inside an sdkman shell.
+[[recipe]]
+name = "sdkman-candidate"
+[[recipe.install]]
+type = "shell"
+script = """
+set -e
+export SDKMAN_DIR="$HOME/.sdkman"
+if [ ! -f "$SDKMAN_DIR/bin/sdkman-init.sh" ]; then
+    curl -fsSL https://get.sdkman.io | bash
+fi
+. "$SDKMAN_DIR/bin/sdkman-init.sh"
+sdk install {{ arg }}
+"""
+
+# corepack.rs
+[[recipe]]
+name = "corepack-prepare"
+[[recipe.install]]
+type = "exec"
+program = "corepack"
+argline = "prepare {{ arg }}@latest --activate"
+
+# go_lang.rs — verbatim body uses command substitution; loaded from
+# recipes/go-toolchain.sh by the shell processor (B3). arg ignored.
+[[recipe]]
+name = "go-toolchain"
+[[recipe.install]]
+type = "shell"
+script_file = "recipes/go-toolchain.sh"
+
+# python.rs python:tools — verbatim; bodies embedded as consts in scripts.rs.
+[[recipe]]
+name = "python-tools"
+[[recipe.install]]
+type = "shell"
+script_file = "recipes/python-tools.sh"
+[[recipe.uninstall]]
+type = "shell"
+script_file = "recipes/python-tools-uninstall.sh"
+
+# github_release.rs — verbatim body uses command substitution; loaded from
+# recipes/gh-release.sh by the shell processor (B3).
+[[recipe]]
+name = "gh-release"
+[[recipe.install]]
+type = "shell"
+script_file = "recipes/gh-release.sh"
+[[recipe.uninstall]]
+type = "shell"
+script = 'rm -f "$HOME/.local/bin/{{ key }}"'
+
+# git_clone.rs — verbatim (dest is home-expanded by the engine first).
+[[recipe]]
+name = "git-clone"
+[[recipe.install]]
+type = "shell"
+script = """
+if [ -d "{{ dest }}/.git" ]; then
+    echo "git-clone: {{ dest }} already a git checkout, skipping" >&2
+    exit 0
+fi
+git clone --depth=1 {{ url }} "{{ dest }}"
+"""
+[[recipe.uninstall]]
+type = "shell"
+script = 'rm -rf "{{ dest }}"'
+
+# merge_json.rs — native processor (deep JSON merge has no faithful shell form).
+[[recipe]]
+name = "merge-json"
+[[recipe.install]]
+type = "merge_json"
+target = "{{ target }}"
+command = "{{ command }}"
+
+# marketplace.rs equivalent — fully generic: a check_command guard + two
+# exec steps (no tool-specific native processor).
+[[recipe]]
+name = "marketplace"
+[[recipe.install]]
+type = "check_command"
+program = "claude"
+on_missing = "plugin '{{ plugin }}' is a Claude Code marketplace plugin but 'claude' is not installed. Set CODING_CLI=claude or remove it."
+[[recipe.install]]
+type = "exec"
+program = "claude"
+argline = "plugin marketplace add {{ repo }}"
+[[recipe.install]]
+type = "exec"
+program = "claude"
+argline = "plugin install {{ plugin }}@{{ marketplace }}"
+[[recipe.uninstall]]
+type = "exec"
+program = "claude"
+argline = "plugin uninstall {{ plugin }}"
+
+# raw curl ... | bash pipelines.
+[[recipe]]
+name = "shell-pipe"
+[[recipe.install]]
+type = "shell"
+script = "{{ script }}"
+
+# ── recipe-pack plugins (E2) ───────────────────────────────────────────────
+# Paths resolved relative to this file's dir. Recipes namespaced
+# `<name>/<recipe>`; prefixes global; core wins prefix collisions.
+[[plugin]]
+name = "sys-pkg"
+path = "plugins/sys-pkg"
+
+[[plugin]]
+name = "lang-pkg"
+path = "plugins/lang-pkg"

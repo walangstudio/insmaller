@@ -1,0 +1,26 @@
+{
+  "_comment": "Safe demo catalog. `demo` uses inline generic steps and writes ONLY under DEMO_DIR (resolved from the env via the prompt processor). Exercises: prompt(EnvResolver, non-blocking) + register/templating + shell(platform) + ensure_line(idempotent) + copy + sentinel_meta. `hello` shows the terse desugar path. No network, no builds.",
+
+  "tools": [
+    {
+      "key": "demo",
+      "group": "demo",
+      "description": "writes a few files under DEMO_DIR (safe, idempotent)",
+      "default": true,
+      "steps": [
+        { "type": "prompt", "name": "DEMO_DIR", "message": "Output directory", "required": true },
+        { "type": "shell", "script": "echo insmaller-demo-ok > {{ DEMO_DIR }}/hello.txt" },
+        { "type": "ensure_line", "file": "{{ DEMO_DIR }}/profile.txt", "line": "export INSMALLER_DEMO=1" },
+        { "type": "copy", "src": "{{ DEMO_DIR }}/hello.txt", "dest": "{{ DEMO_DIR }}/copied/hello.txt" },
+        { "type": "sentinel_meta" }
+      ]
+    },
+
+    {
+      "key": "hello",
+      "group": "demo",
+      "description": "terse spec path (hello: desugar -> recipe)",
+      "install": "hello:world"
+    }
+  ]
+}
