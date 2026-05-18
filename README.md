@@ -1,6 +1,6 @@
 # insmaller
 
-![version](https://img.shields.io/badge/version-0.2.0-blue)
+![version](https://img.shields.io/badge/version-0.2.1-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![rust](https://img.shields.io/badge/rust-1.78%2B-orange)
 ![tests](https://img.shields.io/badge/tests-203%20passing-brightgreen)
