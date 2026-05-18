@@ -1,0 +1,11 @@
+# Normalize line endings regardless of each contributor's git config.
+# Everything is LF in the repo; LF in the working tree too (so shell
+# scripts and CI YAML are never CRLF on Linux/macOS runners).
+* text=auto eol=lf
+
+# PowerShell is the exception: keep CRLF in the working tree on checkout.
+*.ps1 text eol=crlf
+
+# Treat the release binary / archives as binary if ever committed.
+*.tar.gz binary
+*.zip binary
