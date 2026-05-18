@@ -104,6 +104,10 @@ async fn main() -> ExitCode {
         Some("install") => cmd_op(&args[1..], Op::Install).await,
         Some("uninstall") | Some("remove") => cmd_op(&args[1..], Op::Uninstall).await,
         Some("setup") => cmd_setup(&args[1..]).await,
+        Some("-V") | Some("--version") | Some("version") => {
+            println!("insmaller {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
         Some("-h") | Some("--help") | Some("help") | None => {
             eprintln!(
                 "usage:\n  insmaller <key…>            [--config F] [--catalog F] [--dry-run] [--json]   (defaults to install)\n  insmaller install   <key…> [--config F] [--catalog F] [--dry-run] [--json]\n  insmaller uninstall <key…> [--config F] [--catalog F] [--dry-run] [--json] [--force]\n  insmaller setup [--wizard F] [--catalog F] [--config F] [--answers F] [--dry-run]\n\n--config: if omitted, the first of insmaller.toml/.insmaller.toml/\ninstaller.toml found in the cwd or any parent dir.\n--catalog/--wizard default to the config's `[settings] catalog`/`wizard`\n(relative to the config file) if set, else catalog.json/wizard.toml in cwd.\n--force: uninstall even if another installed key still depends on it."

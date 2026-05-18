@@ -5,8 +5,8 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "MIT"
-# placeholder — replace before any `cargo publish`; project is local-only today
-repository = "https://example.invalid/insmaller"
+repository = "https://github.com/walangstudio/insmaller"
+homepage = "https://github.com/walangstudio/insmaller"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
