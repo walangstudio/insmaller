@@ -32,6 +32,29 @@ impl Sentinel {
         Self { base }
     }
 
+    /// Scope-aware construction. Precedence (highest first):
+    /// `sentinel_path` (explicit, `~`-expanded) → `workspace`
+    /// (`<config_dir>/.<sentinel_dir_name>`) → `global` (the historical
+    /// `<data_local_dir>/<sentinel_dir_name>`). `workspace` with no
+    /// `config_dir` falls back to `global`. Default settings ⇒ identical to
+    /// `Sentinel::new(&settings.sentinel_dir_name)`.
+    pub fn resolve(
+        settings: &crate::config::Settings,
+        config_dir: Option<&std::path::Path>,
+    ) -> Self {
+        use crate::config::SentinelScope;
+        if let Some(p) = &settings.sentinel_path {
+            let expanded = crate::pathenv::expand_home(p).unwrap_or_else(|_| p.clone());
+            return Self::with_base(PathBuf::from(expanded));
+        }
+        match (settings.sentinel_scope, config_dir) {
+            (SentinelScope::Workspace, Some(dir)) => {
+                Self::with_base(dir.join(format!(".{}", settings.sentinel_dir_name)))
+            }
+            _ => Self::new(&settings.sentinel_dir_name),
+        }
+    }
+
     /// Defense-in-depth: a catalog `kind`/`key` must not contain path
     /// separators or `..`, so a sentinel write can never escape the base
     /// (even though the catalog is inside the trust boundary).
@@ -56,6 +79,11 @@ impl Sentinel {
         self.base
             .join(Self::safe(kind))
             .join(format!("{}.post", Self::safe(key)))
+    }
+
+    /// The resolved base directory (host introspection / `insmaller status`).
+    pub fn base(&self) -> &std::path::Path {
+        &self.base
     }
 
     pub fn is_installed(&self, kind: &str, key: &str) -> bool {
@@ -199,5 +227,48 @@ mod tests {
         let mut got = s.list_kind("plugins");
         got.sort();
         assert_eq!(got, vec!["a", "b"]);
+    }
+
+    use crate::config::{Settings, SentinelScope};
+
+    #[test]
+    fn scope_defaults_global_matches_new() {
+        let s = Settings::default();
+        assert_eq!(
+            Sentinel::resolve(&s, Some(std::path::Path::new("/some/proj"))).base,
+            Sentinel::new(&s.sentinel_dir_name).base,
+            "default scope must be byte-identical to the historical path"
+        );
+    }
+
+    #[test]
+    fn sentinel_path_overrides_scope() {
+        let mut s = Settings::default();
+        s.sentinel_scope = SentinelScope::Workspace;
+        s.sentinel_path = Some("/explicit/base".into());
+        assert_eq!(
+            Sentinel::resolve(&s, Some(std::path::Path::new("/proj"))).base,
+            PathBuf::from("/explicit/base")
+        );
+    }
+
+    #[test]
+    fn workspace_anchors_to_config_dir() {
+        let mut s = Settings::default();
+        s.sentinel_scope = SentinelScope::Workspace;
+        assert_eq!(
+            Sentinel::resolve(&s, Some(std::path::Path::new("/proj"))).base,
+            PathBuf::from("/proj").join(".insmaller")
+        );
+    }
+
+    #[test]
+    fn workspace_without_config_dir_falls_back_global() {
+        let mut s = Settings::default();
+        s.sentinel_scope = SentinelScope::Workspace;
+        assert_eq!(
+            Sentinel::resolve(&s, None).base,
+            Sentinel::new(&s.sentinel_dir_name).base
+        );
     }
 }

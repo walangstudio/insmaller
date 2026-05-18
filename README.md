@@ -1,9 +1,9 @@
 # insmaller
 
-![version](https://img.shields.io/badge/version-0.2.1-blue)
+![version](https://img.shields.io/badge/version-0.3.0-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![rust](https://img.shields.io/badge/rust-1.78%2B-orange)
-![tests](https://img.shields.io/badge/tests-203%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-219%20passing-brightgreen)
 
 insmaller installs things by reading a config file instead of running
 hand-written install code. You describe each tool as a list of steps in TOML,
@@ -61,7 +61,9 @@ clears the marker.
 The processors available to steps are shell, exec, download (with sha256 and a
 bearer-token guard), extract (tar, zip, gz, bz2, xz, with path-traversal
 checks), copy, symlink (a directory junction, then a copy, as fallback on
-Windows), merge_json, check_command, prompt, save_input, ensure_line,
+Windows), merge_json, merge_toml, merge_yaml (each deep-merges a command's
+JSON output into a target file, written atomically), backup (a timestamped
+copy before a mutation), check_command, prompt, save_input, ensure_line,
 write_env, and sentinel_meta. shell/exec/check_command take an optional
 `poll = { attempts, delay_ms, until_exit_zero }` for wait-ready loops. Recipes
 can also be provided as separate TOML packs, or as external programs that speak
@@ -75,6 +77,11 @@ atomically; named `[task.*]` lifecycle pipelines (`insmaller task <name>`) with
 `needs` ordering and per-OS step overrides; and a `[project]` block of
 presentation strings and opaque pass-through `extra` for task templating. All
 of it is optional and additive — existing catalogs are unaffected.
+
+`insmaller status` (alias `query`) lists what the install markers record, as a
+table or `--json`. Marker location is global per-user by default;
+`[settings] sentinel_scope = "workspace"` anchors it to the config's directory
+instead, and `sentinel_path` sets it explicitly.
 
 ## Getting started
 
@@ -98,6 +105,7 @@ insmaller setup              # interactive wizard, then installs the selection
 insmaller ripgrep            # install one thing directly
 insmaller uninstall ripgrep  # run its uninstall steps, clear the marker
 insmaller task build         # run a [task.build] pipeline (alias: insmaller run)
+insmaller status             # list what is installed (alias: query; --json)
 ```
 
 Add `--dry-run` to any of these to see what would happen without doing it.
@@ -144,7 +152,7 @@ GitHub release. `insmaller --version` reports the same version.
 
 ## Status
 
-The engine is built and passing: `cargo test --workspace` is 203 tests, no
+The engine is built and passing: `cargo test --workspace` is 219 tests, no
 failures, no ignored, clippy clean. It works on its own through the CLI today.
 
 The optional native plugin transport builds with `--features cdylib`. The WASM
