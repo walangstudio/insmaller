@@ -110,6 +110,25 @@ The release binary is a single file of roughly 7 MB. HTTPS uses rustls, the
 archive codecs are compiled in, so there is no OpenSSL or zlib to install
 alongside it.
 
+## Releases
+
+CI (`.github/workflows/ci.yml`) runs the test suite on Linux, macOS, and
+Windows plus clippy on every push and pull request. The Rust toolchain is
+pinned in `rust-toolchain.toml` and the workflows use the same version, so
+your local build uses the exact compiler and clippy CI does. Run
+`scripts/preflight.ps1` (or `scripts/preflight.sh`) before pushing; it runs
+CI's test and clippy commands locally so a failure is caught here, not on
+GitHub. Failures specific to another OS still cannot be reproduced from one
+machine. Bump the version in `rust-toolchain.toml` and the
+`dtolnay/rust-toolchain@<ver>` refs in the workflows together.
+
+Releases are cut by `.github/workflows/release.yml`. Push a `vX.Y.Z` tag, or
+run the Release workflow from the GitHub Actions tab and give it a tag and a
+branch. It creates the tag if you triggered it manually, sets the crate
+version from the tag, builds the binary for Linux, macOS (Intel and Apple
+silicon), and Windows, and attaches the archives and a SHA256SUMS file to a
+GitHub release. `insmaller --version` reports the same version.
+
 ## Status
 
 The engine is built and passing: `cargo test --workspace` is 152 tests, no
