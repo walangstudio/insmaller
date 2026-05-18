@@ -1,0 +1,5 @@
+# Unattended answers (StaticAnswerer). OS_GATE=macos ⇒ beta's entry
+# condition `${OS_GATE} == 'linux'` is false ⇒ beta is skipped, not failed.
+selected_clis = ["alpha"]
+ALPHA_TOKEN   = "test-secret"
+OS_GATE       = "macos"

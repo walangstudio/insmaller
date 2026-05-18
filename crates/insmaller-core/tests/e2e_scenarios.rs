@@ -216,6 +216,7 @@ async fn dry_run_resolves_real_plugin_pipeline_without_side_effects() {
         &sent,
         &["rg".into()],
         RunOpts { dry_run: true, ..Default::default() },
+        None,
     )
     .await;
     assert!(s.failed.is_empty(), "{:?}", s.failed); // cargo: desugared via lang-pkg
@@ -286,6 +287,7 @@ async fn real_sibling_catalog_loads_and_resolves() {
         &sent,
         &keys,
         RunOpts { dry_run: true, ..Default::default() },
+        None,
     )
     .await;
     assert!(s.failed.is_empty(), "sibling resolve failed: {:?}", s.failed);

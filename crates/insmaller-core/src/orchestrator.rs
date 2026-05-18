@@ -27,6 +27,9 @@ pub struct EntryRef {
     pub deps: Vec<String>,
     /// Verbatim codetainyrrr behavior: bash commands run once per install.
     pub post_install: Vec<String>,
+    /// Availability / install guard. Evaluated against the run's vars; false
+    /// ⇒ the entry is skipped (reported, not failed).
+    pub condition: Option<String>,
 }
 
 pub trait EntrySource: Send + Sync {
@@ -67,14 +70,30 @@ fn build_ctx(
     Ok(ctx)
 }
 
+/// Run a flat step pipeline (no dep-resolution / sentinels). Public so other
+/// generic drivers (e.g. named tasks) reuse the exact step semantics —
+/// when/unless/requires gating, register_as, timeout, retries — without
+/// reaching into the install-only `EngineCtx`.
+pub async fn run_step_pipeline(
+    reg: &ProcessorRegistry,
+    rep: &dyn Reporter,
+    inp: &dyn InputResolver,
+    steps: &[Step],
+    base_ctx: &Ctx,
+    key: &str,
+) -> Result<()> {
+    run_steps(reg, rep, inp, steps, base_ctx, key, false).await
+}
+
 async fn run_steps(
-    ec: &EngineCtx<'_>,
+    reg: &ProcessorRegistry,
+    rep: &dyn Reporter,
+    inp: &dyn InputResolver,
     steps: &[Step],
     base_ctx: &Ctx,
     key: &str,
     dry_run: bool,
 ) -> Result<()> {
-    let (reg, rep, inp) = (ec.reg, ec.rep, ec.inp);
     // Outputs registered by earlier steps, layered over the base ctx without
     // mutating it (Ctx is read-only by design).
     let mut registered: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
@@ -213,6 +232,9 @@ struct EngineCtx<'a> {
     rep: &'a dyn Reporter,
     inp: &'a dyn InputResolver,
     sent: &'a Sentinel,
+    /// Vars an entry `condition` is evaluated against (wizard answers / env).
+    /// Empty on the direct-keys path that supplies none.
+    run_vars: &'a serde_json::Map<String, serde_json::Value>,
 }
 
 async fn install_with_deps(
@@ -250,6 +272,15 @@ async fn install_body(
         return Ok(());
     }
 
+    // Availability guard: a conditioned-out entry is skipped (reported, not
+    // failed), no deps/steps/sentinel. Holds on the direct-keys path too.
+    if let Some(cond) = &e.condition {
+        if !crate::wizard::eval_condition(cond, ec.run_vars) {
+            ec.rep.log(&format!("[{key}] skipped (condition)"));
+            return Ok(());
+        }
+    }
+
     for dep in &e.deps {
         Box::pin(install_with_deps(ec, dep, state, opts))
             .await
@@ -271,10 +302,10 @@ async fn install_body(
             .recipe(&d.recipe)
             .ok_or_else(|| EngineError::UnknownRecipe(d.recipe.clone()))?;
         let ctx = build_ctx(key, &d.params, opts.dry_run)?;
-        run_steps(ec, &recipe.install, &ctx, key, opts.dry_run).await?;
+        run_steps(ec.reg, ec.rep, ec.inp, &recipe.install, &ctx, key, opts.dry_run).await?;
         // `verify` phase: asserted success. Real state — skipped in dry-run.
         if !opts.dry_run && !recipe.verify.is_empty() {
-            run_steps(ec, &recipe.verify, &ctx, key, false)
+            run_steps(ec.reg, ec.rep, ec.inp, &recipe.verify, &ctx, key, false)
                 .await
                 .map_err(|err| {
                     EngineError::Verify {
@@ -285,7 +316,7 @@ async fn install_body(
         }
     } else if let Some(steps) = &e.steps {
         let ctx = build_ctx(key, &serde_json::Map::new(), opts.dry_run)?;
-        run_steps(ec, steps, &ctx, key, opts.dry_run).await?;
+        run_steps(ec.reg, ec.rep, ec.inp, steps, &ctx, key, opts.dry_run).await?;
     } // else: pure meta entry — nothing to run, just sentinel below.
 
     // Dry-run previews nothing persistent: no post_install, no sentinel.
@@ -328,7 +359,7 @@ pub async fn install_many(
     sent: &Sentinel,
     keys: &[String],
 ) -> InstallSummary {
-    install_many_with(src, cfg, reg, rep, inp, sent, keys, RunOpts::default()).await
+    install_many_with(src, cfg, reg, rep, inp, sent, keys, RunOpts::default(), None).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -341,8 +372,18 @@ pub async fn install_many_with(
     sent: &Sentinel,
     keys: &[String],
     opts: RunOpts,
+    run_vars: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> InstallSummary {
-    let ec = EngineCtx { src, cfg, reg, rep, inp, sent };
+    let empty = serde_json::Map::new();
+    let ec = EngineCtx {
+        src,
+        cfg,
+        reg,
+        rep,
+        inp,
+        sent,
+        run_vars: run_vars.unwrap_or(&empty),
+    };
     let mut state = DepState::default();
     let mut summary = InstallSummary::default();
     for key in keys {
@@ -375,7 +416,7 @@ async fn uninstall_one(ec: &EngineCtx<'_>, key: &str, opts: RunOpts) -> Result<(
             .ok_or_else(|| EngineError::UnknownRecipe(d.recipe.clone()))?;
         if !recipe.uninstall.is_empty() {
             let ctx = build_ctx(key, &d.params, false)?;
-            run_steps(ec, &recipe.uninstall, &ctx, key, false).await?;
+            run_steps(ec.reg, ec.rep, ec.inp, &recipe.uninstall, &ctx, key, false).await?;
         }
     }
     // Clear both markers so a later reinstall re-fires install + post_install
@@ -412,7 +453,16 @@ pub async fn uninstall_many_with(
     keys: &[String],
     opts: RunOpts,
 ) -> InstallSummary {
-    let ec = EngineCtx { src, cfg, reg, rep, inp, sent };
+    let empty = serde_json::Map::new();
+    let ec = EngineCtx {
+        src,
+        cfg,
+        reg,
+        rep,
+        inp,
+        sent,
+        run_vars: &empty,
+    };
     let mut summary = InstallSummary::default();
     let batch: std::collections::HashSet<&str> = keys.iter().map(String::as_str).collect();
     for key in keys {
@@ -520,6 +570,7 @@ mod tests {
             steps: Some(vec![step_rec(tag)]),
             deps: deps.iter().map(|s| s.to_string()).collect(),
             post_install: vec![],
+            condition: None,
         }
     }
     fn rig() -> (ProcessorRegistry, Arc<Mutex<Vec<String>>>) {
@@ -562,6 +613,7 @@ mod tests {
             steps: Some(steps),
             deps: vec![],
             post_install: vec![],
+            condition: None,
         }
     }
     fn rig2() -> (ProcessorRegistry, Arc<Mutex<Vec<String>>>) {
@@ -726,6 +778,7 @@ mod tests {
                 steps: None,
                 deps: vec![],
                 post_install: vec![],
+                condition: None,
             },
         );
         let d = tempfile::tempdir().unwrap();
@@ -755,6 +808,7 @@ mod tests {
             &sent,
             &["x".into()],
             RunOpts { dry_run: true, ..Default::default() },
+            None,
         )
         .await;
         // post_install would fail if run; dry-run must skip it entirely.
@@ -817,6 +871,7 @@ mod tests {
                 steps: None,
                 deps: vec![],
                 post_install: vec![],
+                condition: None,
             },
         );
         let d = tempfile::tempdir().unwrap();
@@ -866,6 +921,7 @@ mod tests {
                 steps: None,
                 deps: vec![],
                 post_install: vec![],
+                condition: None,
             },
         );
         let src = Src(m);
@@ -914,6 +970,7 @@ mod tests {
             steps: None,
             deps,
             post_install: vec![],
+            condition: None,
         };
         let mut m = HashMap::new();
         m.insert("dep".to_string(), mk(vec![]));
@@ -963,6 +1020,7 @@ mod tests {
             &sent,
             &["x".into()],
             RunOpts { dry_run: true, ..Default::default() },
+            None,
         )
         .await;
         assert_eq!(s.completed, vec!["x"]);
@@ -1122,6 +1180,89 @@ mod tests {
         .await;
         assert_eq!(s.failed.len(), 1);
         assert!(s.failed[0].1.contains("ghost"));
+    }
+
+    fn cond_entry(cond: &str, tag: &str) -> EntryRef {
+        let mut e = entry(&[], tag);
+        e.condition = Some(cond.to_string());
+        e
+    }
+
+    #[tokio::test]
+    async fn conditioned_entry_skipped_when_false() {
+        let (reg, log) = rig();
+        let mut m = HashMap::new();
+        m.insert("x".into(), cond_entry("${OS_GATE} == 'linux'", "ran"));
+        let d = tempfile::tempdir().unwrap();
+        let sent = Sentinel::with_base(d.path().into());
+        let mut vars = serde_json::Map::new();
+        vars.insert("OS_GATE".into(), serde_json::Value::String("macos".into()));
+        let s = install_many_with(
+            &Src(m),
+            &cfg(),
+            &reg,
+            &NullReporter,
+            &EnvResolver,
+            &sent,
+            &["x".into()],
+            RunOpts::default(),
+            Some(&vars),
+        )
+        .await;
+        assert_eq!(s.completed, vec!["x"]); // skip is success, not failure
+        assert!(s.failed.is_empty());
+        assert!(log.lock().unwrap().is_empty()); // no steps ran
+        assert!(!sent.is_installed("tools", "x")); // no sentinel
+    }
+
+    #[tokio::test]
+    async fn conditioned_entry_runs_when_true() {
+        let (reg, log) = rig();
+        let mut m = HashMap::new();
+        m.insert("x".into(), cond_entry("${OS_GATE} == 'linux'", "ran"));
+        let d = tempfile::tempdir().unwrap();
+        let sent = Sentinel::with_base(d.path().into());
+        let mut vars = serde_json::Map::new();
+        vars.insert("OS_GATE".into(), serde_json::Value::String("linux".into()));
+        let s = install_many_with(
+            &Src(m),
+            &cfg(),
+            &reg,
+            &NullReporter,
+            &EnvResolver,
+            &sent,
+            &["x".into()],
+            RunOpts::default(),
+            Some(&vars),
+        )
+        .await;
+        assert_eq!(s.completed, vec!["x"]);
+        assert_eq!(*log.lock().unwrap(), vec!["ran"]);
+        assert!(sent.is_installed("tools", "x"));
+    }
+
+    #[tokio::test]
+    async fn condition_skip_on_direct_install_many_path() {
+        // No run_vars supplied (direct path) → ${X} empty → != 'go' is true,
+        // so a guard that requires X==go skips.
+        let (reg, log) = rig();
+        let mut m = HashMap::new();
+        m.insert("x".into(), cond_entry("${X} == 'go'", "ran"));
+        let d = tempfile::tempdir().unwrap();
+        let sent = Sentinel::with_base(d.path().into());
+        let s = install_many(
+            &Src(m),
+            &cfg(),
+            &reg,
+            &NullReporter,
+            &EnvResolver,
+            &sent,
+            &["x".into()],
+        )
+        .await;
+        assert_eq!(s.completed, vec!["x"]);
+        assert!(log.lock().unwrap().is_empty());
+        assert!(!sent.is_installed("tools", "x"));
     }
 
     #[tokio::test]

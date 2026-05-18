@@ -16,7 +16,7 @@ mod theme;
 mod tui;
 
 use insmaller_core::{
-    builtins, run_wizard, Catalog, EnvResolver, InstallSummary, LoadedConfig, Reporter,
+    builtins, run_wizard, Catalog, Ctx, EnvResolver, InstallSummary, LoadedConfig, Reporter,
     Sentinel, StaticAnswerer, StdoutReporter, WizardDef, WizardOutcome, WizardSession,
 };
 use serde_json::{Map, Value};
@@ -104,13 +104,14 @@ async fn main() -> ExitCode {
         Some("install") => cmd_op(&args[1..], Op::Install).await,
         Some("uninstall") | Some("remove") => cmd_op(&args[1..], Op::Uninstall).await,
         Some("setup") => cmd_setup(&args[1..]).await,
+        Some("task") | Some("run") => cmd_task(&args[1..]).await,
         Some("-V") | Some("--version") | Some("version") => {
             println!("insmaller {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
         Some("-h") | Some("--help") | Some("help") | None => {
             eprintln!(
-                "usage:\n  insmaller <key…>            [--config F] [--catalog F] [--dry-run] [--json]   (defaults to install)\n  insmaller install   <key…> [--config F] [--catalog F] [--dry-run] [--json]\n  insmaller uninstall <key…> [--config F] [--catalog F] [--dry-run] [--json] [--force]\n  insmaller setup [--wizard F] [--catalog F] [--config F] [--answers F] [--dry-run]\n\n--config: if omitted, the first of insmaller.toml/.insmaller.toml/\ninstaller.toml found in the cwd or any parent dir.\n--catalog/--wizard default to the config's `[settings] catalog`/`wizard`\n(relative to the config file) if set, else catalog.json/wizard.toml in cwd.\n--force: uninstall even if another installed key still depends on it."
+                "usage:\n  insmaller <key…>            [--config F] [--catalog F] [--dry-run] [--json]   (defaults to install)\n  insmaller install   <key…> [--config F] [--catalog F] [--dry-run] [--json]\n  insmaller uninstall <key…> [--config F] [--catalog F] [--dry-run] [--json] [--force]\n  insmaller setup [--wizard F] [--catalog F] [--config F] [--answers F] [--dry-run]\n  insmaller task <name…>     [--config F]   (alias: insmaller run <name…>)\n\n--config: if omitted, the first of insmaller.toml/.insmaller.toml/\ninstaller.toml found in the cwd or any parent dir.\n--catalog/--wizard default to the config's `[settings] catalog`/`wizard`\n(relative to the config file) if set, else catalog.json/wizard.toml in cwd.\n--force: uninstall even if another installed key still depends on it.\ntask: runs a `[task.<name>]` pipeline (needs first, per-OS, fail-fast)."
             );
             if args.is_empty() { ExitCode::FAILURE } else { ExitCode::SUCCESS }
         }
@@ -138,6 +139,7 @@ async fn load(
 // Runs install/uninstall and returns the summary plus its result noun. The
 // caller owns the Reporter (Stdout/Json/Bar) and prints the summary after,
 // so the indicatif bar can be cleared before the summary lines.
+#[allow(clippy::too_many_arguments)]
 async fn run_op(
     cfg: &LoadedConfig,
     cat: &Catalog,
@@ -146,6 +148,7 @@ async fn run_op(
     dry_run: bool,
     force: bool,
     rep: &dyn Reporter,
+    run_vars: Option<&Map<String, Value>>,
 ) -> (InstallSummary, &'static str) {
     let mut reg = builtins(&cfg.settings);
     insmaller_core::register_external(&mut reg, &cfg.plugins);
@@ -154,7 +157,7 @@ async fn run_op(
     match op {
         Op::Install => (
             insmaller_core::install_many_with(
-                cat, cfg, &reg, rep, &EnvResolver, &sent, keys, opts,
+                cat, cfg, &reg, rep, &EnvResolver, &sent, keys, opts, run_vars,
             )
             .await,
             "ok",
@@ -213,9 +216,17 @@ async fn cmd_op(a: &[String], op: Op) -> ExitCode {
             } else {
                 Box::new(StdoutReporter)
             };
-            let (s, verb) =
-                run_op(&cfg, &cat, &keys, op, has(a, "--dry-run"), has(a, "--force"), rep.as_ref())
-                    .await;
+            let (s, verb) = run_op(
+                &cfg,
+                &cat,
+                &keys,
+                op,
+                has(a, "--dry-run"),
+                has(a, "--force"),
+                rep.as_ref(),
+                None,
+            )
+            .await;
             summarize(&s, verb)
         }
         Err(e) => {
@@ -250,6 +261,24 @@ async fn cmd_setup(a: &[String]) -> ExitCode {
     // --answers F → non-blocking StaticAnswerer; else interactive stdin.
     // Unattended (--answers or no TTY) → non-blocking StaticAnswerer.
     // Interactive TTY → the ratatui progress TUI (back/forward + buttons).
+    // P2-A: render the intro template (project.extra as vars) at setup start.
+    let group_order: Vec<String> = cfg
+        .project
+        .as_ref()
+        .map(|p| p.group_order.clone())
+        .unwrap_or_default();
+    if let Some(proj) = cfg.project.as_ref() {
+        if let Some(tmpl) = &proj.intro_template {
+            let mut c = Ctx::new();
+            for (k, v) in &proj.extra {
+                c.set(k, v.as_str());
+            }
+            if let Ok(s) = c.render(tmpl) {
+                println!("{s}");
+            }
+        }
+    }
+
     let palette = theme::Palette::resolve(&cfg.settings);
     let unattended = has(a, "--answers") || !std::io::stdin().is_terminal();
     let (outcome, tui_used): (WizardOutcome, bool) = if unattended {
@@ -261,7 +290,7 @@ async fn cmd_setup(a: &[String]) -> ExitCode {
             .and_then(|v| v.as_object().cloned())
             .or_else(|| serde_json::from_str(&raw).ok())
             .unwrap_or_default();
-        match run_wizard(&wiz, &cat, &StaticAnswerer(m)) {
+        match run_wizard(&wiz, &cat, &StaticAnswerer(m), &group_order) {
             Ok(o) => (o, false),
             Err(e) => {
                 eprintln!("wizard error: {e}");
@@ -269,7 +298,7 @@ async fn cmd_setup(a: &[String]) -> ExitCode {
             }
         }
     } else {
-        let mut session = WizardSession::new(&wiz, &cat);
+        let mut session = WizardSession::new(&wiz, &cat, group_order.clone());
         match tui::run_wizard_tui(&mut session, palette) {
             Ok(true) => (session.finish(), true),
             Ok(false) => {
@@ -292,25 +321,117 @@ async fn cmd_setup(a: &[String]) -> ExitCode {
             _ => {}
         }
     }
+
+    // P1-C: emit the resolved vars to the configured sink (runs before the
+    // install phase so it's present even on --dry-run).
+    if let Some(so) = cfg.settings.setup_output.as_ref() {
+        if let Err(e) = insmaller_core::write_setup_output(so, &outcome.vars) {
+            eprintln!("setup_output error: {e:#}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    // P2-A: outro rendered at the end (project.extra + scalar wizard vars).
+    let render_outro = || {
+        if let Some(proj) = cfg.project.as_ref() {
+            if let Some(tmpl) = &proj.outro_template {
+                let mut c = Ctx::new();
+                for (k, v) in &proj.extra {
+                    c.set(k, v.as_str());
+                }
+                for (k, v) in &outcome.vars {
+                    if let Value::String(s) = v {
+                        c.set(k, s.as_str());
+                    }
+                }
+                if let Ok(s) = c.render(tmpl) {
+                    println!("{s}");
+                }
+            }
+        }
+    };
+
     println!("Selected: {:?}", outcome.selected_keys);
     if outcome.selected_keys.is_empty() {
         println!("Nothing selected.");
+        render_outro();
         return ExitCode::SUCCESS;
     }
     let dry_run = has(a, "--dry-run");
     if !tui_used {
-        let (s, verb) =
-            run_op(&cfg, &cat, &outcome.selected_keys, Op::Install, dry_run, false, &StdoutReporter)
-                .await;
-        return summarize(&s, verb);
+        let (s, verb) = run_op(
+            &cfg,
+            &cat,
+            &outcome.selected_keys,
+            Op::Install,
+            dry_run,
+            false,
+            &StdoutReporter,
+            Some(&outcome.vars),
+        )
+        .await;
+        let code = summarize(&s, verb);
+        render_outro();
+        return code;
     }
     // Interactive: indicatif spinner for the install phase. The bar must be
     // cleared before the summary prints, hence run_op → finish → summarize.
     let bar = tui::BarReporter::new(palette);
-    let (s, verb) =
-        run_op(&cfg, &cat, &outcome.selected_keys, Op::Install, dry_run, false, &bar).await;
+    let (s, verb) = run_op(
+        &cfg,
+        &cat,
+        &outcome.selected_keys,
+        Op::Install,
+        dry_run,
+        false,
+        &bar,
+        Some(&outcome.vars),
+    )
+    .await;
     bar.finish();
-    summarize(&s, verb)
+    let code = summarize(&s, verb);
+    render_outro();
+    code
+}
+
+/// `insmaller task <name…>` / `insmaller run <name…>` — run named lifecycle
+/// task pipelines. `run_vars` = project.extra + process env (so task scripts
+/// template the consumer's image_tag/container_name/etc).
+async fn cmd_task(a: &[String]) -> ExitCode {
+    let cfg_p = discover_config(opt_opt(a, "--config"));
+    let names = collect_keys(a);
+    let cfg = match LoadedConfig::from_path(std::path::Path::new(&cfg_p)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("config error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if names.is_empty() {
+        eprintln!("usage: insmaller task <name…>  (available: {:?})", cfg.tasks.keys().collect::<Vec<_>>());
+        return ExitCode::FAILURE;
+    }
+    let mut run_vars: Map<String, Value> = Map::new();
+    if let Some(proj) = cfg.project.as_ref() {
+        for (k, v) in &proj.extra {
+            run_vars.insert(k.clone(), Value::String(v.clone()));
+        }
+    }
+    for (k, v) in std::env::vars() {
+        run_vars.entry(k).or_insert(Value::String(v));
+    }
+    let mut reg = builtins(&cfg.settings);
+    insmaller_core::register_external(&mut reg, &cfg.plugins);
+    for name in &names {
+        if let Err(e) =
+            insmaller_core::run_task(name, &cfg, &reg, &StdoutReporter, &EnvResolver, &run_vars)
+                .await
+        {
+            eprintln!("task '{name}' failed: {e:#}");
+            return ExitCode::FAILURE;
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 #[cfg(test)]

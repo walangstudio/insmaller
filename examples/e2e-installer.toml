@@ -1,0 +1,30 @@
+# e2e engine config exercising P1-C (setup_output), P2-A (project intro/outro
+# + opaque extra), catalog-tree compat. No desugar/recipes needed — the
+# fixture catalog uses inline generic steps.
+
+[settings]
+sentinel_dir_name = "insmaller-e2e"
+catalog = "e2e-fixture.catalog.json"
+wizard  = "e2e-fixture.wizard.toml"
+
+[settings.setup_output]
+# Path is templated/home-expanded by the engine; tests inject a tempdir
+# instead. Documented here as the consumer-facing shape.
+path    = "~/.insmaller-e2e/out.env"
+format  = "env"
+header  = "e2e test output"
+include = ["ALPHA_TOKEN"]
+mode    = 0o600
+
+[project]
+name           = "E2E"
+about          = "insmaller codetainyrrr e2e fixture"
+intro_template = "Welcome to {{ name }}"
+outro_template = "Done. token={{ ALPHA_TOKEN }} img={{ image_tag }}"
+default_cli    = "alpha"
+group_order    = ["core", "optional"]
+
+[project.extra]
+name           = "E2E"
+image_tag      = "e2e:1"
+container_name = "e2e-box"

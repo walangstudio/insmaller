@@ -1,0 +1,26 @@
+# e2e wizard: pick CLIs → collect declared inputs of the selection
+# (selected.inputs, P1-A) → an OS gate var used by beta's entry condition.
+
+[[page]]
+id = "pick"
+title = "Pick CLIs"
+[[page.field]]
+id = "selected_clis"
+type = "multiselect"
+source = "catalog.clis"
+
+[[page]]
+id = "inputs"
+title = "Required inputs"
+[[page.field]]
+id = "_req"
+type = "text"
+source = "selected.inputs"
+
+[[page]]
+id = "gate"
+title = "OS gate"
+[[page.field]]
+id = "OS_GATE"
+type = "text"
+required = false

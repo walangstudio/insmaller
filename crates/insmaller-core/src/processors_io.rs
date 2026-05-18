@@ -27,6 +27,145 @@ pub fn register(r: &mut ProcessorRegistry, _g: Globs, settings: &crate::config::
     r.register(Arc::new(CopyProcessor));
     r.register(Arc::new(SymlinkProcessor));
     r.register(Arc::new(EnsureLineProcessor));
+    r.register(Arc::new(WriteEnvProcessor));
+}
+
+/// Atomic file write: write a sibling `.tmp` then rename over `path` (same
+/// filesystem ⇒ the rename is atomic). On Unix `mode` is applied before the
+/// rename so the file never exists world-readable. The temp file is removed
+/// on any error after creation.
+fn atomic_write(path: &Path, content: &[u8], mode: Option<u32>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    let write_then_rename = || -> Result<()> {
+        std::fs::write(&tmp, content)?;
+        #[cfg(unix)]
+        if let Some(bits) = mode {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(bits))?;
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    };
+    match write_then_rename() {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// `KEY=value` body from scalar vars (String/Bool/Number), keys alpha-sorted,
+/// optionally filtered by `include` and prefixed with a `# header` line.
+/// Values containing whitespace, `"` or `\` are double-quoted with `\`/`"`
+/// escaped (dotenv-safe).
+fn render_env_body(
+    vars: &serde_json::Map<String, serde_json::Value>,
+    header: Option<&str>,
+    include: Option<&[String]>,
+) -> String {
+    let needs_quote = |s: &str| s.is_empty() || s.chars().any(|c| c.is_whitespace() || c == '"' || c == '\\' || c == '\'' || c == '#');
+    let mut keys: Vec<&String> = vars
+        .iter()
+        .filter(|(k, v)| {
+            matches!(
+                v,
+                serde_json::Value::String(_)
+                    | serde_json::Value::Bool(_)
+                    | serde_json::Value::Number(_)
+            ) && include.map(|inc| inc.iter().any(|i| i == *k)).unwrap_or(true)
+        })
+        .map(|(k, _)| k)
+        .collect();
+    keys.sort();
+    let mut out = String::new();
+    if let Some(h) = header {
+        out.push_str("# ");
+        out.push_str(h);
+        out.push('\n');
+    }
+    for k in keys {
+        let raw = match &vars[k] {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            serde_json::Value::Number(n) => n.to_string(),
+            _ => unreachable!(),
+        };
+        if needs_quote(&raw) {
+            let esc = raw.replace('\\', "\\\\").replace('"', "\\\"");
+            out.push_str(&format!("{k}=\"{esc}\"\n"));
+        } else {
+            out.push_str(&format!("{k}={raw}\n"));
+        }
+    }
+    out
+}
+
+/// Render the resolved vars to the configured setup-output file. Used by the
+/// CLI after the wizard; the `write_env` processor reuses the same core so a
+/// recipe can compose it too. Absent config is a no-op (caller-checked).
+pub fn write_setup_output(
+    so: &crate::config::SetupOutput,
+    vars: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    let crate::config::OutputFormat::Env = so.format;
+    let path = expand_home(&so.path)?;
+    let body = render_env_body(vars, so.header.as_deref(), so.include.as_deref());
+    atomic_write(Path::new(&path), body.as_bytes(), so.mode)
+        .with_context(|| format!("write_setup_output {path}"))?;
+    Ok(())
+}
+
+/// `write_env` — emit the engine's resolved scalar vars to an env file
+/// (atomic). Params: `path` (required, templated + home-expanded), `header`,
+/// `include` (array allowlist), `mode`. Generic and composable in any recipe.
+pub struct WriteEnvProcessor;
+
+#[async_trait::async_trait]
+impl Processor for WriteEnvProcessor {
+    fn kind(&self) -> &str {
+        "write_env"
+    }
+    async fn run(
+        &self,
+        step: &Step,
+        ctx: &Ctx,
+        _r: &dyn Reporter,
+        _i: &dyn InputResolver,
+    ) -> Result<StepOutput> {
+        let path = expand_home(
+            &ctx.render(step.param_str("path").context("write_env needs `path`")?)?,
+        )?;
+        let header = match step.param_str("header") {
+            Some(h) => Some(ctx.render(h)?),
+            None => None,
+        };
+        let include: Option<Vec<String>> = step.param_array("include").map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        });
+        let mode = step
+            .param_i64("mode")
+            .and_then(|m| u32::try_from(m).ok());
+        let vars = match ctx.vars_json() {
+            serde_json::Value::Object(m) => m,
+            _ => serde_json::Map::new(),
+        };
+        let body = render_env_body(&vars, header.as_deref(), include.as_deref());
+        atomic_write(Path::new(&path), body.as_bytes(), mode)
+            .with_context(|| format!("write_env {path}"))?;
+        Ok(StepOutput::ok())
+    }
 }
 
 /// `ensure_line` — idempotently ensure `line` is present in `file` (shell
@@ -134,15 +273,37 @@ pub struct SymlinkProcessor;
 fn make_symlink(src: &Path, dest: &Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(src, dest)
 }
+/// Directory junction via `mklink /J` — needs no SeCreateSymbolicLink
+/// privilege (unlike a symlink), so it works outside Developer Mode and
+/// without admin. Junctions are directory-only.
+#[cfg(windows)]
+fn make_dir_junction(src: &Path, dest: &Path) -> std::io::Result<()> {
+    let status = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(dest)
+        .arg(src)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("mklink /J failed"))
+    }
+}
+
 #[cfg(windows)]
 fn make_symlink(src: &Path, dest: &Path) -> std::io::Result<()> {
-    let r = if src.is_dir() {
+    if src.is_dir() {
+        // symlink → junction (no privilege needed) → recursive copy.
         std::os::windows::fs::symlink_dir(src, dest)
+            .or_else(|_| make_dir_junction(src, dest))
+            .or_else(|_| copy_recursive(src, dest))
     } else {
+        // Files: symlink, else copy (no junction equivalent for files).
         std::os::windows::fs::symlink_file(src, dest)
-    };
-    // No SeCreateSymbolicLink privilege (non-Developer-Mode) → copy instead.
-    r.or_else(|_| copy_recursive(src, dest))
+            .or_else(|_| copy_recursive(src, dest))
+    }
 }
 
 #[async_trait::async_trait]
@@ -946,6 +1107,155 @@ mod tests {
         let out = dir.path().join("o");
         extract_archive(&tgz, &out, 5).unwrap(); // strip more than depth
         assert!(std::fs::read_dir(&out).unwrap().next().is_none());
+    }
+
+    fn jmap(pairs: &[(&str, serde_json::Value)]) -> serde_json::Map<String, serde_json::Value> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+    }
+
+    #[test]
+    fn write_env_creates_file_with_correct_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("out.env");
+        let so = crate::config::SetupOutput {
+            path: f.to_string_lossy().into_owned(),
+            format: crate::config::OutputFormat::Env,
+            header: None,
+            include: None,
+            mode: None,
+        };
+        let vars = jmap(&[
+            ("B", serde_json::json!("two")),
+            ("A", serde_json::json!("one")),
+        ]);
+        write_setup_output(&so, &vars).unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "A=one\nB=two\n");
+    }
+
+    #[test]
+    fn write_env_header_is_first_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("o.env");
+        let so = crate::config::SetupOutput {
+            path: f.to_string_lossy().into_owned(),
+            format: crate::config::OutputFormat::Env,
+            header: Some("generated by test".into()),
+            include: None,
+            mode: None,
+        };
+        write_setup_output(&so, &jmap(&[("K", serde_json::json!("v"))])).unwrap();
+        let body = std::fs::read_to_string(&f).unwrap();
+        assert!(body.starts_with("# generated by test\nK=v\n"));
+    }
+
+    #[test]
+    fn write_env_include_filters_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("o.env");
+        let so = crate::config::SetupOutput {
+            path: f.to_string_lossy().into_owned(),
+            format: crate::config::OutputFormat::Env,
+            header: None,
+            include: Some(vec!["KEEP".into()]),
+            mode: None,
+        };
+        let vars = jmap(&[
+            ("KEEP", serde_json::json!("yes")),
+            ("DROP", serde_json::json!("no")),
+        ]);
+        write_setup_output(&so, &vars).unwrap();
+        let body = std::fs::read_to_string(&f).unwrap();
+        assert_eq!(body, "KEEP=yes\n");
+    }
+
+    #[test]
+    fn write_env_quotes_value_with_spaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("o.env");
+        let so = crate::config::SetupOutput {
+            path: f.to_string_lossy().into_owned(),
+            format: crate::config::OutputFormat::Env,
+            header: None,
+            include: None,
+            mode: None,
+        };
+        let vars = jmap(&[
+            ("MSG", serde_json::json!("hello world")),
+            ("Q", serde_json::json!(r#"a"b\c"#)),
+        ]);
+        write_setup_output(&so, &vars).unwrap();
+        let body = std::fs::read_to_string(&f).unwrap();
+        assert!(body.contains("MSG=\"hello world\"\n"));
+        assert!(body.contains(r#"Q="a\"b\\c""#));
+    }
+
+    #[test]
+    fn write_env_no_tmp_leftover_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("o.env");
+        let so = crate::config::SetupOutput {
+            path: f.to_string_lossy().into_owned(),
+            format: crate::config::OutputFormat::Env,
+            header: None,
+            include: None,
+            mode: None,
+        };
+        write_setup_output(&so, &jmap(&[("A", serde_json::json!("1"))])).unwrap();
+        // overwrite again (atomic) and confirm no .tmp sibling remains
+        write_setup_output(&so, &jmap(&[("A", serde_json::json!("2"))])).unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "A=2\n");
+        let mut tmp = f.into_os_string();
+        tmp.push(".tmp");
+        assert!(!std::path::Path::new(&tmp).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_mode_applied() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("secret.env");
+        atomic_write(&f, b"X=1\n", Some(0o600)).unwrap();
+        let m = std::fs::metadata(&f).unwrap().permissions().mode();
+        assert_eq!(m & 0o777, 0o600);
+    }
+
+    #[tokio::test]
+    async fn write_env_processor_reads_ctx_vars() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("p.env");
+        let mut c = ctx();
+        c.set("TOKEN", "abc");
+        let s = format!(
+            "type=\"write_env\"\npath=\"{}\"\ninclude=[\"TOKEN\"]",
+            p(&f)
+        );
+        WriteEnvProcessor
+            .run(&step(&s), &c, &NullReporter, &EnvResolver)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "TOKEN=abc\n");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn symlink_dir_falls_back_to_junction_or_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/sub")).unwrap();
+        std::fs::write(dir.path().join("src/sub/a.txt"), "hi").unwrap();
+        let s = format!(
+            "type=\"symlink\"\nsrc=\"{}\"\ndest=\"{}\"",
+            p(&dir.path().join("src")),
+            p(&dir.path().join("link"))
+        );
+        SymlinkProcessor
+            .run(&step(&s), &ctx(), &NullReporter, &EnvResolver)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("link/sub/a.txt")).unwrap(),
+            "hi"
+        );
     }
 
     #[test]

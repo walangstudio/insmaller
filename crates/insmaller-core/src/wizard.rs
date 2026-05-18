@@ -25,7 +25,7 @@ pub enum FieldType {
     Toggle,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Field {
     pub id: String,
     #[serde(rename = "type")]
@@ -49,6 +49,45 @@ pub struct Field {
 
 fn default_true() -> bool {
     true
+}
+
+/// Field `source` value: expand into one synthetic field per declared input
+/// of the currently-selected entries (P1-A).
+pub const SELECTED_INPUTS: &str = "selected.inputs";
+
+/// An input (key/token/cred) an entry declares it requires. Sourced into a
+/// wizard page via `source = "selected.inputs"` — one synthetic [`Field`] per
+/// declared input of the currently-selected entries.
+#[derive(Debug, Clone, Deserialize)]
+pub struct InputDecl {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub r#type: FieldType,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default = "default_true")]
+    pub required: bool,
+    #[serde(default)]
+    pub default: Option<String>,
+    #[serde(default)]
+    pub condition: Option<String>,
+}
+
+impl InputDecl {
+    /// Synthetic field for this declaration. `condition` is applied by the
+    /// caller before expansion, so the produced field carries none.
+    pub fn to_field(&self) -> Field {
+        Field {
+            id: self.id.clone(),
+            field_type: self.r#type,
+            prompt: self.prompt.clone(),
+            default: self.default.clone(),
+            required: self.required,
+            source: None,
+            options: Vec::new(),
+            condition: None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -152,8 +191,45 @@ fn var_as_str(v: &Value) -> String {
     }
 }
 
-/// Evaluate a condition against collected vars. Mirrors codetainyrrr.
+/// Dotted numeric version (`v` prefix and trailing non-digits per component
+/// tolerated). `None` ⇒ not version-like, caller falls back to string compare.
+fn parse_ver(s: &str) -> Option<Vec<u64>> {
+    let s = s.trim().trim_start_matches('v').trim_start_matches('V');
+    if s.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for p in s.split('.') {
+        let digits: String = p.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            return None;
+        }
+        out.push(digits.parse::<u64>().ok()?);
+    }
+    Some(out)
+}
+
+/// Semver-ish ordering. `None` ⇒ either side isn't version-like.
+fn version_cmp(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    let (av, bv) = (parse_ver(a)?, parse_ver(b)?);
+    let n = av.len().max(bv.len());
+    for i in 0..n {
+        let (x, y) = (
+            av.get(i).copied().unwrap_or(0),
+            bv.get(i).copied().unwrap_or(0),
+        );
+        if x != y {
+            return Some(x.cmp(&y));
+        }
+    }
+    Some(std::cmp::Ordering::Equal)
+}
+
+/// Evaluate a condition against collected vars. Mirrors codetainyrrr, plus
+/// version-compare operators (`>= <= > <`, and semver-aware `== !=`) — the
+/// single expression grammar reused by entries, item conditions, and pages.
 pub fn eval_condition(expr: &str, vars: &Map<String, Value>) -> bool {
+    use std::cmp::Ordering;
     let s = expr.trim();
     let get = |name: &str| -> String {
         vars.get(name.trim()).map(var_as_str).unwrap_or_default()
@@ -167,11 +243,41 @@ pub fn eval_condition(expr: &str, vars: &Map<String, Value>) -> bool {
     };
     let lit = |t: &str| t.trim().trim_matches('\'').trim_matches('"').to_string();
 
+    if let Some((l, r)) = s.split_once(">=") {
+        let (lv, rv) = (get(&unwrap_var(l)), lit(r));
+        return matches!(
+            version_cmp(&lv, &rv),
+            Some(Ordering::Greater | Ordering::Equal)
+        );
+    }
+    if let Some((l, r)) = s.split_once("<=") {
+        let (lv, rv) = (get(&unwrap_var(l)), lit(r));
+        return matches!(
+            version_cmp(&lv, &rv),
+            Some(Ordering::Less | Ordering::Equal)
+        );
+    }
     if let Some((l, r)) = s.split_once("==") {
-        return get(&unwrap_var(l)) == lit(r);
+        let (lv, rv) = (get(&unwrap_var(l)), lit(r));
+        return match version_cmp(&lv, &rv) {
+            Some(o) => o == Ordering::Equal,
+            None => lv == rv,
+        };
     }
     if let Some((l, r)) = s.split_once("!=") {
-        return get(&unwrap_var(l)) != lit(r);
+        let (lv, rv) = (get(&unwrap_var(l)), lit(r));
+        return match version_cmp(&lv, &rv) {
+            Some(o) => o != Ordering::Equal,
+            None => lv != rv,
+        };
+    }
+    if let Some((l, r)) = s.split_once('>') {
+        let (lv, rv) = (get(&unwrap_var(l)), lit(r));
+        return matches!(version_cmp(&lv, &rv), Some(Ordering::Greater));
+    }
+    if let Some((l, r)) = s.split_once('<') {
+        let (lv, rv) = (get(&unwrap_var(l)), lit(r));
+        return matches!(version_cmp(&lv, &rv), Some(Ordering::Less));
     }
     if let Some((l, r)) = s.split_once(" in ") {
         let lt = l.trim();
@@ -190,14 +296,33 @@ pub fn eval_condition(expr: &str, vars: &Map<String, Value>) -> bool {
     !(v.is_empty() || v == "false" || v == "0")
 }
 
+#[cfg(test)]
 fn choices_for(field: &Field, catalog: &Catalog) -> Vec<Choice> {
+    choices_for_vars(field, catalog, &Map::new(), &[])
+}
+
+/// Choices for a field, dropping catalog options whose entry `condition`
+/// evaluates false against `vars`, and ordering groups by `group_order`
+/// (empty ⇒ default group/key sort).
+pub fn choices_for_vars(
+    field: &Field,
+    catalog: &Catalog,
+    vars: &Map<String, Value>,
+    group_order: &[String],
+) -> Vec<Choice> {
     if let Some(src) = &field.source {
         if let Some(kind) = src.strip_prefix("catalog.") {
             // catalog.tools → kind "tools"; catalog.clis → "cli".
             let kind = if kind == "clis" { "cli" } else { kind };
             return catalog
-                .options(kind)
+                .options_ordered(kind, group_order)
                 .into_iter()
+                .filter(|o| {
+                    o.condition
+                        .as_deref()
+                        .map(|c| eval_condition(c, vars))
+                        .unwrap_or(true)
+                })
                 .map(|o| Choice {
                     label: match (&o.group, &o.description) {
                         (Some(g), Some(d)) => format!("[{g}] {} — {d}", o.key),
@@ -236,6 +361,7 @@ pub fn run_wizard(
     def: &WizardDef,
     catalog: &Catalog,
     answerer: &dyn Answerer,
+    group_order: &[String],
 ) -> Result<WizardOutcome> {
     let mut out = WizardOutcome::default();
     for page in &def.pages {
@@ -250,7 +376,31 @@ pub fn run_wizard(
                     continue;
                 }
             }
-            let choices = choices_for(field, catalog);
+            // `selected.inputs` expands in place into one synthetic field per
+            // declared input of the currently-selected entries.
+            if field.source.as_deref() == Some(SELECTED_INPUTS) {
+                for decl in catalog.required_inputs(&out.selected_keys) {
+                    if decl
+                        .condition
+                        .as_deref()
+                        .is_some_and(|c| !eval_condition(c, &out.vars))
+                    {
+                        continue;
+                    }
+                    let synthetic = decl.to_field();
+                    let stored = match answerer.ask(&synthetic, &[])? {
+                        WizValue::Skip => continue,
+                        WizValue::Multi(v) => {
+                            Value::Array(v.into_iter().map(Value::String).collect())
+                        }
+                        WizValue::One(s) | WizValue::Text(s) => Value::String(s),
+                        WizValue::Bool(b) => Value::Bool(b),
+                    };
+                    out.vars.insert(synthetic.id.clone(), stored);
+                }
+                continue;
+            }
+            let choices = choices_for_vars(field, catalog, &out.vars, group_order);
             let ans = answerer.ask(field, &choices)?;
             let stored = match ans {
                 WizValue::Skip => continue,
@@ -323,20 +473,28 @@ pub struct WizardSession<'a> {
     def: &'a WizardDef,
     catalog: &'a Catalog,
     vars: Map<String, Value>,
+    group_order: Vec<String>,
     /// Index into `def.pages` of the page currently shown.
     idx: usize,
 }
 
 impl<'a> WizardSession<'a> {
-    pub fn new(def: &'a WizardDef, catalog: &'a Catalog) -> Self {
+    pub fn new(def: &'a WizardDef, catalog: &'a Catalog, group_order: Vec<String>) -> Self {
         let mut s = Self {
             def,
             catalog,
             vars: Map::new(),
+            group_order,
             idx: 0,
         };
         s.idx = s.next_active_from(0).unwrap_or(def.pages.len());
         s
+    }
+
+    /// Catalog keys selected so far (recomputed from currently-active
+    /// catalog-source fields).
+    pub fn current_selected_keys(&self) -> Vec<String> {
+        collect_outcome(self.def, &self.vars).selected_keys
     }
 
     fn active(&self, i: usize) -> bool {
@@ -360,24 +518,43 @@ impl<'a> WizardSession<'a> {
     pub fn current(&self) -> Option<&'a Page> {
         self.def.pages.get(self.idx)
     }
-    /// Visible fields of the current page (field conditions applied).
-    pub fn fields(&self) -> Vec<&'a Field> {
-        self.current()
-            .map(|p| {
-                p.fields
-                    .iter()
-                    .filter(|f| {
-                        f.condition
-                            .as_deref()
-                            .map(|c| eval_condition(c, &self.vars))
-                            .unwrap_or(true)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+    /// Visible fields of the current page (field conditions applied). A
+    /// `selected.inputs` field expands in place into one synthetic field per
+    /// declared input of the currently-selected entries (each gated by its
+    /// own `condition`). Returns owned fields because synthetic ones are not
+    /// part of `WizardDef`.
+    pub fn fields(&self) -> Vec<Field> {
+        let Some(p) = self.current() else {
+            return Vec::new();
+        };
+        let mut out: Vec<Field> = Vec::new();
+        for f in &p.fields {
+            if f.condition
+                .as_deref()
+                .is_some_and(|c| !eval_condition(c, &self.vars))
+            {
+                continue;
+            }
+            if f.source.as_deref() == Some(SELECTED_INPUTS) {
+                let keys = self.current_selected_keys();
+                for decl in self.catalog.required_inputs(&keys) {
+                    if decl
+                        .condition
+                        .as_deref()
+                        .is_some_and(|c| !eval_condition(c, &self.vars))
+                    {
+                        continue;
+                    }
+                    out.push(decl.to_field());
+                }
+                continue;
+            }
+            out.push(f.clone());
+        }
+        out
     }
     pub fn choices(&self, field: &Field) -> Vec<Choice> {
-        choices_for(field, self.catalog)
+        choices_for_vars(field, self.catalog, &self.vars, &self.group_order)
     }
     /// Prior answer for a field (so back-nav re-renders with it selected).
     pub fn answer_for(&self, id: &str) -> Option<&Value> {
@@ -519,8 +696,13 @@ mod tests {
         let mut a = Map::new();
         a.insert("INSTALL_TOOLS".into(), serde_json::json!(["ripgrep"]));
         a.insert("OPENAI_API_KEY".into(), Value::String("sk-x".into()));
-        let o = run_wizard(&WizardDef::from_str(WIZ).unwrap(), &cat(), &StaticAnswerer(a))
-            .unwrap();
+        let o = run_wizard(
+            &WizardDef::from_str(WIZ).unwrap(),
+            &cat(),
+            &StaticAnswerer(a),
+            &[],
+        )
+        .unwrap();
         assert_eq!(o.selected_keys, vec!["ripgrep"]);
         assert_eq!(o.vars.get("OPENAI_API_KEY").unwrap(), "sk-x");
     }
@@ -531,8 +713,13 @@ mod tests {
         a.insert("INSTALL_TOOLS".into(), serde_json::json!(["node"]));
         // OPENAI not provided; its page is gated on ripgrep (not picked) so
         // the required-secret is never asked → no MissingInput error.
-        let o = run_wizard(&WizardDef::from_str(WIZ).unwrap(), &cat(), &StaticAnswerer(a))
-            .unwrap();
+        let o = run_wizard(
+            &WizardDef::from_str(WIZ).unwrap(),
+            &cat(),
+            &StaticAnswerer(a),
+            &[],
+        )
+        .unwrap();
         assert_eq!(o.selected_keys, vec!["node"]);
         assert!(o.vars.get("OPENAI_API_KEY").is_none());
     }
@@ -553,6 +740,7 @@ mod tests {
             &WizardDef::from_str(wiz).unwrap(),
             &cat(),
             &StaticAnswerer(Map::new()),
+            &[],
         );
         assert!(matches!(r, Err(EngineError::MissingInput(_))));
     }
@@ -561,7 +749,7 @@ mod tests {
     fn session_navigates_forward_and_back_with_recompute() {
         let d = WizardDef::from_str(WIZ).unwrap();
         let c = cat();
-        let mut s = WizardSession::new(&d, &c);
+        let mut s = WizardSession::new(&d, &c, vec![]);
         // page 1 = tools; progress 1/1 because keys page is gated off (no
         // INSTALL_TOOLS yet → 'ripgrep' in '' is false).
         assert_eq!(s.current().unwrap().id, "tools");
@@ -591,7 +779,7 @@ mod tests {
     fn session_finish_recomputes_keys_from_active_only() {
         let d = WizardDef::from_str(WIZ).unwrap();
         let c = cat();
-        let mut s = WizardSession::new(&d, &c);
+        let mut s = WizardSession::new(&d, &c, vec![]);
         let mut a = Map::new();
         a.insert("INSTALL_TOOLS".into(), serde_json::json!(["ripgrep", "node"]));
         s.submit(a).unwrap();
@@ -602,5 +790,171 @@ mod tests {
         let o = s.finish();
         assert_eq!(o.selected_keys, vec!["ripgrep", "node"]);
         assert_eq!(o.vars.get("OPENAI_API_KEY").unwrap(), "sk");
+    }
+
+    fn cat_inputs() -> Catalog {
+        Catalog::from_json_str(
+            r#"{ "clis":[
+              {"key":"alpha","install":"npm:a","requires_input":[
+                 {"id":"ALPHA_TOKEN","type":"secret","required":true},
+                 {"id":"OAUTH","type":"toggle","required":false,
+                  "condition":"${USE_OAUTH} == 'yes'"}]},
+              {"key":"beta","install":"npm:b","condition":"${OS} == 'linux'",
+               "requires_input":[{"id":"ALPHA_TOKEN","type":"secret"}]}
+            ]}"#,
+        )
+        .unwrap()
+    }
+
+    const WIZ_INPUTS: &str = r#"
+        [[page]]
+        id = "pick"
+        [[page.field]]
+        id = "clis"
+        type = "multiselect"
+        source = "catalog.clis"
+
+        [[page]]
+        id = "inputs"
+        [[page.field]]
+        id = "_req"
+        type = "text"
+        source = "selected.inputs"
+    "#;
+
+    #[test]
+    fn selected_inputs_expands_synthetic_fields() {
+        let mut a = Map::new();
+        a.insert("clis".into(), serde_json::json!(["alpha"]));
+        a.insert("ALPHA_TOKEN".into(), Value::String("sek".into()));
+        let o = run_wizard(
+            &WizardDef::from_str(WIZ_INPUTS).unwrap(),
+            &cat_inputs(),
+            &StaticAnswerer(a),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(o.vars.get("ALPHA_TOKEN").unwrap(), "sek");
+    }
+
+    #[test]
+    fn selected_inputs_condition_gates_field() {
+        // OAUTH only asked when USE_OAUTH == yes; here it's not set, so the
+        // gated input is skipped and its absence is not an error.
+        let mut a = Map::new();
+        a.insert("clis".into(), serde_json::json!(["alpha"]));
+        a.insert("ALPHA_TOKEN".into(), Value::String("sek".into()));
+        let o = run_wizard(
+            &WizardDef::from_str(WIZ_INPUTS).unwrap(),
+            &cat_inputs(),
+            &StaticAnswerer(a),
+            &[],
+        )
+        .unwrap();
+        assert!(o.vars.get("OAUTH").is_none());
+    }
+
+    #[test]
+    fn selected_inputs_required_missing_is_error() {
+        let mut a = Map::new();
+        a.insert("clis".into(), serde_json::json!(["alpha"]));
+        // ALPHA_TOKEN required but not provided.
+        let r = run_wizard(
+            &WizardDef::from_str(WIZ_INPUTS).unwrap(),
+            &cat_inputs(),
+            &StaticAnswerer(a),
+            &[],
+        );
+        assert!(matches!(r, Err(EngineError::MissingInput(_))));
+    }
+
+    #[test]
+    fn selected_inputs_dedup_two_entries_same_id() {
+        // alpha+beta both declare ALPHA_TOKEN → asked once.
+        let mut a = Map::new();
+        a.insert("clis".into(), serde_json::json!(["alpha", "beta"]));
+        a.insert("ALPHA_TOKEN".into(), Value::String("one".into()));
+        let o = run_wizard(
+            &WizardDef::from_str(WIZ_INPUTS).unwrap(),
+            &cat_inputs(),
+            &StaticAnswerer(a),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(o.vars.get("ALPHA_TOKEN").unwrap(), "one");
+    }
+
+    #[test]
+    fn choices_for_vars_hides_entry_when_condition_false() {
+        let c = cat_inputs();
+        let f = Field {
+            id: "x".into(),
+            field_type: FieldType::Multiselect,
+            prompt: None,
+            default: None,
+            required: false,
+            source: Some("catalog.clis".into()),
+            options: vec![],
+            condition: None,
+        };
+        let mut vars = Map::new();
+        vars.insert("OS".into(), Value::String("macos".into()));
+        let ch = choices_for_vars(&f, &c, &vars, &[]);
+        assert!(ch.iter().all(|x| x.value != "beta"));
+        assert!(ch.iter().any(|x| x.value == "alpha"));
+    }
+
+    #[test]
+    fn choices_for_vars_shows_entry_when_condition_true() {
+        let c = cat_inputs();
+        let f = Field {
+            id: "x".into(),
+            field_type: FieldType::Multiselect,
+            prompt: None,
+            default: None,
+            required: false,
+            source: Some("catalog.clis".into()),
+            options: vec![],
+            condition: None,
+        };
+        let mut vars = Map::new();
+        vars.insert("OS".into(), Value::String("linux".into()));
+        let ch = choices_for_vars(&f, &c, &vars, &[]);
+        assert!(ch.iter().any(|x| x.value == "beta"));
+    }
+
+    #[test]
+    fn eval_version_ge_le_gt_lt() {
+        let v = |k: &str, val: &str| {
+            let mut m = Map::new();
+            m.insert(k.into(), Value::String(val.into()));
+            m
+        };
+        assert!(eval_condition("${NODE} >= '20'", &v("NODE", "22.3.1")));
+        assert!(!eval_condition("${NODE} >= '20'", &v("NODE", "18.9")));
+        assert!(eval_condition("${PY} >= '3.10'", &v("PY", "3.12.1")));
+        assert!(!eval_condition("${PY} >= '3.10'", &v("PY", "3.9.18")));
+        assert!(eval_condition("${V} <= '1.2.3'", &v("V", "1.2.3")));
+        assert!(eval_condition("${V} > '1.0'", &v("V", "1.0.1")));
+        assert!(!eval_condition("${V} > '1.0'", &v("V", "1.0.0")));
+        assert!(eval_condition("${V} < '2'", &v("V", "1.9.9")));
+    }
+
+    #[test]
+    fn eval_version_eq_semver() {
+        let mut m = Map::new();
+        m.insert("V".into(), Value::String("1.2.0".into()));
+        assert!(eval_condition("${V} == '1.2'", &m)); // 1.2.0 == 1.2
+        assert!(!eval_condition("${V} != '1.2'", &m));
+    }
+
+    #[test]
+    fn eval_version_falls_back_to_string_when_unparseable() {
+        let mut m = Map::new();
+        m.insert("MODE".into(), Value::String("fast".into()));
+        assert!(eval_condition("${MODE} == 'fast'", &m));
+        assert!(!eval_condition("${MODE} == 'slow'", &m));
+        // version ops on non-version values → false (no panic).
+        assert!(!eval_condition("${MODE} >= '1.0'", &m));
     }
 }
