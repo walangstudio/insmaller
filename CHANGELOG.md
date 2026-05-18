@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.1] - 2026-05-18
+
+### Changed
+- CI/release workflows pin Node24-native action majors (`checkout@v5`,
+  `setup-python@v6`, `upload-artifact@v5`, `download-artifact@v5`) and drop the
+  `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24` opt-in env. No build behavior change;
+  removes the Node 20 deprecation notices.
+
 ## [0.2.0] - 2026-05-18
 
 Generic, reusable engine primitives so a downstream config-only consumer
