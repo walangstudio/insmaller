@@ -15,6 +15,58 @@ use std::sync::Arc;
 
 type Globs = Arc<Vec<String>>;
 
+/// Optional generic wait-loop on a step. Distinct from `Step.retries` (an
+/// on-error retry the engine applies): `poll` re-runs the processor's own
+/// operation up to `attempts` times with `delay_ms` between tries until it
+/// exits zero. Pure config ⇒ a `wait-ready` task needs no engine knowledge of
+/// what it's waiting for.
+struct PollCfg {
+    attempts: u32,
+    delay_ms: u64,
+    until_exit_zero: bool,
+}
+
+fn poll_cfg(step: &Step) -> Option<PollCfg> {
+    let o = step.params.get("poll")?.as_object()?;
+    Some(PollCfg {
+        attempts: o.get("attempts").and_then(|v| v.as_u64()).unwrap_or(1) as u32,
+        delay_ms: o.get("delay_ms").and_then(|v| v.as_u64()).unwrap_or(0),
+        until_exit_zero: o
+            .get("until_exit_zero")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    })
+}
+
+/// Run `op` once, or (when `poll.until_exit_zero`) poll it until success or
+/// `attempts` is exhausted.
+async fn with_poll<F, Fut>(step: &Step, mut op: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    match poll_cfg(step) {
+        Some(p) if p.until_exit_zero => {
+            let attempts = p.attempts.max(1);
+            let mut last: Option<anyhow::Error> = None;
+            for i in 0..attempts {
+                match op().await {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        last = Some(e);
+                        if i + 1 < attempts {
+                            tokio::time::sleep(std::time::Duration::from_millis(p.delay_ms))
+                                .await;
+                        }
+                    }
+                }
+            }
+            Err(last.unwrap_or_else(|| anyhow::anyhow!("poll exhausted")))
+        }
+        _ => op().await,
+    }
+}
+
 /// Register all built-ins from engine `[settings]` (path globs + the
 /// download hardening knobs).
 pub fn builtins(settings: &crate::config::Settings) -> ProcessorRegistry {
@@ -71,7 +123,8 @@ impl Processor for ShellProcessor {
         _i: &dyn InputResolver,
     ) -> Result<StepOutput> {
         let script = resolve_script(step, ctx)?;
-        run_sh(&script, &self.0, step_dir(step, ctx)?.as_deref()).await?;
+        let dir = step_dir(step, ctx)?;
+        with_poll(step, || run_sh(&script, &self.0, dir.as_deref())).await?;
         Ok(StepOutput::ok())
     }
 }
@@ -118,7 +171,11 @@ impl Processor for ExecProcessor {
         _i: &dyn InputResolver,
     ) -> Result<StepOutput> {
         let (program, args) = build_exec(step, ctx)?;
-        run_cmd(&program, &args, &self.0, step_dir(step, ctx)?.as_deref()).await?;
+        let dir = step_dir(step, ctx)?;
+        with_poll(step, || {
+            run_cmd(&program, &args, &self.0, dir.as_deref())
+        })
+        .await?;
         Ok(StepOutput::ok())
     }
 }
@@ -214,14 +271,21 @@ impl Processor for CheckCommandProcessor {
             step.param_str("program")
                 .context("check_command missing `program`")?,
         )?;
-        if resolve_in_path(&program, &enriched_path(&self.0)).is_none() {
-            let msg = step
-                .param_str("on_missing")
-                .map(|m| ctx.render(m))
-                .transpose()?
-                .unwrap_or_else(|| format!("required command '{program}' not found"));
-            bail!(msg);
-        }
+        let msg = step
+            .param_str("on_missing")
+            .map(|m| ctx.render(m))
+            .transpose()?
+            .unwrap_or_else(|| format!("required command '{program}' not found"));
+        // `poll` lets this wait for a binary to appear on PATH (generic
+        // wait-ready); without it, a single presence check as before.
+        with_poll(step, || async {
+            if resolve_in_path(&program, &enriched_path(&self.0)).is_some() {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(msg.clone()))
+            }
+        })
+        .await?;
         Ok(StepOutput::ok())
     }
 }

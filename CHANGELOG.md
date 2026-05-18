@@ -1,0 +1,67 @@
+# Changelog
+
+All notable changes to this project are documented here. The format follows
+[Keep a Changelog](https://keepachangelog.com/) and the project uses
+[Semantic Versioning](https://semver.org/).
+
+## [0.2.0] - 2026-05-18
+
+Generic, reusable engine primitives so a downstream config-only consumer
+(codetainyrrr) drives everything through `insmaller` + config. All new schema
+is optional with serde defaults; existing catalogs and demos are unaffected.
+The single `eval_condition` grammar stays the only expression evaluator.
+
+### Added
+- **Entry `condition`** — an entry/option is offered/installed only when its
+  predicate holds; a conditioned-out entry is skipped (reported, counted
+  completed), not failed. Honored on the direct `install_many` path too.
+- **`requires_input` + `selected.inputs`** — an entry declares the inputs it
+  needs; a wizard field `source = "selected.inputs"` expands in place into one
+  field per declared input of the current selection (union, dedup by id,
+  selection order), each gated by its own condition.
+- **`[settings.setup_output]` + `write_env` processor** — emit the resolved
+  vars to a single env file with an optional header and allowlist, written
+  atomically (temp + rename, optional Unix mode).
+- **Named tasks** — `[task.<name>]` ordered, per-OS, generic step pipelines
+  with `needs` composition (cycle-guarded at load); `insmaller task <name>`
+  (alias `insmaller run`). No Docker/container concepts in engine code.
+- **`poll`** on shell/exec/check_command — `{ attempts, delay_ms,
+  until_exit_zero }` wait-ready loop, distinct from on-error `retries`.
+- **`[project]` block** — presentation strings (name/about, `intro_template`/
+  `outro_template` rendered through the wizard vars) plus opaque pass-through
+  `extra` available to task-script templating. Never read by install logic.
+- **Configurable group order** — `project.group_order` orders wizard groups
+  (unlisted after, alphabetical), then key within a group.
+- **`provides_command`** — sugar that auto-appends a `check_command` verify
+  step for an entry's binary.
+- **Version-compare operators** in `eval_condition`: `>= <= > <` and
+  semver-aware `== !=` (e.g. `${NODE} >= '20'`), with string fallback when a
+  side is not version-like.
+- Catalog-tree compatibility: `category` accepted as a serde alias of `group`;
+  optional `name` label passthrough; unknown entry fields still ignored
+  (no `deny_unknown_fields`).
+- E2E fixtures under `examples/e2e-*` and integration coverage
+  (`tests/codetainyrrr_e2e.rs`).
+
+### Changed
+- Windows `symlink` of a directory now tries a real symlink, then a directory
+  **junction** (no privilege required), then a recursive copy — previously it
+  fell straight to a copy.
+- `install_many_with` takes a `run_vars` argument (entry-condition evaluation);
+  `install_many` is unchanged and passes none.
+- `WizardSession::fields()` returns owned `Vec<Field>` (synthetic
+  `selected.inputs` fields are not part of `WizardDef`).
+- `run_wizard` / `WizardSession::new` take a `group_order` argument.
+- Step-pipeline execution exposed as `run_step_pipeline` for the task runner.
+
+### Notes
+- `release.yml` was already clean (no merge-conflict marker); the pipeline
+  produces the four target archives + `SHA256SUMS`.
+- `cargo test --workspace` is 203 tests, clippy clean.
+
+## [0.1.0]
+
+Initial release: config-driven installer engine — declarative step pipelines,
+built-in processors, desugar table, recipe packs, optional wizard, sentinels,
+JSON `EntrySource`, CLI (`install`/`uninstall`/`setup`), CI + release
+workflows.

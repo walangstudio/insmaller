@@ -1,0 +1,27 @@
+{
+  "_comment": "Codetainyrrr-shape e2e fixture: clis[] with requires_input (P1-A), entry condition (P1-B), category alias + name passthrough (catalog-tree compat). Loads with no consumer-specific engine code.",
+  "clis": [
+    {
+      "key": "alpha",
+      "name": "Alpha CLI",
+      "category": "core",
+      "description": "always installs; declares a required secret",
+      "default": true,
+      "requires_input": [
+        { "id": "ALPHA_TOKEN", "type": "secret", "required": true }
+      ],
+      "steps": [{ "type": "shell", "script": "echo alpha-ok" }]
+    },
+    {
+      "key": "beta",
+      "name": "Beta CLI",
+      "category": "optional",
+      "description": "Linux-only; skipped via entry condition when OS_GATE != linux",
+      "default": false,
+      "condition": "${OS_GATE} == 'linux'",
+      "supported_clis": ["beta"],
+      "oauth_supported": true,
+      "steps": [{ "type": "shell", "script": "echo beta-ok" }]
+    }
+  ]
+}

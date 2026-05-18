@@ -29,22 +29,29 @@ pub mod reporter;
 pub mod scripts;
 pub mod sentinel;
 pub mod step;
+pub mod tasks;
 pub mod wizard;
 
-pub use config::{EngineConfig, LoadedConfig, ParseKind, Recipe, Settings, ThemeColors};
+pub use config::{
+    CompiledTask, EngineConfig, LoadedConfig, OutputFormat, ParseKind, ProjectMeta, Recipe,
+    Settings, SetupOutput, TaskDef, ThemeColors,
+};
 pub use ctx::Ctx;
 pub use desugar::{desugar, Desugared};
 pub use error::{EngineError, Result};
 pub use input::{EnvResolver, InputResolver, PromptSpec, ResolvedInput, StaticResolver};
 pub use json_catalog::{Catalog, CatalogOption};
 pub use wizard::{
-    collect_outcome, run_wizard, Answerer, Choice, Field, FieldType, Page, StaticAnswerer,
-    WizValue, WizardDef, WizardOutcome, WizardSession,
+    choices_for_vars, collect_outcome, eval_condition, run_wizard, Answerer, Choice, Field,
+    FieldType, InputDecl, Page, StaticAnswerer, WizValue, WizardDef, WizardOutcome,
+    WizardSession, SELECTED_INPUTS,
 };
 pub use orchestrator::{
-    install_many, install_many_with, uninstall_many, uninstall_many_with, EntryRef,
-    EntrySource, InstallSummary, RunOpts,
+    install_many, install_many_with, run_step_pipeline, uninstall_many, uninstall_many_with,
+    EntryRef, EntrySource, InstallSummary, RunOpts,
 };
+pub use processors_io::write_setup_output;
+pub use tasks::run_task;
 pub use plugin::{
     register_external, ExternalProcessor, PluginResponse, PluginTransport, PROTOCOL,
 };

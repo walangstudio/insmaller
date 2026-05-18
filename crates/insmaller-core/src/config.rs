@@ -1,7 +1,7 @@
 use crate::error::{EngineError, Result};
 use crate::step::Step;
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 /// The single engine config (`installer.toml`): processors are built-in code,
@@ -17,6 +17,60 @@ pub struct EngineConfig {
     pub recipes_raw: Vec<RecipeRaw>,
     #[serde(default, rename = "plugin")]
     pub plugins: Vec<PluginDecl>,
+    /// Branding/presentation metadata. Never read by install/task logic.
+    #[serde(default)]
+    pub project: Option<ProjectMeta>,
+    /// Named scriptable lifecycle tasks (`[task.run]`, `[task.build]`, …).
+    #[serde(default, rename = "task")]
+    pub tasks_raw: BTreeMap<String, TaskDef>,
+}
+
+/// Branding/presentation strings the CLI/wizard interpolates. The engine MUST
+/// NOT read this for install logic; `extra` is opaque pass-through available
+/// to task-script templating only.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ProjectMeta {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub about: Option<String>,
+    #[serde(default)]
+    pub intro_template: Option<String>,
+    #[serde(default)]
+    pub outro_template: Option<String>,
+    #[serde(default)]
+    pub default_cli: Option<String>,
+    #[serde(default)]
+    pub group_order: Vec<String>,
+    #[serde(default)]
+    pub extra: BTreeMap<String, String>,
+}
+
+/// A named task: an ordered, per-OS, generic [`Step`] pipeline plus simple
+/// `needs` composition. The engine knows nothing of what the steps do
+/// (Docker/systemd/k8s all live in the script bodies).
+#[derive(Debug, Clone, Deserialize)]
+pub struct TaskDef {
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub steps: Vec<toml::Table>,
+    /// Per-OS overrides keyed by `std::env::consts::OS`
+    /// ("linux"/"macos"/"windows"); falls back to `steps` when no match.
+    #[serde(default)]
+    pub os: Option<BTreeMap<String, Vec<toml::Table>>>,
+    /// Other tasks to run first (ordered, cycle-guarded).
+    #[serde(default)]
+    pub needs: Vec<String>,
+}
+
+/// Parsed [`TaskDef`]: step tables resolved into `Step`s at load.
+#[derive(Debug, Clone)]
+pub struct CompiledTask {
+    pub description: Option<String>,
+    pub steps: Vec<Step>,
+    pub os_steps: BTreeMap<String, Vec<Step>>,
+    pub needs: Vec<String>,
 }
 
 /// A `[[plugin]]` declaration. P2 uses `path` (recipe-pack). `command`/`kinds`
@@ -79,6 +133,36 @@ pub struct Settings {
     /// Sibling wizard path, same resolution/precedence as `catalog`.
     #[serde(default)]
     pub wizard: Option<String>,
+    /// After `setup`, render the resolved vars to a single file a runtime
+    /// consumes. Absent ⇒ no-op.
+    #[serde(default)]
+    pub setup_output: Option<SetupOutput>,
+}
+
+/// Output sink format. Only `env` today; an enum so adding json/toml later is
+/// non-breaking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputFormat {
+    #[default]
+    Env,
+}
+
+/// `[settings.setup_output]` — emit resolved vars to `path`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetupOutput {
+    pub path: String,
+    #[serde(default)]
+    pub format: OutputFormat,
+    /// Optional `# ...` header line.
+    #[serde(default)]
+    pub header: Option<String>,
+    /// Allowlist of var names; absent ⇒ all scalar vars.
+    #[serde(default)]
+    pub include: Option<Vec<String>>,
+    /// Unix file mode (e.g. `0o600`).
+    #[serde(default)]
+    pub mode: Option<u32>,
 }
 
 /// Optional hex (`#rrggbb`) overrides for individual palette roles. Core
@@ -111,6 +195,7 @@ impl Default for Settings {
             colors: None,
             catalog: None,
             wizard: None,
+            setup_output: None,
         }
     }
 }
@@ -206,9 +291,81 @@ pub struct LoadedConfig {
     pub desugar: Vec<DesugarRule>,
     /// Raw `[[plugin]]` decls (E1/E4 transports are read here in P3/P5).
     pub plugins: Vec<PluginDecl>,
+    /// Presentation metadata (CLI-only; engine never reads this).
+    pub project: Option<ProjectMeta>,
+    /// Named lifecycle tasks, step pipelines compiled at load.
+    pub tasks: BTreeMap<String, CompiledTask>,
     recipes: HashMap<String, Recipe>,
     /// Desugar prefixes claimed by core (immutable; plugins cannot shadow).
     core_prefixes: HashSet<String>,
+}
+
+fn compile_tasks(raw: BTreeMap<String, TaskDef>) -> Result<BTreeMap<String, CompiledTask>> {
+    let mut out: BTreeMap<String, CompiledTask> = BTreeMap::new();
+    for (name, t) in raw {
+        let steps = t
+            .steps
+            .into_iter()
+            .map(Step::from_table)
+            .collect::<Result<Vec<_>>>()?;
+        let mut os_steps = BTreeMap::new();
+        if let Some(osm) = t.os {
+            for (os, tables) in osm {
+                let s = tables
+                    .into_iter()
+                    .map(Step::from_table)
+                    .collect::<Result<Vec<_>>>()?;
+                os_steps.insert(os, s);
+            }
+        }
+        out.insert(
+            name,
+            CompiledTask {
+                description: t.description,
+                steps,
+                os_steps,
+                needs: t.needs,
+            },
+        );
+    }
+    // `needs` must reference real tasks, with no cycles (DFS, same shape as
+    // the orchestrator dep guard).
+    for (name, ct) in &out {
+        for n in &ct.needs {
+            if !out.contains_key(n) {
+                return Err(EngineError::Config(format!(
+                    "task '{name}' needs unknown task '{n}'"
+                )));
+            }
+        }
+    }
+    fn visit(
+        name: &str,
+        tasks: &BTreeMap<String, CompiledTask>,
+        stack: &mut Vec<String>,
+        done: &mut HashSet<String>,
+    ) -> Result<()> {
+        if done.contains(name) {
+            return Ok(());
+        }
+        if stack.iter().any(|s| s == name) {
+            return Err(EngineError::Config(format!(
+                "task dependency cycle through '{name}'"
+            )));
+        }
+        stack.push(name.to_string());
+        for n in &tasks[name].needs {
+            visit(n, tasks, stack, done)?;
+        }
+        stack.pop();
+        done.insert(name.to_string());
+        Ok(())
+    }
+    let mut done = HashSet::new();
+    for name in out.keys() {
+        visit(name, &out, &mut Vec::new(), &mut done)?;
+    }
+    Ok(out)
 }
 
 impl LoadedConfig {
@@ -290,10 +447,13 @@ impl LoadedConfig {
         }
         Self::validate_desugar(&raw.desugar, &recipes)?;
         let core_prefixes = raw.desugar.iter().map(|d| d.prefix.clone()).collect();
+        let tasks = compile_tasks(raw.tasks_raw)?;
         Ok(Self {
             settings: raw.settings,
             desugar: raw.desugar,
             plugins: raw.plugins,
+            project: raw.project,
+            tasks,
             recipes,
             core_prefixes,
         })
@@ -441,6 +601,154 @@ mod tests {
             parse = "single_arg"
         "#;
         assert!(LoadedConfig::from_str(bad).is_err());
+    }
+
+    #[test]
+    fn setup_output_defaults_to_none() {
+        let cfg = LoadedConfig::from_str("").unwrap();
+        assert!(cfg.settings.setup_output.is_none());
+    }
+
+    #[test]
+    fn setup_output_all_fields_parse() {
+        let cfg = LoadedConfig::from_str(
+            r#"
+            [settings.setup_output]
+            path = "~/.app/out.env"
+            format = "env"
+            header = "generated"
+            include = ["A", "B"]
+            mode = 0o600
+            "#,
+        )
+        .unwrap();
+        let so = cfg.settings.setup_output.unwrap();
+        assert_eq!(so.path, "~/.app/out.env");
+        assert_eq!(so.format, OutputFormat::Env);
+        assert_eq!(so.header.as_deref(), Some("generated"));
+        assert_eq!(so.include.unwrap(), vec!["A", "B"]);
+        assert_eq!(so.mode, Some(0o600));
+    }
+
+    #[test]
+    fn project_defaults_to_none() {
+        let cfg = LoadedConfig::from_str("").unwrap();
+        assert!(cfg.project.is_none());
+    }
+
+    #[test]
+    fn project_all_fields_parse() {
+        let cfg = LoadedConfig::from_str(
+            r#"
+            [project]
+            name = "Demo"
+            about = "a demo"
+            intro_template = "Hi {{ name }}"
+            outro_template = "Bye"
+            default_cli = "claude"
+            group_order = ["core", "extra"]
+            extra = { image_tag = "demo:1", container_name = "demo" }
+            "#,
+        )
+        .unwrap();
+        let p = cfg.project.unwrap();
+        assert_eq!(p.name.as_deref(), Some("Demo"));
+        assert_eq!(p.group_order, vec!["core", "extra"]);
+        assert_eq!(p.extra.get("image_tag").unwrap(), "demo:1");
+    }
+
+    #[test]
+    fn project_extra_is_btreemap() {
+        let cfg = LoadedConfig::from_str(
+            r#"
+            [project.extra]
+            z = "1"
+            a = "2"
+            "#,
+        )
+        .unwrap();
+        let proj = cfg.project.unwrap();
+        let keys: Vec<&String> = proj.extra.keys().collect();
+        assert_eq!(keys, vec!["a", "z"]); // BTreeMap = sorted
+    }
+
+    #[test]
+    fn task_parses_basic() {
+        let cfg = LoadedConfig::from_str(
+            r#"
+            [task.build]
+            description = "build it"
+            [[task.build.steps]]
+            type = "shell"
+            script = "echo build"
+            "#,
+        )
+        .unwrap();
+        let t = cfg.tasks.get("build").unwrap();
+        assert_eq!(t.description.as_deref(), Some("build it"));
+        assert_eq!(t.steps.len(), 1);
+        assert_eq!(t.steps[0].kind, "shell");
+    }
+
+    #[test]
+    fn task_os_override_parses() {
+        let cfg = LoadedConfig::from_str(
+            r#"
+            [task.run]
+            [[task.run.steps]]
+            type = "shell"
+            script = "echo generic"
+            [[task.run.os.linux]]
+            type = "shell"
+            script = "echo linux"
+            [[task.run.os.windows]]
+            type = "shell"
+            script = "echo win"
+            "#,
+        )
+        .unwrap();
+        let t = cfg.tasks.get("run").unwrap();
+        assert_eq!(t.os_steps.get("linux").unwrap().len(), 1);
+        assert_eq!(t.os_steps.get("windows").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn task_needs_unknown_is_error() {
+        let r = LoadedConfig::from_str(
+            r#"
+            [task.a]
+            needs = ["ghost"]
+            [[task.a.steps]]
+            type = "shell"
+            script = "true"
+            "#,
+        );
+        assert!(format!("{}", r.unwrap_err()).contains("unknown task 'ghost'"));
+    }
+
+    #[test]
+    fn task_needs_cycle_is_error() {
+        let r = LoadedConfig::from_str(
+            r#"
+            [task.a]
+            needs = ["b"]
+            [[task.a.steps]]
+            type = "shell"
+            script = "true"
+            [task.b]
+            needs = ["a"]
+            [[task.b.steps]]
+            type = "shell"
+            script = "true"
+            "#,
+        );
+        assert!(format!("{}", r.unwrap_err()).contains("cycle"));
+    }
+
+    #[test]
+    fn task_empty_is_ok() {
+        let cfg = LoadedConfig::from_str("").unwrap();
+        assert!(cfg.tasks.is_empty());
     }
 
     #[test]

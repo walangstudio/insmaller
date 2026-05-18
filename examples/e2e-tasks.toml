@@ -1,0 +1,47 @@
+# P1-D fixture: named scriptable tasks. Zero Docker/container concepts in the
+# engine — any docker commands would live here as plain script bodies. This
+# fixture stays portable (echo/true) so the offline suite can run it.
+
+[settings]
+sentinel_dir_name = "insmaller-e2e-tasks"
+
+[project.extra]
+PROJ_MSG = "hello-from-project"
+
+[task.check-env]
+description = "prints a project.extra var (templating)"
+[[task.check-env.steps]]
+type   = "shell"
+script = "echo CHECK={{ PROJ_MSG }}"
+
+[task.wait-ready]
+description = "generic poll-until-exit-zero (a docker readiness check would go here)"
+[[task.wait-ready.steps]]
+type    = "shell"
+script  = "true"
+poll    = { attempts = 3, delay_ms = 0, until_exit_zero = true }
+
+[task.deploy]
+description = "needs check-env first; per-OS branch, else the default step"
+needs = ["check-env"]
+[[task.deploy.steps]]
+type   = "shell"
+script = "echo generic-deploy"
+[[task.deploy.os.linux]]
+type   = "shell"
+script = "echo linux-deploy"
+[[task.deploy.os.macos]]
+type   = "shell"
+script = "echo macos-deploy"
+[[task.deploy.os.windows]]
+type   = "shell"
+script = "echo windows-deploy"
+
+[task.fail-early]
+description = "first step fails ⇒ second must not run; non-zero exit"
+[[task.fail-early.steps]]
+type   = "shell"
+script = "exit 1"
+[[task.fail-early.steps]]
+type   = "shell"
+script = "echo should-not-run"

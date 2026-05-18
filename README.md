@@ -1,9 +1,9 @@
 # insmaller
 
-![version](https://img.shields.io/badge/version-0.1.0-blue)
+![version](https://img.shields.io/badge/version-0.2.0-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![rust](https://img.shields.io/badge/rust-1.78%2B-orange)
-![tests](https://img.shields.io/badge/tests-152%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-203%20passing-brightgreen)
 
 insmaller installs things by reading a config file instead of running
 hand-written install code. You describe each tool as a list of steps in TOML,
@@ -43,8 +43,9 @@ are. So in a project that has an `insmaller.toml`, you run `insmaller setup`
 with no arguments.
 
 It runs the same config across Linux, macOS, and Windows. The OS, architecture,
-and package manager are detected at runtime; steps can be gated on them; shell
-snippets run under bash or PowerShell automatically. The bundled recipe packs
+and package manager are detected at runtime; steps and catalog entries can be
+gated on them with a single expression grammar that also does version compares
+(`${NODE} >= '20'`); shell snippets run under bash or PowerShell automatically. The bundled recipe packs
 cover apt, dnf, pacman, zypper, apk, brew, winget, scoop, choco, and the usual
 language installers (pip, pipx, cargo, gem, pnpm, yarn, rustup, asdf, mise,
 composer, deno, bun, and more) behind short `name:` prefixes.
@@ -59,10 +60,21 @@ clears the marker.
 
 The processors available to steps are shell, exec, download (with sha256 and a
 bearer-token guard), extract (tar, zip, gz, bz2, xz, with path-traversal
-checks), copy, symlink (copies instead on Windows), merge_json, check_command,
-prompt, save_input, ensure_line, and sentinel_meta. Recipes can also be
-provided as separate TOML packs, or as external programs that speak a small
-JSON protocol.
+checks), copy, symlink (a directory junction, then a copy, as fallback on
+Windows), merge_json, check_command, prompt, save_input, ensure_line,
+write_env, and sentinel_meta. shell/exec/check_command take an optional
+`poll = { attempts, delay_ms, until_exit_zero }` for wait-ready loops. Recipes
+can also be provided as separate TOML packs, or as external programs that speak
+a small JSON protocol.
+
+Beyond installing, the config can declare: per-entry `condition` (offer/skip an
+entry on a predicate); `requires_input` on an entry plus a `selected.inputs`
+wizard page that collects the union of declared inputs of the selection;
+`[settings.setup_output]` to emit the resolved vars to a single env file
+atomically; named `[task.*]` lifecycle pipelines (`insmaller task <name>`) with
+`needs` ordering and per-OS step overrides; and a `[project]` block of
+presentation strings and opaque pass-through `extra` for task templating. All
+of it is optional and additive — existing catalogs are unaffected.
 
 ## Getting started
 
@@ -85,6 +97,7 @@ Then, from anywhere in that project tree:
 insmaller setup              # interactive wizard, then installs the selection
 insmaller ripgrep            # install one thing directly
 insmaller uninstall ripgrep  # run its uninstall steps, clear the marker
+insmaller task build         # run a [task.build] pipeline (alias: insmaller run)
 ```
 
 Add `--dry-run` to any of these to see what would happen without doing it.
@@ -131,7 +144,7 @@ GitHub release. `insmaller --version` reports the same version.
 
 ## Status
 
-The engine is built and passing: `cargo test --workspace` is 152 tests, no
+The engine is built and passing: `cargo test --workspace` is 203 tests, no
 failures, no ignored, clippy clean. It works on its own through the CLI today.
 
 The optional native plugin transport builds with `--features cdylib`. The WASM

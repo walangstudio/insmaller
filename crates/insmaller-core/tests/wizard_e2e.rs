@@ -33,7 +33,7 @@ async fn sample_wizard_resolves_and_drives_install() {
     ans.insert("PP_AUTHOR".into(), json!("alice")); // required by gated page
     // GIT_AUTHOR_EMAIL omitted → optional → Skip (no error)
 
-    let outcome = run_wizard(&wiz, &cat, &StaticAnswerer(ans)).unwrap();
+    let outcome = run_wizard(&wiz, &cat, &StaticAnswerer(ans), &[]).unwrap();
     assert_eq!(outcome.selected_keys, vec!["mememo", "pair-pressure"]);
     assert_eq!(outcome.vars.get("PP_AUTHOR").unwrap(), "alice");
     assert!(outcome.vars.get("GIT_AUTHOR_EMAIL").is_none());
@@ -51,6 +51,7 @@ async fn sample_wizard_resolves_and_drives_install() {
         &sent,
         &outcome.selected_keys,
         RunOpts { dry_run: true, ..Default::default() },
+        None,
     )
     .await;
     assert!(s.failed.is_empty(), "{:?}", s.failed);
@@ -67,7 +68,7 @@ async fn gated_required_field_not_asked_when_condition_false() {
     let mut ans = Map::new();
     ans.insert("CODING_CLI".into(), json!(""));
     ans.insert("INSTALL_TOOLS".into(), json!(["mememo"]));
-    let o = run_wizard(&wiz, &cat, &StaticAnswerer(ans)).unwrap();
+    let o = run_wizard(&wiz, &cat, &StaticAnswerer(ans), &[]).unwrap();
     assert_eq!(o.selected_keys, vec!["mememo"]);
     assert!(o.vars.get("PP_AUTHOR").is_none());
 }
