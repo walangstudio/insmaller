@@ -28,13 +28,14 @@ pub fn register(r: &mut ProcessorRegistry, _g: Globs, settings: &crate::config::
     r.register(Arc::new(SymlinkProcessor));
     r.register(Arc::new(EnsureLineProcessor));
     r.register(Arc::new(WriteEnvProcessor));
+    r.register(Arc::new(BackupProcessor));
 }
 
 /// Atomic file write: write a sibling `.tmp` then rename over `path` (same
 /// filesystem ⇒ the rename is atomic). On Unix `mode` is applied before the
 /// rename so the file never exists world-readable. The temp file is removed
 /// on any error after creation.
-fn atomic_write(path: &Path, content: &[u8], mode: Option<u32>) -> Result<()> {
+pub(crate) fn atomic_write(path: &Path, content: &[u8], mode: Option<u32>) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
@@ -212,6 +213,61 @@ impl Processor for EnsureLineProcessor {
         body.push_str(&line);
         body.push('\n');
         std::fs::write(path, body).with_context(|| format!("writing {file}"))?;
+        Ok(StepOutput::ok())
+    }
+}
+
+/// `backup` — timestamped copy of `path` before something else mutates it.
+/// Generic composable step (placed before a `merge_*`/`ensure_line` in a
+/// pipeline); no coupling to any writer. Params: `path` (required, templated,
+/// home-expanded), `dir` (optional, default = `path`'s parent), `suffix`
+/// (optional, default `bak`). Missing `path` ⇒ skipped (nothing to back up).
+/// Dry-run ⇒ no copy.
+pub struct BackupProcessor;
+
+#[async_trait::async_trait]
+impl Processor for BackupProcessor {
+    fn kind(&self) -> &str {
+        "backup"
+    }
+    async fn run(
+        &self,
+        step: &Step,
+        ctx: &Ctx,
+        r: &dyn Reporter,
+        _i: &dyn InputResolver,
+    ) -> Result<StepOutput> {
+        let path = expand_home(
+            &ctx.render(step.param_str("path").context("backup needs `path`")?)?,
+        )?;
+        let src = Path::new(&path);
+        if !src.exists() {
+            return Ok(StepOutput::skipped()); // nothing to back up
+        }
+        let dir = match step.param_str("dir") {
+            Some(d) => std::path::PathBuf::from(expand_home(&ctx.render(d)?)?),
+            None => src.parent().map(Path::to_path_buf).unwrap_or_default(),
+        };
+        let suffix = match step.param_str("suffix") {
+            Some(s) => ctx.render(s)?,
+            None => "bak".to_string(),
+        };
+        let name = src
+            .file_name()
+            .and_then(|n| n.to_str())
+            .context("backup `path` has no file name")?;
+        let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
+        let dest = dir.join(format!("{name}.{ts}.{suffix}"));
+        if ctx.dry_run() {
+            r.log(&format!("backup (dry-run): {path} → {}", dest.display()));
+            return Ok(StepOutput::ok());
+        }
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(&dir)?;
+        }
+        std::fs::copy(src, &dest)
+            .with_context(|| format!("backup {path} → {}", dest.display()))?;
+        r.log(&format!("backup: {} ", dest.display()));
         Ok(StepOutput::ok())
     }
 }
@@ -1276,5 +1332,72 @@ mod tests {
         let out = dir.path().join("o");
         extract_archive(&p, &out, 0).unwrap();
         assert_eq!(std::fs::read_to_string(out.join("f.txt")).unwrap(), "bz");
+    }
+
+    #[tokio::test]
+    async fn backup_copies_existing_file_timestamped() {
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("config.toml");
+        std::fs::write(&src, "x = 1\n").unwrap();
+        let s = format!("type=\"backup\"\npath=\"{}\"", p(&src));
+        BackupProcessor
+            .run(&step(&s), &ctx(), &NullReporter, &EnvResolver)
+            .await
+            .unwrap();
+        let baks: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".bak"))
+            .collect();
+        assert_eq!(baks.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(baks[0].path()).unwrap(),
+            "x = 1\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn backup_missing_path_is_skipped() {
+        let d = tempfile::tempdir().unwrap();
+        let s = format!("type=\"backup\"\npath=\"{}\"", p(&d.path().join("nope")));
+        let out = BackupProcessor
+            .run(&step(&s), &ctx(), &NullReporter, &EnvResolver)
+            .await
+            .unwrap();
+        assert!(out.skipped);
+    }
+
+    #[tokio::test]
+    async fn backup_dry_run_no_file() {
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("c");
+        std::fs::write(&src, "v").unwrap();
+        let mut c = ctx();
+        c.set_dry_run(true);
+        let s = format!("type=\"backup\"\npath=\"{}\"", p(&src));
+        BackupProcessor
+            .run(&step(&s), &c, &NullReporter, &EnvResolver)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 1); // only the source
+    }
+
+    #[tokio::test]
+    async fn backup_custom_dir_and_suffix() {
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("c.yaml");
+        std::fs::write(&src, "k: v\n").unwrap();
+        let bdir = d.path().join("backups");
+        let s = format!(
+            "type=\"backup\"\npath=\"{}\"\ndir=\"{}\"\nsuffix=\"orig\"",
+            p(&src),
+            p(&bdir)
+        );
+        BackupProcessor
+            .run(&step(&s), &ctx(), &NullReporter, &EnvResolver)
+            .await
+            .unwrap();
+        let f = std::fs::read_dir(&bdir).unwrap().next().unwrap().unwrap();
+        assert!(f.file_name().to_string_lossy().ends_with(".orig"));
     }
 }

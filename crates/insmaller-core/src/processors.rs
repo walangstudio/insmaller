@@ -75,6 +75,8 @@ pub fn builtins(settings: &crate::config::Settings) -> ProcessorRegistry {
     r.register(Arc::new(ShellProcessor(g.clone())));
     r.register(Arc::new(ExecProcessor(g.clone())));
     r.register(Arc::new(MergeJsonProcessor(g.clone())));
+    r.register(Arc::new(MergeCfgProcessor(g.clone(), CfgFmt::Toml)));
+    r.register(Arc::new(MergeCfgProcessor(g.clone(), CfgFmt::Yaml)));
     r.register(Arc::new(CheckCommandProcessor(g.clone())));
     r.register(Arc::new(SentinelMetaProcessor));
     crate::processors_io::register(&mut r, g, settings);
@@ -251,6 +253,106 @@ impl Processor for MergeJsonProcessor {
     }
 }
 
+// ── merge_toml / merge_yaml ─────────────────────────────────────────────────
+//
+// Same contract as merge_json (a `command` emits a JSON patch deep-merged into
+// `target`), only the on-disk format of `target` differs. merge_json is left
+// untouched on purpose (its verbatim-port tests). These two: parse the existing
+// target strictly (refuse to silently discard an unparseable config), respect
+// `ctx.dry_run()`, and write through the atomic helper.
+
+#[derive(Clone, Copy)]
+enum CfgFmt {
+    Toml,
+    Yaml,
+}
+
+impl CfgFmt {
+    fn kind(self) -> &'static str {
+        match self {
+            CfgFmt::Toml => "merge_toml",
+            CfgFmt::Yaml => "merge_yaml",
+        }
+    }
+    fn parse(self, raw: &str) -> Result<serde_json::Value> {
+        match self {
+            CfgFmt::Toml => toml::from_str(raw).context("existing target is not valid TOML"),
+            CfgFmt::Yaml => serde_yaml::from_str(raw).context("existing target is not valid YAML"),
+        }
+    }
+    fn dump(self, v: &serde_json::Value) -> Result<String> {
+        match self {
+            CfgFmt::Toml => toml::to_string_pretty(v)
+                .context("merged document is not representable as TOML (e.g. null/non-table root)"),
+            CfgFmt::Yaml => serde_yaml::to_string(v).context("serializing merged YAML"),
+        }
+    }
+}
+
+async fn run_merge(
+    p: &MergeCfgProcessor,
+    step: &Step,
+    ctx: &Ctx,
+) -> Result<StepOutput> {
+    let fmt = p.1;
+    let target = expand_home(&ctx.render(
+        step.param_str("target")
+            .with_context(|| format!("{} missing `target`", fmt.kind()))?,
+    )?)?;
+    let command = ctx.render(
+        step.param_str("command")
+            .with_context(|| format!("{} missing `command`", fmt.kind()))?,
+    )?;
+    if ctx.dry_run() {
+        return Ok(StepOutput::ok());
+    }
+    let output =
+        crate::pathenv::run_capture(&command, &p.0, step_dir(step, ctx)?.as_deref())
+            .await
+            .with_context(|| format!("failed to run: {command}"))?;
+    if !output.status.success() {
+        bail!(
+            "command '{}' failed ({}): {}",
+            command,
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let patch: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("command stdout is not valid JSON")?;
+    let mut existing: serde_json::Value = if std::path::Path::new(&target).exists() {
+        fmt.parse(&std::fs::read_to_string(&target)?)?
+    } else {
+        serde_json::Value::Object(Default::default())
+    };
+    deep_merge(&mut existing, patch);
+    crate::processors_io::atomic_write(
+        std::path::Path::new(&target),
+        fmt.dump(&existing)?.as_bytes(),
+        None,
+    )
+    .with_context(|| format!("{} {target}", fmt.kind()))?;
+    Ok(StepOutput::ok())
+}
+
+pub struct MergeCfgProcessor(Globs, CfgFmt);
+
+#[async_trait::async_trait]
+impl Processor for MergeCfgProcessor {
+    fn kind(&self) -> &str {
+        self.1.kind()
+    }
+    async fn run(
+        &self,
+        step: &Step,
+        ctx: &Ctx,
+        _r: &dyn Reporter,
+        _i: &dyn InputResolver,
+    ) -> Result<StepOutput> {
+        run_merge(self, step, ctx).await
+    }
+}
+
 // ── check_command ───────────────────────────────────────────────────────────
 
 pub struct CheckCommandProcessor(Globs);
@@ -340,6 +442,8 @@ mod tests {
             "shell",
             "exec",
             "merge_json",
+            "merge_toml",
+            "merge_yaml",
             "check_command",
             "sentinel_meta",
             "prompt",
@@ -418,5 +522,76 @@ mod tests {
         let mut base = serde_json::json!({"a":{"x":1},"b":2});
         deep_merge(&mut base, serde_json::json!({"a":{"y":9},"b":3,"c":4}));
         assert_eq!(base, serde_json::json!({"a":{"x":1,"y":9},"b":3,"c":4}));
+    }
+
+    #[test]
+    fn merge_toml_creates_and_deep_merges() {
+        let mut base = CfgFmt::Toml
+            .parse("[tool]\nname = \"old\"\nkeep = 1\n")
+            .unwrap();
+        deep_merge(
+            &mut base,
+            serde_json::json!({"tool":{"name":"new"},"added":true}),
+        );
+        let out = CfgFmt::Toml.dump(&base).unwrap();
+        let back = CfgFmt::Toml.parse(&out).unwrap();
+        assert_eq!(
+            back,
+            serde_json::json!({"tool":{"name":"new","keep":1},"added":true})
+        );
+    }
+
+    #[test]
+    fn merge_toml_missing_target_starts_empty() {
+        let mut base = serde_json::Value::Object(Default::default());
+        deep_merge(&mut base, serde_json::json!({"a":{"b":1}}));
+        let back = CfgFmt::Toml.parse(&CfgFmt::Toml.dump(&base).unwrap()).unwrap();
+        assert_eq!(back, serde_json::json!({"a":{"b":1}}));
+    }
+
+    #[test]
+    fn merge_yaml_deep_merges() {
+        let mut base = CfgFmt::Yaml.parse("provider:\n  model: a\n  keep: 1\n").unwrap();
+        deep_merge(&mut base, serde_json::json!({"provider":{"model":"b"}}));
+        let back = CfgFmt::Yaml.parse(&CfgFmt::Yaml.dump(&base).unwrap()).unwrap();
+        assert_eq!(back, serde_json::json!({"provider":{"model":"b","keep":1}}));
+    }
+
+    #[test]
+    fn merge_toml_non_table_root_errors_clearly() {
+        let e = CfgFmt::Toml
+            .dump(&serde_json::Value::Null)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("TOML"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn merge_toml_via_command_writes_and_dry_run_noop() {
+        if std::env::consts::OS == "windows" {
+            return; // command body is POSIX
+        }
+        let d = tempfile::tempdir().unwrap();
+        let target = d.path().join("config.toml");
+        std::fs::write(&target, "[a]\nkeep = 1\n").unwrap();
+        let p = MergeCfgProcessor(Arc::new(vec![]), CfgFmt::Toml);
+        let mk = |dry: bool| {
+            let s = step(&format!(
+                "type = \"merge_toml\"\ntarget = \"{}\"\ncommand = \"printf '{{\\\"a\\\":{{\\\"added\\\":true}}}}'\"\n",
+                target.to_string_lossy()
+            ));
+            let mut c = Ctx::default();
+            c.set_dry_run(dry);
+            (s, c)
+        };
+        let (s, c) = mk(true);
+        run_merge(&p, &s, &c).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "[a]\nkeep = 1\n");
+        let (s, c) = mk(false);
+        run_merge(&p, &s, &c).await.unwrap();
+        let back = CfgFmt::Toml
+            .parse(&std::fs::read_to_string(&target).unwrap())
+            .unwrap();
+        assert_eq!(back, serde_json::json!({"a":{"keep":1,"added":true}}));
     }
 }

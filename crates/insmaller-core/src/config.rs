@@ -137,6 +137,26 @@ pub struct Settings {
     /// consumes. Absent ⇒ no-op.
     #[serde(default)]
     pub setup_output: Option<SetupOutput>,
+    /// Where install markers live. `global` (default) = today's
+    /// `<data_local_dir>/<sentinel_dir_name>`, unchanged. `workspace` =
+    /// `<config-dir>/.<sentinel_dir_name>` so a project's installs track with
+    /// the project. `sentinel_path` (below) overrides both.
+    #[serde(default)]
+    pub sentinel_scope: SentinelScope,
+    /// Explicit sentinel base (absolute or `~`-expanded). Wins over
+    /// `sentinel_scope`. Absent ⇒ scope decides.
+    #[serde(default)]
+    pub sentinel_path: Option<String>,
+}
+
+/// Sentinel base resolution. `global` keeps the historical per-user location;
+/// `workspace` anchors to the discovered config's directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SentinelScope {
+    #[default]
+    Global,
+    Workspace,
 }
 
 /// Output sink format. Only `env` today; an enum so adding json/toml later is
@@ -196,6 +216,8 @@ impl Default for Settings {
             catalog: None,
             wizard: None,
             setup_output: None,
+            sentinel_scope: SentinelScope::default(),
+            sentinel_path: None,
         }
     }
 }
@@ -628,6 +650,23 @@ mod tests {
         assert_eq!(so.header.as_deref(), Some("generated"));
         assert_eq!(so.include.unwrap(), vec!["A", "B"]);
         assert_eq!(so.mode, Some(0o600));
+    }
+
+    #[test]
+    fn settings_scope_path_parse_and_default_none() {
+        let def = LoadedConfig::from_str("").unwrap();
+        assert_eq!(def.settings.sentinel_scope, SentinelScope::Global);
+        assert!(def.settings.sentinel_path.is_none());
+        let cfg = LoadedConfig::from_str(
+            r#"
+            [settings]
+            sentinel_scope = "workspace"
+            sentinel_path = "~/.local/share/app"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.settings.sentinel_scope, SentinelScope::Workspace);
+        assert_eq!(cfg.settings.sentinel_path.as_deref(), Some("~/.local/share/app"));
     }
 
     #[test]

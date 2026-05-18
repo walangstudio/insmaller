@@ -1,0 +1,26 @@
+# v0.3.0 fixture: composable config-mutation primitives. A task backs up a
+# config then deep-merges a JSON patch into it as TOML, then the same for a
+# YAML file. The patch comes from a plain command (here `printf`), so the
+# engine has zero knowledge of the consumer's config shape. Portable bodies
+# (printf) keep the offline suite green.
+
+[settings]
+sentinel_dir_name = "insmaller-e2e-merge"
+
+[task.seed-toml]
+description = "backup then merge a TOML patch (idempotent, atomic)"
+[[task.seed-toml.steps]]
+type = "backup"
+path = "{{ TOML_CFG }}"
+suffix = "bak"
+[[task.seed-toml.steps]]
+type   = "merge_toml"
+target = "{{ TOML_CFG }}"
+command = "printf '{\"tool\":{\"added\":true}}'"
+
+[task.seed-yaml]
+description = "merge a JSON patch into a YAML target"
+[[task.seed-yaml.steps]]
+type   = "merge_yaml"
+target = "{{ YAML_CFG }}"
+command = "printf '{\"provider\":{\"model\":\"b\"}}'"

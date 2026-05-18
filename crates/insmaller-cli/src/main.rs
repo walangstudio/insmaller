@@ -4,6 +4,7 @@
 //!   insmaller install   <key…> [--config F] [--catalog F] [--dry-run] [--json]
 //!   insmaller uninstall <key…> [--config F] [--catalog F] [--dry-run] [--json]
 //!   insmaller setup [--wizard F] [--catalog F] [--config F] [--answers F] [--dry-run]
+//!   insmaller status [<key>] [--config F] [--json]
 //!
 //! insmaller is an installer: a bare `insmaller <key…>` (no recognized
 //! subcommand) defaults to `install`. `uninstall` runs each recipe's
@@ -17,7 +18,8 @@ mod tui;
 
 use insmaller_core::{
     builtins, run_wizard, Catalog, Ctx, EnvResolver, InstallSummary, LoadedConfig, Reporter,
-    Sentinel, StaticAnswerer, StdoutReporter, WizardDef, WizardOutcome, WizardSession,
+    Sentinel, SentinelData, StaticAnswerer, StdoutReporter, WizardDef, WizardOutcome,
+    WizardSession,
 };
 use serde_json::{Map, Value};
 use std::io::IsTerminal;
@@ -105,13 +107,14 @@ async fn main() -> ExitCode {
         Some("uninstall") | Some("remove") => cmd_op(&args[1..], Op::Uninstall).await,
         Some("setup") => cmd_setup(&args[1..]).await,
         Some("task") | Some("run") => cmd_task(&args[1..]).await,
+        Some("status") | Some("query") => cmd_status(&args[1..]).await,
         Some("-V") | Some("--version") | Some("version") => {
             println!("insmaller {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
         Some("-h") | Some("--help") | Some("help") | None => {
             eprintln!(
-                "usage:\n  insmaller <key…>            [--config F] [--catalog F] [--dry-run] [--json]   (defaults to install)\n  insmaller install   <key…> [--config F] [--catalog F] [--dry-run] [--json]\n  insmaller uninstall <key…> [--config F] [--catalog F] [--dry-run] [--json] [--force]\n  insmaller setup [--wizard F] [--catalog F] [--config F] [--answers F] [--dry-run]\n  insmaller task <name…>     [--config F]   (alias: insmaller run <name…>)\n\n--config: if omitted, the first of insmaller.toml/.insmaller.toml/\ninstaller.toml found in the cwd or any parent dir.\n--catalog/--wizard default to the config's `[settings] catalog`/`wizard`\n(relative to the config file) if set, else catalog.json/wizard.toml in cwd.\n--force: uninstall even if another installed key still depends on it.\ntask: runs a `[task.<name>]` pipeline (needs first, per-OS, fail-fast)."
+                "usage:\n  insmaller <key…>            [--config F] [--catalog F] [--dry-run] [--json]   (defaults to install)\n  insmaller install   <key…> [--config F] [--catalog F] [--dry-run] [--json]\n  insmaller uninstall <key…> [--config F] [--catalog F] [--dry-run] [--json] [--force]\n  insmaller setup [--wizard F] [--catalog F] [--config F] [--answers F] [--dry-run]\n  insmaller task <name…>     [--config F]   (alias: insmaller run <name…>)\n  insmaller status [<key>]   [--config F] [--json]   (alias: insmaller query)\n\n--config: if omitted, the first of insmaller.toml/.insmaller.toml/\ninstaller.toml found in the cwd or any parent dir.\n--catalog/--wizard default to the config's `[settings] catalog`/`wizard`\n(relative to the config file) if set, else catalog.json/wizard.toml in cwd.\n--force: uninstall even if another installed key still depends on it.\ntask: runs a `[task.<name>]` pipeline (needs first, per-OS, fail-fast)."
             );
             if args.is_empty() { ExitCode::FAILURE } else { ExitCode::SUCCESS }
         }
@@ -139,6 +142,13 @@ async fn load(
 // Runs install/uninstall and returns the summary plus its result noun. The
 // caller owns the Reporter (Stdout/Json/Bar) and prints the summary after,
 // so the indicatif bar can be cleared before the summary lines.
+/// Scope-aware sentinel: `[settings] sentinel_path`/`sentinel_scope` decide
+/// the base; default is the historical per-user location, unchanged. The
+/// config's own directory anchors `workspace` scope.
+fn sentinel_for(cfg: &LoadedConfig, cfg_p: &str) -> Sentinel {
+    Sentinel::resolve(&cfg.settings, Path::new(cfg_p).parent())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_op(
     cfg: &LoadedConfig,
@@ -149,10 +159,11 @@ async fn run_op(
     force: bool,
     rep: &dyn Reporter,
     run_vars: Option<&Map<String, Value>>,
+    cfg_p: &str,
 ) -> (InstallSummary, &'static str) {
     let mut reg = builtins(&cfg.settings);
     insmaller_core::register_external(&mut reg, &cfg.plugins);
-    let sent = Sentinel::new(&cfg.settings.sentinel_dir_name);
+    let sent = sentinel_for(cfg, cfg_p);
     let opts = insmaller_core::RunOpts { dry_run, force };
     match op {
         Op::Install => (
@@ -225,6 +236,7 @@ async fn cmd_op(a: &[String], op: Op) -> ExitCode {
                 has(a, "--force"),
                 rep.as_ref(),
                 None,
+                &cfg_p,
             )
             .await;
             summarize(&s, verb)
@@ -368,6 +380,7 @@ async fn cmd_setup(a: &[String]) -> ExitCode {
             false,
             &StdoutReporter,
             Some(&outcome.vars),
+            &cfg_p,
         )
         .await;
         let code = summarize(&s, verb);
@@ -386,6 +399,7 @@ async fn cmd_setup(a: &[String]) -> ExitCode {
         false,
         &bar,
         Some(&outcome.vars),
+        &cfg_p,
     )
     .await;
     bar.finish();
@@ -430,6 +444,68 @@ async fn cmd_task(a: &[String]) -> ExitCode {
             eprintln!("task '{name}' failed: {e:#}");
             return ExitCode::FAILURE;
         }
+    }
+    ExitCode::SUCCESS
+}
+
+/// `insmaller status [<key>]` — read-only listing of what the scope-aware
+/// sentinel records as installed. `--json` emits an array; otherwise an
+/// aligned table. Optional positional filters to one key. Always SUCCESS
+/// (empty is not an error); only a config load failure is FAILURE.
+async fn cmd_status(a: &[String]) -> ExitCode {
+    let cfg_p = discover_config(opt_opt(a, "--config"));
+    let cfg = match LoadedConfig::from_path(std::path::Path::new(&cfg_p)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("config error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let filter = collect_keys(a).into_iter().next();
+    let sent = sentinel_for(&cfg, &cfg_p);
+    let mut rows: Vec<(String, String, SentinelData, bool)> = sent
+        .installed()
+        .into_iter()
+        .filter(|(_, k)| filter.as_ref().is_none_or(|f| f == k))
+        .filter_map(|(kind, key)| {
+            sent.read(&kind, &key).map(|d| {
+                let post = sent.post_install_done(&kind, &key);
+                (kind, key, d, post)
+            })
+        })
+        .collect();
+    rows.sort_by(|x, y| (&x.0, &x.1).cmp(&(&y.0, &y.1)));
+
+    if has(a, "--json") {
+        let arr: Vec<Value> = rows
+            .iter()
+            .map(|(kind, key, d, post)| {
+                serde_json::json!({
+                    "kind": kind, "key": key,
+                    "version": d.version, "spec": d.spec,
+                    "installed_at": d.installed_at, "post_done": post,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&Value::Array(arr)).unwrap());
+        return ExitCode::SUCCESS;
+    }
+    if rows.is_empty() {
+        println!("nothing installed");
+        return ExitCode::SUCCESS;
+    }
+    let kw = rows.iter().map(|r| r.0.len()).max().unwrap_or(4).max(4);
+    let yw = rows.iter().map(|r| r.1.len()).max().unwrap_or(3).max(3);
+    println!("{:<kw$}  {:<yw$}  {:<10}  spec", "kind", "key", "version");
+    for (kind, key, d, post) in &rows {
+        println!(
+            "{:<kw$}  {:<yw$}  {:<10}  {}{}",
+            kind,
+            key,
+            d.version.as_deref().unwrap_or("-"),
+            d.spec,
+            if *post { "  (post-install done)" } else { "" }
+        );
     }
     ExitCode::SUCCESS
 }

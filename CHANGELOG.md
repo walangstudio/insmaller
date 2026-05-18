@@ -4,6 +4,40 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-05-18
+
+The leftover workspace-migration primitives deferred from 0.2.0. All new
+schema is optional with serde defaults; existing catalogs/configs and the
+default sentinel location are unaffected.
+
+### Added
+- **`merge_toml` / `merge_yaml` processors** — same contract as `merge_json`
+  (a `command` emits a JSON patch deep-merged into `target`), for TOML and
+  YAML config files. Existing target parsed strictly (an unparseable file is
+  refused, not silently discarded), `--dry-run` writes nothing, output written
+  atomically. `merge_json` is unchanged.
+- **`backup` processor** — standalone composable step: a timestamped copy of
+  `path` to `<dir>/<file>.<UTC>.<suffix>` before something mutates it. Missing
+  path ⇒ skipped; dry-run ⇒ no copy.
+- **`insmaller status`** (alias `query`) — read-only listing of recorded
+  installs as an aligned table or `--json` array
+  (`kind,key,version,spec,installed_at,post_done`); optional single-key filter.
+- **`[settings] sentinel_scope` + `sentinel_path`** — `global` (default,
+  unchanged) | `workspace` (anchored to the config's directory); an explicit
+  `sentinel_path` overrides both. `Sentinel::resolve` + `Sentinel::base`
+  added to the library API.
+
+### Changed
+- `atomic_write` is now `pub(crate)` (shared by the new merge processors);
+  `merge_json`'s plain write is untouched.
+- CLI sentinel construction routed through `Sentinel::resolve`; behavior is
+  byte-identical to before at the default `global` scope.
+- `serde_yaml` added as a workspace dependency.
+
+### Notes
+- `cargo test --workspace` is 219 tests, clippy clean; offline build verified
+  (`serde_yaml` was already in the cargo cache).
+
 ## [0.2.1] - 2026-05-18
 
 ### Changed
