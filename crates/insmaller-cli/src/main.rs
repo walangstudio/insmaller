@@ -494,8 +494,9 @@ async fn cmd_status(a: &[String]) -> ExitCode {
         println!("nothing installed");
         return ExitCode::SUCCESS;
     }
-    let kw = rows.iter().map(|r| r.0.len()).max().unwrap_or(4).max(4);
-    let yw = rows.iter().map(|r| r.1.len()).max().unwrap_or(3).max(3);
+    let (kw, yw) = rows
+        .iter()
+        .fold((4, 3), |(k, y), r| (k.max(r.0.len()), y.max(r.1.len())));
     println!("{:<kw$}  {:<yw$}  {:<10}  spec", "kind", "key", "version");
     for (kind, key, d, post) in &rows {
         println!(
