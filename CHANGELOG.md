@@ -39,9 +39,21 @@ default sentinel location are unaffected.
   byte-identical to before at the default `global` scope.
 - `serde_yaml` added as a workspace dependency.
 
+### Security
+- Bumped `ratatui` 0.29 → 0.30 (and `crossterm` 0.28 → 0.29) so the
+  transitive `lru` resolves to 0.16.4, fixing RUSTSEC-2026-0002 /
+  GHSA-rhfx-m35p-ff5j (`lru::IterMut` Stacked-Borrows UB). The vulnerable
+  `iter_mut` path was never reachable here (ratatui uses `lru` only for its
+  internal layout cache; insmaller never touches it), so this is hygiene, not
+  an exploitable fix. ratatui pinned to `default-features = false` +
+  `crossterm_0_29, underline-color, all-widgets, macros, layout-cache` to keep
+  the termion/termwiz backends out. No source changes — 0.30 re-exports the
+  used API unchanged.
+
 ### Notes
 - `cargo test --workspace` is 224 tests, clippy clean; offline build verified
-  (`serde_yaml` was already in the cargo cache).
+  (`serde_yaml` was already in the cargo cache; the ratatui 0.30 tree was
+  fetched online once, then builds offline).
 
 ## [0.2.1] - 2026-05-18
 
