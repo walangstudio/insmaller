@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.1] - 2026-05-19
+
+### Changed
+- `release.yml`: `actions/upload-artifact` v5 → v7. v5 still runs on Node 20
+  (0.2.1's note was inaccurate — only `upload-artifact` v6+ is
+  `runs.using: node24`; `checkout@v5`/`setup-python@v6`/`download-artifact@v5`
+  were already Node 24). Silences the last Node 20 deprecation warning in the
+  release workflow. No source/behavior change.
+
 ## [0.3.0] - 2026-05-18
 
 The leftover workspace-migration primitives deferred from 0.2.0. All new
