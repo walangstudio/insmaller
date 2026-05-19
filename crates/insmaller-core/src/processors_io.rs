@@ -65,10 +65,27 @@ pub(crate) fn atomic_write(path: &Path, content: &[u8], mode: Option<u32>) -> Re
     }
 }
 
-/// `KEY=value` body from scalar vars (String/Bool/Number), keys alpha-sorted,
-/// optionally filtered by `include` and prefixed with a `# header` line.
-/// Values containing whitespace, `"` or `\` are double-quoted with `\`/`"`
-/// escaped (dotenv-safe).
+/// One scalar (String/Bool/Number) as its env string; `None` for anything
+/// else (Object/Array/Null) — used to flatten array elements.
+fn scalar_str(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// `KEY=value` body from vars, keys alpha-sorted, optionally filtered by
+/// `include` and prefixed with a `# header` line. Scalars (String/Bool/Number)
+/// emit directly. A JSON **array** of scalars emits as a comma-joined CSV
+/// (`KEY=a,b,c`) so multiselect wizard fields survive into the env file and
+/// round-trip through CSV `in` conditions; non-scalar elements are skipped and
+/// an empty array emits `KEY=` (the key is kept so a consumer can tell
+/// "selected nothing" from "key absent"). Objects/Null are dropped. Values
+/// containing whitespace, `"`, `\`, `'` or `#` are double-quoted with `\`/`"`
+/// escaped (dotenv-safe); the CSV is quoted as a whole if any element forces
+/// it (commas themselves never trigger quoting — the consumer splits on them).
 fn render_env_body(
     vars: &serde_json::Map<String, serde_json::Value>,
     header: Option<&str>,
@@ -83,6 +100,7 @@ fn render_env_body(
                 serde_json::Value::String(_)
                     | serde_json::Value::Bool(_)
                     | serde_json::Value::Number(_)
+                    | serde_json::Value::Array(_)
             ) && include.map(|inc| inc.iter().any(|i| i == *k)).unwrap_or(true)
         })
         .map(|(k, _)| k)
@@ -95,11 +113,28 @@ fn render_env_body(
         out.push('\n');
     }
     for k in keys {
-        let raw = match &vars[k] {
-            serde_json::Value::String(s) => s.clone(),
-            serde_json::Value::Bool(b) => b.to_string(),
-            serde_json::Value::Number(n) => n.to_string(),
-            _ => unreachable!(),
+        if let serde_json::Value::Array(a) = &vars[k] {
+            // Empty / all-non-scalar array ⇒ bare `KEY=` (key kept on purpose).
+            let csv = a
+                .iter()
+                .filter_map(scalar_str)
+                .collect::<Vec<_>>()
+                .join(",");
+            if csv.is_empty() {
+                out.push_str(&format!("{k}=\n"));
+                continue;
+            }
+            if needs_quote(&csv) {
+                let esc = csv.replace('\\', "\\\\").replace('"', "\\\"");
+                out.push_str(&format!("{k}=\"{esc}\"\n"));
+            } else {
+                out.push_str(&format!("{k}={csv}\n"));
+            }
+            continue;
+        }
+        let raw = match scalar_str(&vars[k]) {
+            Some(s) => s,
+            None => continue, // unreachable given the filter, but total
         };
         if needs_quote(&raw) {
             let esc = raw.replace('\\', "\\\\").replace('"', "\\\"");
@@ -1399,5 +1434,53 @@ mod tests {
             .unwrap();
         let f = std::fs::read_dir(&bdir).unwrap().next().unwrap().unwrap();
         assert!(f.file_name().to_string_lossy().ends_with(".orig"));
+    }
+
+    #[test]
+    fn render_env_array_becomes_csv() {
+        let v: serde_json::Map<String, serde_json::Value> = serde_json::from_value(
+            serde_json::json!({"INSTALL_TOOLS": ["node", "ts", "go"]}),
+        )
+        .unwrap();
+        assert_eq!(render_env_body(&v, None, None), "INSTALL_TOOLS=node,ts,go\n");
+    }
+
+    #[test]
+    fn render_env_empty_array_is_bare_key() {
+        let v: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({"INSTALL_PLUGINS": []})).unwrap();
+        assert_eq!(render_env_body(&v, None, None), "INSTALL_PLUGINS=\n");
+    }
+
+    #[test]
+    fn render_env_array_skips_non_scalar_elements() {
+        let v: serde_json::Map<String, serde_json::Value> = serde_json::from_value(
+            serde_json::json!({"K": ["a", {"x": 1}, "b", [9], 3, true]}),
+        )
+        .unwrap();
+        // object + nested array dropped; string/number/bool kept, in order.
+        assert_eq!(render_env_body(&v, None, None), "K=a,b,3,true\n");
+    }
+
+    #[test]
+    fn render_env_csv_quoted_when_element_has_space() {
+        let v: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({"K": ["a b", "c"]})).unwrap();
+        // a space in any element forces dotenv quoting of the whole CSV;
+        // the comma itself never triggers quoting.
+        assert_eq!(render_env_body(&v, None, None), "K=\"a b,c\"\n");
+    }
+
+    #[test]
+    fn render_env_array_respects_include_allowlist() {
+        let v: serde_json::Map<String, serde_json::Value> = serde_json::from_value(
+            serde_json::json!({"KEEP": [1, 2], "DROP": ["x"], "S": "scalar"}),
+        )
+        .unwrap();
+        let inc = vec!["KEEP".to_string(), "S".to_string()];
+        assert_eq!(
+            render_env_body(&v, None, Some(&inc)),
+            "KEEP=1,2\nS=scalar\n"
+        );
     }
 }

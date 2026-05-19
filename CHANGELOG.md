@@ -19,6 +19,11 @@ default sentinel location are unaffected.
 - **`backup` processor** — standalone composable step: a timestamped copy of
   `path` to `<dir>/<file>.<UTC>.<suffix>` before something mutates it. Missing
   path ⇒ skipped; dry-run ⇒ no copy.
+- **`write_env` / `setup_output` array→CSV** — a JSON-array var (multiselect
+  wizard field) now serializes as a comma-joined list (`KEY=a,b,c`) instead of
+  being silently dropped; non-scalar elements skipped, empty array ⇒ bare
+  `KEY=` (key kept), commas never force quoting (consumer splits on them).
+  Restores parity with CSV `in` conditions.
 - **`insmaller status`** (alias `query`) — read-only listing of recorded
   installs as an aligned table or `--json` array
   (`kind,key,version,spec,installed_at,post_done`); optional single-key filter.
@@ -35,7 +40,7 @@ default sentinel location are unaffected.
 - `serde_yaml` added as a workspace dependency.
 
 ### Notes
-- `cargo test --workspace` is 219 tests, clippy clean; offline build verified
+- `cargo test --workspace` is 224 tests, clippy clean; offline build verified
   (`serde_yaml` was already in the cargo cache).
 
 ## [0.2.1] - 2026-05-18

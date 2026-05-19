@@ -3,7 +3,7 @@
 ![version](https://img.shields.io/badge/version-0.3.0-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![rust](https://img.shields.io/badge/rust-1.78%2B-orange)
-![tests](https://img.shields.io/badge/tests-219%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-224%20passing-brightgreen)
 
 insmaller installs things by reading a config file instead of running
 hand-written install code. You describe each tool as a list of steps in TOML,
@@ -152,7 +152,7 @@ GitHub release. `insmaller --version` reports the same version.
 
 ## Status
 
-The engine is built and passing: `cargo test --workspace` is 219 tests, no
+The engine is built and passing: `cargo test --workspace` is 224 tests, no
 failures, no ignored, clippy clean. It works on its own through the CLI today.
 
 The optional native plugin transport builds with `--features cdylib`. The WASM
