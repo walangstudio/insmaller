@@ -255,11 +255,9 @@ impl Processor for MergeJsonProcessor {
 
 // ── merge_toml / merge_yaml ─────────────────────────────────────────────────
 //
-// Same contract as merge_json (a `command` emits a JSON patch deep-merged into
-// `target`), only the on-disk format of `target` differs. merge_json is left
-// untouched on purpose (its verbatim-port tests). These two: parse the existing
-// target strictly (refuse to silently discard an unparseable config), respect
-// `ctx.dry_run()`, and write through the atomic helper.
+// merge_json's contract for TOML/YAML targets. Kept separate from
+// `MergeJsonProcessor` so its verbatim-port tests don't move; unlike it, an
+// unparseable existing target is an error (never silently overwritten).
 
 #[derive(Clone, Copy)]
 enum CfgFmt {
@@ -320,10 +318,12 @@ async fn run_merge(
     }
     let patch: serde_json::Value =
         serde_json::from_slice(&output.stdout).context("command stdout is not valid JSON")?;
-    let mut existing: serde_json::Value = if std::path::Path::new(&target).exists() {
-        fmt.parse(&std::fs::read_to_string(&target)?)?
-    } else {
-        serde_json::Value::Object(Default::default())
+    let mut existing: serde_json::Value = match std::fs::read_to_string(&target) {
+        Ok(raw) => fmt.parse(&raw)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            serde_json::Value::Object(Default::default())
+        }
+        Err(e) => return Err(e.into()),
     };
     deep_merge(&mut existing, patch);
     crate::processors_io::atomic_write(
