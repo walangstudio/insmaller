@@ -62,16 +62,134 @@ fn find_config(start: &Path, names: &[&str], exists: impl Fn(&Path) -> bool) -> 
     })
 }
 
-/// `--config` if given, else the discovered config, else the legacy
-/// `installer.toml` (so a missing-file error names something sensible).
-fn discover_config(explicit: Option<String>) -> String {
+/// Program name derived from argv0 — `Path::file_stem` strips `.exe`; falls
+/// back to `"insmaller"` when argv0 is missing/unreadable. Lets a rebranded
+/// copy (binary renamed to `codetainyrrr`) report and discover under its own
+/// name without recompilation.
+fn program_name_from(argv0: Option<&str>) -> String {
+    argv0
+        .map(std::path::Path::new)
+        .and_then(|p| p.file_stem())
+        .and_then(|s| s.to_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| "insmaller".into())
+}
+
+fn program_name() -> String {
+    program_name_from(std::env::args().next().as_deref())
+}
+
+/// POSIX app-home candidates for `<name>/installer.toml` (XDG → ~/.<name> →
+/// /etc/<name>). Pure: env reads + `dirs::*` happen in the caller and inject
+/// the resolved bases, so tests don't touch global state. Compiled on every
+/// platform so cross-platform tests can call it; production wiring is
+/// `cfg(unix)`-gated.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn app_home_candidates_posix(
+    name: &str,
+    xdg_config: Option<&str>,
+    config_dir: Option<&Path>,
+    home_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let base = xdg_config
+        .map(PathBuf::from)
+        .or_else(|| config_dir.map(PathBuf::from));
+    if let Some(b) = base {
+        out.push(b.join(name).join("installer.toml"));
+    }
+    if let Some(h) = home_dir {
+        out.push(h.join(format!(".{name}")).join("installer.toml"));
+    }
+    out.push(PathBuf::from("/etc").join(name).join("installer.toml"));
+    out
+}
+
+/// Windows app-home candidates for `<name>\installer.toml` (`%APPDATA%` →
+/// `%USERPROFILE%\.<name>` → `%PROGRAMDATA%`). Same purity contract as the
+/// POSIX variant; cross-compiled for tests.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn app_home_candidates_windows(
+    name: &str,
+    appdata: Option<&str>,
+    config_dir: Option<&Path>,
+    home_dir: Option<&Path>,
+    program_data: Option<&str>,
+    data_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let base = appdata
+        .map(PathBuf::from)
+        .or_else(|| config_dir.map(PathBuf::from));
+    if let Some(b) = base {
+        out.push(b.join(name).join("installer.toml"));
+    }
+    if let Some(h) = home_dir {
+        out.push(h.join(format!(".{name}")).join("installer.toml"));
+    }
+    let sysbase = program_data
+        .map(PathBuf::from)
+        .or_else(|| data_dir.map(PathBuf::from));
+    if let Some(b) = sysbase {
+        out.push(b.join(name).join("installer.toml"));
+    }
+    out
+}
+
+/// Production wiring for `app_home_candidates_*` — reads live env/`dirs::*`.
+fn app_home_candidates(name: &str) -> Vec<PathBuf> {
+    #[cfg(unix)]
+    {
+        let xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        app_home_candidates_posix(
+            name,
+            xdg.as_deref(),
+            dirs::config_dir().as_deref(),
+            dirs::home_dir().as_deref(),
+        )
+    }
+    #[cfg(windows)]
+    {
+        let appdata = std::env::var("APPDATA").ok();
+        let progdata = std::env::var("PROGRAMDATA").ok();
+        app_home_candidates_windows(
+            name,
+            appdata.as_deref(),
+            dirs::config_dir().as_deref(),
+            dirs::home_dir().as_deref(),
+            progdata.as_deref(),
+            dirs::data_dir().as_deref(),
+        )
+    }
+}
+
+/// `--config` if given (wins over everything), else cwd+ancestors discovery,
+/// else app-home candidates derived from `<name>`, else the legacy
+/// `installer.toml` literal (so a missing-file error names something sensible).
+fn discover_config_in(
+    explicit: Option<String>,
+    cwd: &Path,
+    app_home: &[PathBuf],
+    exists: impl Fn(&Path) -> bool,
+) -> String {
     if let Some(e) = explicit {
         return e;
     }
+    if let Some(p) = find_config(cwd, CONFIG_NAMES, &exists) {
+        return p.to_string_lossy().into_owned();
+    }
+    for cand in app_home {
+        if exists(cand) {
+            return cand.to_string_lossy().into_owned();
+        }
+    }
+    "installer.toml".to_string()
+}
+
+fn discover_config(explicit: Option<String>, name: &str) -> String {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    find_config(&cwd, CONFIG_NAMES, |p| p.is_file())
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "installer.toml".to_string())
+    let app_home = app_home_candidates(name);
+    discover_config_in(explicit, &cwd, &app_home, |p| p.is_file())
 }
 
 /// Resolve a sibling file (catalog/wizard). Precedence: explicit `flag` →
@@ -99,27 +217,34 @@ fn resolve_sibling(
 // Interactive answering is the ratatui TUI (see `tui.rs`); the unattended
 // path uses the engine's non-blocking StaticAnswerer.
 
+/// Usage text rendered for `<name>`. Kept side-effect-free so tests can
+/// assert the basename leaks through to every line.
+fn usage_text(name: &str) -> String {
+    format!(
+        "usage:\n  {name} <key…>            [--config F] [--catalog F] [--dry-run] [--json]   (defaults to install)\n  {name} install   <key…> [--config F] [--catalog F] [--dry-run] [--json]\n  {name} uninstall <key…> [--config F] [--catalog F] [--dry-run] [--json] [--force]\n  {name} setup [--wizard F] [--catalog F] [--config F] [--answers F] [--dry-run]\n  {name} task <name…>     [--config F]   (alias: {name} run <name…>)\n  {name} status [<key>]   [--config F] [--json]   (alias: {name} query)\n\n--config: if omitted, the first of insmaller.toml/.insmaller.toml/\ninstaller.toml found in the cwd or any parent dir; failing that, an\napp-home location derived from the program name (e.g. ~/.{name}/installer.toml\non POSIX, %APPDATA%\\{name}\\installer.toml on Windows).\n--catalog/--wizard default to the config's `[settings] catalog`/`wizard`\n(relative to the config file) if set, else catalog.json/wizard.toml in cwd.\n--force: uninstall even if another installed key still depends on it.\ntask: runs a `[task.<name>]` pipeline (needs first, per-OS, fail-fast)."
+    )
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
+    let name = program_name();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        Some("install") => cmd_op(&args[1..], Op::Install).await,
-        Some("uninstall") | Some("remove") => cmd_op(&args[1..], Op::Uninstall).await,
-        Some("setup") => cmd_setup(&args[1..]).await,
-        Some("task") | Some("run") => cmd_task(&args[1..]).await,
-        Some("status") | Some("query") => cmd_status(&args[1..]).await,
+        Some("install") => cmd_op(&args[1..], Op::Install, &name).await,
+        Some("uninstall") | Some("remove") => cmd_op(&args[1..], Op::Uninstall, &name).await,
+        Some("setup") => cmd_setup(&args[1..], &name).await,
+        Some("task") | Some("run") => cmd_task(&args[1..], &name).await,
+        Some("status") | Some("query") => cmd_status(&args[1..], &name).await,
         Some("-V") | Some("--version") | Some("version") => {
-            println!("insmaller {}", env!("CARGO_PKG_VERSION"));
+            println!("{name} {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
         Some("-h") | Some("--help") | Some("help") | None => {
-            eprintln!(
-                "usage:\n  insmaller <key…>            [--config F] [--catalog F] [--dry-run] [--json]   (defaults to install)\n  insmaller install   <key…> [--config F] [--catalog F] [--dry-run] [--json]\n  insmaller uninstall <key…> [--config F] [--catalog F] [--dry-run] [--json] [--force]\n  insmaller setup [--wizard F] [--catalog F] [--config F] [--answers F] [--dry-run]\n  insmaller task <name…>     [--config F]   (alias: insmaller run <name…>)\n  insmaller status [<key>]   [--config F] [--json]   (alias: insmaller query)\n\n--config: if omitted, the first of insmaller.toml/.insmaller.toml/\ninstaller.toml found in the cwd or any parent dir.\n--catalog/--wizard default to the config's `[settings] catalog`/`wizard`\n(relative to the config file) if set, else catalog.json/wizard.toml in cwd.\n--force: uninstall even if another installed key still depends on it.\ntask: runs a `[task.<name>]` pipeline (needs first, per-OS, fail-fast)."
-            );
+            eprintln!("{}", usage_text(&name));
             if args.is_empty() { ExitCode::FAILURE } else { ExitCode::SUCCESS }
         }
         // insmaller is an installer: anything else is treated as install keys.
-        _ => cmd_op(&args, Op::Install).await,
+        _ => cmd_op(&args, Op::Install, &name).await,
     }
 }
 
@@ -217,8 +342,8 @@ fn collect_keys(a: &[String]) -> Vec<String> {
     keys
 }
 
-async fn cmd_op(a: &[String], op: Op) -> ExitCode {
-    let cfg_p = discover_config(opt_opt(a, "--config"));
+async fn cmd_op(a: &[String], op: Op, name: &str) -> ExitCode {
+    let cfg_p = discover_config(opt_opt(a, "--config"), name);
     let keys = collect_keys(a);
     match load(&cfg_p, opt_opt(a, "--catalog")).await {
         Ok((cfg, cat)) => {
@@ -248,8 +373,8 @@ async fn cmd_op(a: &[String], op: Op) -> ExitCode {
     }
 }
 
-async fn cmd_setup(a: &[String]) -> ExitCode {
-    let cfg_p = discover_config(opt_opt(a, "--config"));
+async fn cmd_setup(a: &[String], name: &str) -> ExitCode {
+    let cfg_p = discover_config(opt_opt(a, "--config"), name);
     let wiz_flag = opt_opt(a, "--wizard");
     let (cfg, cat) = match load(&cfg_p, opt_opt(a, "--catalog")).await {
         Ok(v) => v,
@@ -411,8 +536,8 @@ async fn cmd_setup(a: &[String]) -> ExitCode {
 /// `insmaller task <name…>` / `insmaller run <name…>` — run named lifecycle
 /// task pipelines. `run_vars` = project.extra + process env (so task scripts
 /// template the consumer's image_tag/container_name/etc).
-async fn cmd_task(a: &[String]) -> ExitCode {
-    let cfg_p = discover_config(opt_opt(a, "--config"));
+async fn cmd_task(a: &[String], name: &str) -> ExitCode {
+    let cfg_p = discover_config(opt_opt(a, "--config"), name);
     let names = collect_keys(a);
     let cfg = match LoadedConfig::from_path(std::path::Path::new(&cfg_p)) {
         Ok(c) => c,
@@ -422,7 +547,7 @@ async fn cmd_task(a: &[String]) -> ExitCode {
         }
     };
     if names.is_empty() {
-        eprintln!("usage: insmaller task <name…>  (available: {:?})", cfg.tasks.keys().collect::<Vec<_>>());
+        eprintln!("usage: {name} task <name…>  (available: {:?})", cfg.tasks.keys().collect::<Vec<_>>());
         return ExitCode::FAILURE;
     }
     let mut run_vars: Map<String, Value> = Map::new();
@@ -452,8 +577,8 @@ async fn cmd_task(a: &[String]) -> ExitCode {
 /// sentinel records as installed. `--json` emits an array; otherwise an
 /// aligned table. Optional positional filters to one key. Always SUCCESS
 /// (empty is not an error); only a config load failure is FAILURE.
-async fn cmd_status(a: &[String]) -> ExitCode {
-    let cfg_p = discover_config(opt_opt(a, "--config"));
+async fn cmd_status(a: &[String], name: &str) -> ExitCode {
+    let cfg_p = discover_config(opt_opt(a, "--config"), name);
     let cfg = match LoadedConfig::from_path(std::path::Path::new(&cfg_p)) {
         Ok(c) => c,
         Err(e) => {
@@ -513,7 +638,10 @@ async fn cmd_status(a: &[String]) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{find_config, resolve_sibling, CONFIG_NAMES};
+    use super::{
+        app_home_candidates_posix, app_home_candidates_windows, discover_config_in, find_config,
+        program_name_from, resolve_sibling, usage_text, CONFIG_NAMES,
+    };
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -574,6 +702,150 @@ mod tests {
         assert_eq!(
             resolve_sibling(None, None, "installer.toml", "catalog.json"),
             "catalog.json"
+        );
+    }
+
+    // ── P4: program name + app-home discovery ─────────────────────────────
+
+    #[test]
+    fn program_name_strips_exe_and_dir() {
+        assert_eq!(program_name_from(Some("/usr/local/bin/codetainyrrr")), "codetainyrrr");
+        assert_eq!(program_name_from(Some(r"C:\bin\codetainyrrr.exe")), "codetainyrrr");
+        assert_eq!(program_name_from(Some("insmaller")), "insmaller");
+    }
+
+    #[test]
+    fn program_name_falls_back_to_insmaller() {
+        assert_eq!(program_name_from(None), "insmaller");
+        assert_eq!(program_name_from(Some("")), "insmaller");
+    }
+
+    #[test]
+    fn explicit_config_flag_wins_over_everything() {
+        let app_home = vec![PathBuf::from("/home/u/.codetainyrrr/installer.toml")];
+        let got = discover_config_in(
+            Some("/tmp/explicit.toml".into()),
+            Path::new("/cwd"),
+            &app_home,
+            |_| true, // every path exists
+        );
+        assert_eq!(got, "/tmp/explicit.toml");
+    }
+
+    #[test]
+    fn app_home_discovered_when_only_app_home_present() {
+        // argv0=codetainyrrr, only ~/.codetainyrrr/installer.toml on disk → discovered.
+        let app_home = vec![PathBuf::from("/home/u/.codetainyrrr/installer.toml")];
+        let got = discover_config_in(
+            None,
+            Path::new("/some/cwd"),
+            &app_home,
+            |p| p == Path::new("/home/u/.codetainyrrr/installer.toml"),
+        );
+        assert_eq!(got, "/home/u/.codetainyrrr/installer.toml");
+    }
+
+    #[test]
+    fn cwd_wins_over_app_home_when_both_present() {
+        let app_home = vec![PathBuf::from("/home/u/.codetainyrrr/installer.toml")];
+        let cwd_cfg = PathBuf::from("/proj/installer.toml");
+        let present = vec![cwd_cfg.clone(), app_home[0].clone()];
+        let got = discover_config_in(
+            None,
+            Path::new("/proj"),
+            &app_home,
+            |p| present.iter().any(|q| q == p),
+        );
+        // Path::join uses platform separator; normalize for portable assert.
+        assert_eq!(got.replace('\\', "/"), "/proj/installer.toml");
+    }
+
+    #[test]
+    fn falls_back_to_legacy_default_when_nothing_found() {
+        // argv0=insmaller (default) and no app-home dir → existing behavior unchanged.
+        let got = discover_config_in(None, Path::new("/p/q"), &[], |_| false);
+        assert_eq!(got, "installer.toml");
+    }
+
+    #[test]
+    fn usage_string_uses_derived_program_name() {
+        let u = usage_text("codetainyrrr");
+        assert!(u.contains("codetainyrrr <key…>"));
+        assert!(u.contains("codetainyrrr install"));
+        assert!(u.contains("codetainyrrr task"));
+        // Default name still works for direct usage.
+        assert!(usage_text("insmaller").contains("insmaller install"));
+    }
+
+    #[test]
+    fn posix_app_home_xdg_when_set() {
+        // POSIX: $XDG_CONFIG_HOME/<name>/installer.toml comes first.
+        let cands = app_home_candidates_posix(
+            "codetainyrrr",
+            Some("/tmp/xdg"),
+            Some(Path::new("/home/u/.config")),
+            Some(Path::new("/home/u")),
+        );
+        assert_eq!(cands[0], PathBuf::from("/tmp/xdg/codetainyrrr/installer.toml"));
+        assert_eq!(cands[1], PathBuf::from("/home/u/.codetainyrrr/installer.toml"));
+        assert_eq!(cands[2], PathBuf::from("/etc/codetainyrrr/installer.toml"));
+    }
+
+    #[test]
+    fn posix_app_home_config_dir_fallback_when_xdg_unset() {
+        let cands = app_home_candidates_posix(
+            "codetainyrrr",
+            None,
+            Some(Path::new("/home/u/.config")),
+            Some(Path::new("/home/u")),
+        );
+        assert_eq!(
+            cands[0],
+            PathBuf::from("/home/u/.config/codetainyrrr/installer.toml")
+        );
+    }
+
+    #[test]
+    fn windows_app_home_appdata_when_set() {
+        let cands = app_home_candidates_windows(
+            "codetainyrrr",
+            Some(r"C:\Users\u\AppData\Roaming"),
+            None,
+            Some(Path::new(r"C:\Users\u")),
+            Some(r"C:\ProgramData"),
+            None,
+        );
+        assert_eq!(
+            cands[0],
+            PathBuf::from(r"C:\Users\u\AppData\Roaming\codetainyrrr\installer.toml")
+        );
+        assert_eq!(
+            cands[1],
+            PathBuf::from(r"C:\Users\u\.codetainyrrr\installer.toml")
+        );
+        assert_eq!(
+            cands[2],
+            PathBuf::from(r"C:\ProgramData\codetainyrrr\installer.toml")
+        );
+    }
+
+    #[test]
+    fn windows_app_home_config_dir_fallback_when_appdata_unset() {
+        let cands = app_home_candidates_windows(
+            "codetainyrrr",
+            None,
+            Some(Path::new(r"C:\Users\u\AppData\Roaming")),
+            Some(Path::new(r"C:\Users\u")),
+            None,
+            Some(Path::new(r"C:\ProgramData")),
+        );
+        assert_eq!(
+            cands[0],
+            PathBuf::from(r"C:\Users\u\AppData\Roaming\codetainyrrr\installer.toml")
+        );
+        assert_eq!(
+            cands[2],
+            PathBuf::from(r"C:\ProgramData\codetainyrrr\installer.toml")
         );
     }
 }

@@ -19,3 +19,4 @@ toml.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 indicatif.workspace = true
+dirs.workspace = true
