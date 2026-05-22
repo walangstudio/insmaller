@@ -92,7 +92,11 @@ fn app_home_candidates_posix(
     home_dir: Option<&Path>,
 ) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
+    // An empty-but-set env var (e.g. `XDG_CONFIG_HOME=`) is "unset" per the XDG
+    // spec; without this it would yield a bogus *relative* candidate and shadow
+    // the `dirs::config_dir()` fallback.
     let base = xdg_config
+        .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .or_else(|| config_dir.map(PathBuf::from));
     if let Some(b) = base {
@@ -118,7 +122,10 @@ fn app_home_candidates_windows(
     data_dir: Option<&Path>,
 ) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
+    // Empty-but-set `%APPDATA%`/`%PROGRAMDATA%` is treated as unset (see POSIX
+    // note) so it doesn't shadow the `dirs::*` fallback with a relative path.
     let base = appdata
+        .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .or_else(|| config_dir.map(PathBuf::from));
     if let Some(b) = base {
@@ -128,6 +135,7 @@ fn app_home_candidates_windows(
         out.push(h.join(format!(".{name}")).join("installer.toml"));
     }
     let sysbase = program_data
+        .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .or_else(|| data_dir.map(PathBuf::from));
     if let Some(b) = sysbase {
@@ -806,6 +814,24 @@ mod tests {
     }
 
     #[test]
+    fn posix_app_home_empty_xdg_treated_as_unset() {
+        // `XDG_CONFIG_HOME=` (empty) must fall back to config_dir, not produce
+        // a relative `codetainyrrr/installer.toml`.
+        let cands = app_home_candidates_posix(
+            "codetainyrrr",
+            Some(""),
+            Some(Path::new("/home/u/.config")),
+            Some(Path::new("/home/u")),
+        );
+        assert_eq!(
+            cands[0],
+            PathBuf::from("/home/u/.config/codetainyrrr/installer.toml")
+        );
+        // Not the bogus relative candidate that an unfiltered empty var produces.
+        assert_ne!(cands[0], PathBuf::from("codetainyrrr").join("installer.toml"));
+    }
+
+    #[test]
     fn windows_app_home_appdata_when_set() {
         let cands = app_home_candidates_windows(
             "codetainyrrr",
@@ -822,6 +848,28 @@ mod tests {
         assert_eq!(
             cands[1],
             PathBuf::from(r"C:\Users\u\.codetainyrrr\installer.toml")
+        );
+        assert_eq!(
+            cands[2],
+            PathBuf::from(r"C:\ProgramData\codetainyrrr\installer.toml")
+        );
+    }
+
+    #[test]
+    fn windows_app_home_empty_env_treated_as_unset() {
+        // Empty `%APPDATA%` and `%PROGRAMDATA%` fall back to config_dir/data_dir
+        // rather than producing relative candidates.
+        let cands = app_home_candidates_windows(
+            "codetainyrrr",
+            Some(""),
+            Some(Path::new(r"C:\Users\u\AppData\Roaming")),
+            Some(Path::new(r"C:\Users\u")),
+            Some(""),
+            Some(Path::new(r"C:\ProgramData")),
+        );
+        assert_eq!(
+            cands[0],
+            PathBuf::from(r"C:\Users\u\AppData\Roaming\codetainyrrr\installer.toml")
         );
         assert_eq!(
             cands[2],

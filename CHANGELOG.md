@@ -22,6 +22,10 @@ All notable changes to this project are documented here. The format follows
   precedence; `-c/--config` still overrides everything. Pure mechanism — no
   consumer-specific names in engine code.
 
+  An empty-but-set `XDG_CONFIG_HOME`/`%APPDATA%`/`%PROGRAMDATA%` is treated as
+  unset (per the XDG spec) so it falls back to the `dirs::*` location instead
+  of producing a bogus relative candidate.
+
 ## [0.3.1] - 2026-05-19
 
 ### Changed
