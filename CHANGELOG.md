@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.2] - 2026-05-22
+
+### Added
+- **argv0-derived program name + app-home config discovery (P4).** The CLI
+  derives `<name>` from argv0 (`Path::file_stem`, so `.exe` is stripped;
+  falls back to `"insmaller"`). A binary renamed to `codetainyrrr` now prints
+  `usage: codetainyrrr …` and `codetainyrrr 0.3.2`, and `discover_config`
+  gains an app-home fallback after the existing cwd+ancestors walk:
+  - POSIX: `$XDG_CONFIG_HOME/<name>/installer.toml` (else
+    `~/.config/<name>/…`), `~/.<name>/installer.toml`, `/etc/<name>/…`.
+  - Windows: `%APPDATA%\<name>\installer.toml`,
+    `%USERPROFILE%\.<name>\installer.toml`, `%PROGRAMDATA%\<name>\…`.
+
+  Lets a rebranded engine installed under a per-user app-home dir be invoked
+  from any cwd with no `--config` flag. cwd+ancestors discovery keeps
+  precedence; `-c/--config` still overrides everything. Pure mechanism — no
+  consumer-specific names in engine code.
+
 ## [0.3.1] - 2026-05-19
 
 ### Changed
