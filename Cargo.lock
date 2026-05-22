@@ -842,10 +842,11 @@ dependencies = [
 
 [[package]]
 name = "insmaller-cli"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "crossterm",
+ "dirs",
  "indicatif",
  "insmaller-core",
  "ratatui",
@@ -856,7 +857,7 @@ dependencies = [
 
 [[package]]
 name = "insmaller-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "async-trait",
