@@ -718,6 +718,9 @@ mod tests {
     #[test]
     fn program_name_strips_exe_and_dir() {
         assert_eq!(program_name_from(Some("/usr/local/bin/codetainyrrr")), "codetainyrrr");
+        // `\` is only a path separator on Windows; on Unix the whole string is
+        // one component, so file_stem can't strip the dir/`.exe` here.
+        #[cfg(windows)]
         assert_eq!(program_name_from(Some(r"C:\bin\codetainyrrr.exe")), "codetainyrrr");
         assert_eq!(program_name_from(Some("insmaller")), "insmaller");
     }
@@ -841,17 +844,19 @@ mod tests {
             Some(r"C:\ProgramData"),
             None,
         );
+        // Build expected with the same `join` the fn uses, so the assert holds
+        // on every platform (a backslash literal is one component on Unix).
         assert_eq!(
             cands[0],
-            PathBuf::from(r"C:\Users\u\AppData\Roaming\codetainyrrr\installer.toml")
+            PathBuf::from(r"C:\Users\u\AppData\Roaming").join("codetainyrrr").join("installer.toml")
         );
         assert_eq!(
             cands[1],
-            PathBuf::from(r"C:\Users\u\.codetainyrrr\installer.toml")
+            PathBuf::from(r"C:\Users\u").join(".codetainyrrr").join("installer.toml")
         );
         assert_eq!(
             cands[2],
-            PathBuf::from(r"C:\ProgramData\codetainyrrr\installer.toml")
+            PathBuf::from(r"C:\ProgramData").join("codetainyrrr").join("installer.toml")
         );
     }
 
@@ -869,11 +874,11 @@ mod tests {
         );
         assert_eq!(
             cands[0],
-            PathBuf::from(r"C:\Users\u\AppData\Roaming\codetainyrrr\installer.toml")
+            PathBuf::from(r"C:\Users\u\AppData\Roaming").join("codetainyrrr").join("installer.toml")
         );
         assert_eq!(
             cands[2],
-            PathBuf::from(r"C:\ProgramData\codetainyrrr\installer.toml")
+            PathBuf::from(r"C:\ProgramData").join("codetainyrrr").join("installer.toml")
         );
     }
 
@@ -889,11 +894,11 @@ mod tests {
         );
         assert_eq!(
             cands[0],
-            PathBuf::from(r"C:\Users\u\AppData\Roaming\codetainyrrr\installer.toml")
+            PathBuf::from(r"C:\Users\u\AppData\Roaming").join("codetainyrrr").join("installer.toml")
         );
         assert_eq!(
             cands[2],
-            PathBuf::from(r"C:\ProgramData\codetainyrrr\installer.toml")
+            PathBuf::from(r"C:\ProgramData").join("codetainyrrr").join("installer.toml")
         );
     }
 }
