@@ -171,12 +171,30 @@ fn app_home_candidates(name: &str) -> Vec<PathBuf> {
     }
 }
 
+/// The config path sitting next to the running binary
+/// (`dir(current_exe())/installer.toml`). Lets a freshly-extracted bundle run
+/// in place find its own sibling recipe from any cwd. Only the legacy
+/// `installer.toml` name is probed (a bundle ships exactly that, and matching
+/// only it keeps a stray `insmaller.toml` in a shared bin dir from hijacking
+/// discovery). `current_exe()` failure → empty (the tier is silently skipped).
+fn exe_sibling_candidates() -> Vec<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .as_deref()
+        .and_then(Path::parent)
+        .map(|dir| vec![dir.join("installer.toml")])
+        .unwrap_or_default()
+}
+
 /// `--config` if given (wins over everything), else cwd+ancestors discovery,
-/// else app-home candidates derived from `<name>`, else the legacy
-/// `installer.toml` literal (so a missing-file error names something sensible).
+/// else the exe-sibling candidates (a bundle run in place), else app-home
+/// candidates derived from `<name>`, else the legacy `installer.toml` literal
+/// (so a missing-file error names something sensible). cwd-ancestors stays
+/// above exe-sibling so a project-local config still wins.
 fn discover_config_in(
     explicit: Option<String>,
     cwd: &Path,
+    exe_sibling: &[PathBuf],
     app_home: &[PathBuf],
     exists: impl Fn(&Path) -> bool,
 ) -> String {
@@ -186,7 +204,7 @@ fn discover_config_in(
     if let Some(p) = find_config(cwd, CONFIG_NAMES, &exists) {
         return p.to_string_lossy().into_owned();
     }
-    for cand in app_home {
+    for cand in exe_sibling.iter().chain(app_home) {
         if exists(cand) {
             return cand.to_string_lossy().into_owned();
         }
@@ -196,8 +214,9 @@ fn discover_config_in(
 
 fn discover_config(explicit: Option<String>, name: &str) -> String {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let exe_sibling = exe_sibling_candidates();
     let app_home = app_home_candidates(name);
-    discover_config_in(explicit, &cwd, &app_home, |p| p.is_file())
+    discover_config_in(explicit, &cwd, &exe_sibling, &app_home, |p| p.is_file())
 }
 
 /// Resolve a sibling file (catalog/wizard). Precedence: explicit `flag` →
@@ -229,7 +248,7 @@ fn resolve_sibling(
 /// assert the basename leaks through to every line.
 fn usage_text(name: &str) -> String {
     format!(
-        "usage:\n  {name} <key…>            [--config F] [--catalog F] [--dry-run] [--json]   (defaults to install)\n  {name} install   <key…> [--config F] [--catalog F] [--dry-run] [--json]\n  {name} uninstall <key…> [--config F] [--catalog F] [--dry-run] [--json] [--force]\n  {name} setup [--wizard F] [--catalog F] [--config F] [--answers F] [--dry-run]\n  {name} task <name…>     [--config F]   (alias: {name} run <name…>)\n  {name} status [<key>]   [--config F] [--json]   (alias: {name} query)\n\n--config: if omitted, the first of insmaller.toml/.insmaller.toml/\ninstaller.toml found in the cwd or any parent dir; failing that, an\napp-home location derived from the program name (e.g. ~/.{name}/installer.toml\non POSIX, %APPDATA%\\{name}\\installer.toml on Windows).\n--catalog/--wizard default to the config's `[settings] catalog`/`wizard`\n(relative to the config file) if set, else catalog.json/wizard.toml in cwd.\n--force: uninstall even if another installed key still depends on it.\ntask: runs a `[task.<name>]` pipeline (needs first, per-OS, fail-fast)."
+        "usage:\n  {name} <key…>            [--config F] [--catalog F] [--dry-run] [--json]   (defaults to install)\n  {name} install   <key…> [--config F] [--catalog F] [--dry-run] [--json]\n  {name} uninstall <key…> [--config F] [--catalog F] [--dry-run] [--json] [--force]\n  {name} setup [--wizard F] [--catalog F] [--config F] [--answers F] [--dry-run]\n  {name} task <name…>     [--config F]   (alias: {name} run <name…>)\n  {name} status [<key>]   [--config F] [--json]   (alias: {name} query)\n\n--config: if omitted, the first of insmaller.toml/.insmaller.toml/\ninstaller.toml found in the cwd or any parent dir; failing that, an\ninstaller.toml sitting next to the binary (so an extracted bundle finds its\nown recipe from any cwd); failing that, an app-home location derived from the\nprogram name (e.g. ~/.{name}/installer.toml on POSIX,\n%APPDATA%\\{name}\\installer.toml on Windows).\n--catalog/--wizard default to the config's `[settings] catalog`/`wizard`\n(relative to the config file) if set, else catalog.json/wizard.toml in cwd.\n--force: uninstall even if another installed key still depends on it.\ntask: runs a `[task.<name>]` pipeline (needs first, per-OS, fail-fast)."
     )
 }
 
@@ -541,9 +560,28 @@ async fn cmd_setup(a: &[String], name: &str) -> ExitCode {
     code
 }
 
+/// Inject `self_exe`/`exe_dir` task vars from the running binary's path so a
+/// recipe can `copy {{ self_exe }}` and `{{ exe_dir }}/payload/*` from any cwd.
+/// `or_insert` so an existing project.extra/env value of the same name wins.
+/// `exe = None` (`current_exe()` failed) → injects nothing, no panic.
+fn inject_exe_vars(run_vars: &mut Map<String, Value>, exe: Option<PathBuf>) {
+    let Some(exe) = exe else { return };
+    // `parent()` is `Some("")` for a bare filename — skip that degenerate dir
+    // so `{{ exe_dir }}/x` never renders to a bogus `/x`.
+    if let Some(dir) = exe.parent().filter(|d| !d.as_os_str().is_empty()) {
+        run_vars
+            .entry("exe_dir".to_string())
+            .or_insert_with(|| Value::String(dir.to_string_lossy().into_owned()));
+    }
+    run_vars
+        .entry("self_exe".to_string())
+        .or_insert_with(|| Value::String(exe.to_string_lossy().into_owned()));
+}
+
 /// `insmaller task <name…>` / `insmaller run <name…>` — run named lifecycle
-/// task pipelines. `run_vars` = project.extra + process env (so task scripts
-/// template the consumer's image_tag/container_name/etc).
+/// task pipelines. `run_vars` = project.extra + process env + self_exe/exe_dir
+/// (so task scripts template the consumer's image_tag/container_name/etc and
+/// the running binary's own location).
 async fn cmd_task(a: &[String], name: &str) -> ExitCode {
     let cfg_p = discover_config(opt_opt(a, "--config"), name);
     let names = collect_keys(a);
@@ -567,6 +605,7 @@ async fn cmd_task(a: &[String], name: &str) -> ExitCode {
     for (k, v) in std::env::vars() {
         run_vars.entry(k).or_insert(Value::String(v));
     }
+    inject_exe_vars(&mut run_vars, std::env::current_exe().ok());
     let mut reg = builtins(&cfg.settings);
     insmaller_core::register_external(&mut reg, &cfg.plugins);
     for name in &names {
@@ -647,9 +686,11 @@ async fn cmd_status(a: &[String], name: &str) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        app_home_candidates_posix, app_home_candidates_windows, discover_config_in, find_config,
-        program_name_from, resolve_sibling, usage_text, CONFIG_NAMES,
+        app_home_candidates_posix, app_home_candidates_windows, discover_config_in,
+        find_config, inject_exe_vars, program_name_from, resolve_sibling, usage_text,
+        CONFIG_NAMES,
     };
+    use serde_json::{Map, Value};
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -737,6 +778,7 @@ mod tests {
         let got = discover_config_in(
             Some("/tmp/explicit.toml".into()),
             Path::new("/cwd"),
+            &[PathBuf::from("/b/installer.toml")],
             &app_home,
             |_| true, // every path exists
         );
@@ -750,6 +792,7 @@ mod tests {
         let got = discover_config_in(
             None,
             Path::new("/some/cwd"),
+            &[],
             &app_home,
             |p| p == Path::new("/home/u/.codetainyrrr/installer.toml"),
         );
@@ -764,6 +807,7 @@ mod tests {
         let got = discover_config_in(
             None,
             Path::new("/proj"),
+            &[],
             &app_home,
             |p| present.iter().any(|q| q == p),
         );
@@ -774,8 +818,107 @@ mod tests {
     #[test]
     fn falls_back_to_legacy_default_when_nothing_found() {
         // argv0=insmaller (default) and no app-home dir → existing behavior unchanged.
-        let got = discover_config_in(None, Path::new("/p/q"), &[], |_| false);
+        let got = discover_config_in(None, Path::new("/p/q"), &[], &[], |_| false);
         assert_eq!(got, "installer.toml");
+    }
+
+    // ── S1: exe-sibling config discovery ──────────────────────────────────
+
+    #[test]
+    fn exe_sibling_discovered_from_unrelated_cwd() {
+        // bin at /b/codetainyrrr + /b/installer.toml, cwd=/elsewhere, no --config.
+        let exe_sibling = vec![PathBuf::from("/b/installer.toml")];
+        let got = discover_config_in(
+            None,
+            Path::new("/elsewhere"),
+            &exe_sibling,
+            &[PathBuf::from("/home/u/.codetainyrrr/installer.toml")],
+            |p| p == Path::new("/b/installer.toml"),
+        );
+        assert_eq!(got, "/b/installer.toml");
+    }
+
+    #[test]
+    fn cwd_wins_over_exe_sibling_when_both_present() {
+        let exe_sibling = vec![PathBuf::from("/b/installer.toml")];
+        let present = [
+            PathBuf::from("/proj/installer.toml"),
+            PathBuf::from("/b/installer.toml"),
+        ];
+        let got = discover_config_in(
+            None,
+            Path::new("/proj"),
+            &exe_sibling,
+            &[],
+            |p| present.iter().any(|q| q == p),
+        );
+        assert_eq!(got.replace('\\', "/"), "/proj/installer.toml");
+    }
+
+    #[test]
+    fn exe_sibling_wins_over_app_home_when_both_present() {
+        let exe_sibling = vec![PathBuf::from("/b/installer.toml")];
+        let app_home = vec![PathBuf::from("/home/u/.codetainyrrr/installer.toml")];
+        let present = [exe_sibling[0].clone(), app_home[0].clone()];
+        let got = discover_config_in(
+            None,
+            Path::new("/elsewhere"),
+            &exe_sibling,
+            &app_home,
+            |p| present.iter().any(|q| q == p),
+        );
+        assert_eq!(got, "/b/installer.toml");
+    }
+
+    #[test]
+    fn explicit_config_wins_over_exe_sibling() {
+        let exe_sibling = vec![PathBuf::from("/b/installer.toml")];
+        let got = discover_config_in(
+            Some("/tmp/x.toml".into()),
+            Path::new("/elsewhere"),
+            &exe_sibling,
+            &[],
+            |_| true,
+        );
+        assert_eq!(got, "/tmp/x.toml");
+    }
+
+    // ── S2: self_exe / exe_dir task vars ──────────────────────────────────
+
+    #[test]
+    fn inject_exe_vars_sets_self_exe_and_exe_dir() {
+        let mut rv: Map<String, Value> = Map::new();
+        inject_exe_vars(&mut rv, Some(PathBuf::from("/b/codetainyrrr")));
+        assert_eq!(rv.get("self_exe").and_then(Value::as_str), Some("/b/codetainyrrr"));
+        assert_eq!(rv.get("exe_dir").and_then(Value::as_str), Some("/b"));
+    }
+
+    #[test]
+    fn inject_exe_vars_preserves_existing_override() {
+        // a project.extra/env value of the same name must win.
+        let mut rv: Map<String, Value> = Map::new();
+        rv.insert("self_exe".into(), Value::String("/override/bin".into()));
+        rv.insert("exe_dir".into(), Value::String("/override".into()));
+        inject_exe_vars(&mut rv, Some(PathBuf::from("/b/codetainyrrr")));
+        assert_eq!(rv.get("self_exe").and_then(Value::as_str), Some("/override/bin"));
+        assert_eq!(rv.get("exe_dir").and_then(Value::as_str), Some("/override"));
+    }
+
+    #[test]
+    fn inject_exe_vars_noop_when_exe_unknown() {
+        let mut rv: Map<String, Value> = Map::new();
+        inject_exe_vars(&mut rv, None);
+        assert!(rv.is_empty());
+    }
+
+    #[test]
+    fn inject_exe_vars_skips_empty_exe_dir_for_bare_name() {
+        // current_exe() returning a bare filename → parent() is Some("");
+        // exe_dir must be omitted, not injected as "".
+        let mut rv: Map<String, Value> = Map::new();
+        inject_exe_vars(&mut rv, Some(PathBuf::from("insmaller")));
+        assert_eq!(rv.get("self_exe").and_then(Value::as_str), Some("insmaller"));
+        assert!(rv.get("exe_dir").is_none());
     }
 
     #[test]
