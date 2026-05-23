@@ -1,9 +1,9 @@
 # insmaller
 
-![version](https://img.shields.io/badge/version-0.3.2-blue)
+![version](https://img.shields.io/badge/version-0.3.3-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![rust](https://img.shields.io/badge/rust-1.78%2B-orange)
-![tests](https://img.shields.io/badge/tests-224%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-246%20passing-brightgreen)
 
 insmaller installs things by reading a config file instead of running
 hand-written install code. You describe each tool as a list of steps in TOML,

@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.3] - 2026-05-23
+
+### Added
+- **exe-sibling config discovery (S1).** `discover_config` gains a tier between
+  cwd+ancestors and app-home: an `installer.toml` sitting next to the running
+  binary (`dir(current_exe())/installer.toml`). Lets a freshly-extracted bundle
+  run `./bundle/codetainyrrr task install` from any cwd and find its own recipe
+  with no `--config` and no `cd`. Precedence: `--config` > cwd+ancestors >
+  exe-sibling > app-home > legacy `installer.toml`. Only the legacy name is
+  probed next to the binary, so a stray `insmaller.toml` in a shared bin dir
+  can't hijack discovery. `current_exe()` failure degrades silently.
+- **`self_exe` / `exe_dir` task vars (S2).** `insmaller task <name>` injects the
+  running binary's path and its parent dir into `run_vars`, so a `[task.*]`
+  recipe can `copy {{ self_exe }}` and `{{ exe_dir }}/payload/*` from any cwd.
+  Injected with `or_insert` so a `project.extra`/env value of the same name
+  wins; `current_exe()` failure (or a parentless path) injects nothing.
+
+  Together these let a config-only consumer ship a self-installing bundle
+  (binary + sibling `installer.toml` + `payload/`) driven entirely by an
+  insmaller `[task.install]` recipe, with no bespoke install script. Pure
+  mechanism — no consumer-specific names in engine code.
+
 ## [0.3.2] - 2026-05-22
 
 ### Added
