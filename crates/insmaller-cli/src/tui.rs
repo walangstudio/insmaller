@@ -92,6 +92,25 @@ fn widget_value(w: &Widget) -> Value {
     }
 }
 
+/// Vertical (↑/↓) navigation. Within a select's choices while there's room to
+/// move; otherwise fall through to field navigation. `len` is the focused
+/// select's choice count (0 for Input/Toggle/edge-less widgets, which always
+/// move focus). Returns `(new_cur, new_focus)`; `new_cur` is only meaningful
+/// for selects. Focus is clamped to `0..=n+1` (fields, then Back, then Next).
+fn vert_nav(cur: usize, len: usize, down: bool, focus: usize, n: usize) -> (usize, usize) {
+    if down {
+        if len > 0 && cur + 1 < len {
+            (cur + 1, focus)
+        } else {
+            (cur, (focus + 1).min(n + 1))
+        }
+    } else if len > 0 && cur > 0 {
+        (cur - 1, focus)
+    } else {
+        (cur, focus.saturating_sub(1))
+    }
+}
+
 /// Run the wizard interactively. Returns true if completed, false if quit.
 pub fn run_wizard_tui(session: &mut WizardSession, pal: Palette) -> anyhow::Result<bool> {
     enable_raw_mode()?;
@@ -213,7 +232,7 @@ pub fn run_wizard_tui(session: &mut WizardSession, pal: Palette) -> anyhow::Resu
                     Span::raw("   "),
                     Span::styled(
                         err.clone().unwrap_or_else(|| {
-                            "Tab/←→ focus · ↑↓ move · Space toggle · Enter next · Esc back · q quit".into()
+                            "Tab/←→ focus · ↑↓ move within/between fields · Space toggle · Enter next · Esc back · q quit".into()
                         }),
                         Style::default().fg(if err.is_some() { pal.error } else { pal.muted }),
                     ),
@@ -256,29 +275,20 @@ pub fn run_wizard_tui(session: &mut WizardSession, pal: Palette) -> anyhow::Resu
                         break;
                     }
                 }
-                KeyCode::Up if focus < n => {
-                    if let Some(c) = match &mut widgets[focus] {
-                        Widget::Multi { cur, .. } | Widget::Single { cur, .. } => Some(cur),
-                        _ => None,
-                    } {
-                        *c = c.saturating_sub(1);
-                    }
-                }
-                KeyCode::Down if focus < n => {
-                    let len = match &widgets[focus] {
-                        Widget::Multi { choices, .. } | Widget::Single { choices, .. } => {
-                            choices.len()
-                        }
-                        _ => 0,
+                KeyCode::Up | KeyCode::Down if focus < n => {
+                    let down = k.code == KeyCode::Down;
+                    let (cur, len) = match &widgets[focus] {
+                        Widget::Multi { choices, cur, .. }
+                        | Widget::Single { choices, cur, .. } => (*cur, choices.len()),
+                        _ => (0, 0),
                     };
-                    if let Some(c) = match &mut widgets[focus] {
-                        Widget::Multi { cur, .. } | Widget::Single { cur, .. } => Some(cur),
-                        _ => None,
-                    } {
-                        if *c + 1 < len {
-                            *c += 1;
-                        }
+                    let (new_cur, new_focus) = vert_nav(cur, len, down, focus, n);
+                    if let Widget::Multi { cur, .. } | Widget::Single { cur, .. } =
+                        &mut widgets[focus]
+                    {
+                        *cur = new_cur;
                     }
+                    focus = new_focus;
                 }
                 KeyCode::Char(' ') if focus < n => match &mut widgets[focus] {
                     Widget::Multi { on, cur, .. } => on[*cur] = !on[*cur],
@@ -357,5 +367,44 @@ impl Reporter for BarReporter {
     }
     fn log(&self, msg: &str) {
         self.bar.println(msg);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::vert_nav;
+
+    // 2 fields (n=2): focus 0,1 = fields; 2 = Back; 3 = Next.
+    #[test]
+    fn down_within_select_then_to_next_field() {
+        // field 0 is a 3-choice select at cursor 0
+        assert_eq!(vert_nav(0, 3, true, 0, 2), (1, 0));
+        assert_eq!(vert_nav(1, 3, true, 0, 2), (2, 0));
+        // at the last choice, Down advances focus to field 1
+        assert_eq!(vert_nav(2, 3, true, 0, 2), (2, 1));
+    }
+
+    #[test]
+    fn up_within_select_then_to_prev_field() {
+        // field 1 select at cursor 2 → cursor 1 → cursor 0 → prev field
+        assert_eq!(vert_nav(2, 3, false, 1, 2), (1, 1));
+        assert_eq!(vert_nav(1, 3, false, 1, 2), (0, 1));
+        assert_eq!(vert_nav(0, 3, false, 1, 2), (0, 0));
+    }
+
+    #[test]
+    fn fieldless_widget_moves_focus_both_ways() {
+        // len 0 (Input/Toggle): arrows move focus immediately
+        assert_eq!(vert_nav(0, 0, true, 0, 2), (0, 1));
+        assert_eq!(vert_nav(0, 0, false, 1, 2), (0, 0));
+    }
+
+    #[test]
+    fn focus_clamps_at_edges() {
+        // Down past the last field lands on Back (n) then Next (n+1), no further
+        assert_eq!(vert_nav(0, 0, true, 2, 2), (0, 3));
+        assert_eq!(vert_nav(0, 0, true, 3, 2), (0, 3));
+        // Up from field 0 stays at 0
+        assert_eq!(vert_nav(0, 0, false, 0, 2), (0, 0));
     }
 }
