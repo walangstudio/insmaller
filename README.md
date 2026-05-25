@@ -150,6 +150,11 @@ version from the tag, builds the binary for Linux, macOS (Intel and Apple
 silicon), and Windows, and attaches the archives and a SHA256SUMS file to a
 GitHub release. `insmaller --version` reports the same version.
 
+Windows binaries embed version metadata and an `asInvoker` manifest, and are
+never packed. Code signing is not yet wired (the release workflow has an inert,
+opt-in step). See [docs/antivirus.md](docs/antivirus.md) for why an unsigned
+installer can trip AV heuristics and how to reduce it.
+
 ## Status
 
 The engine is built and passing: `cargo test --workspace` is 224 tests, no
