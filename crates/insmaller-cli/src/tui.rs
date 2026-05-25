@@ -13,15 +13,16 @@ use indicatif::{ProgressBar, ProgressStyle};
 use insmaller_core::{Field, FieldType, Reporter, WizardSession};
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph},
     Terminal,
 };
 use crate::theme::Palette;
 use serde_json::{Map, Value};
 use std::io::{self, Stdout};
+use std::path::{Path, PathBuf};
 
 /// Restores the terminal even on panic/early-return.
 struct TermGuard;
@@ -37,6 +38,116 @@ enum Widget {
     Single { choices: Vec<insmaller_core::Choice>, sel: Option<usize>, cur: usize },
     Toggle { on: bool },
     Input { buf: String, secret: bool },
+    /// A filesystem path. Editable as text; `Ctrl+B` opens an interactive
+    /// directory/file browser (`picker = Some`).
+    Path { buf: String, picker: Option<Picker> },
+}
+
+/// One row in the file browser.
+struct Entry {
+    name: String,
+    is_dir: bool,
+}
+
+/// Interactive directory/file browser overlaid on a `Path` field.
+struct Picker {
+    cwd: PathBuf,
+    entries: Vec<Entry>,
+    cursor: usize,
+}
+
+/// Directory listing for the browser: `..` first (unless at a root), then
+/// directories before files, each group case-insensitively sorted. Unreadable
+/// dirs yield just the `..` entry. Pure given the filesystem — unit-testable
+/// against a tempdir.
+fn list_dir(p: &Path) -> Vec<Entry> {
+    let mut entries: Vec<Entry> = Vec::new();
+    if p.parent().is_some() {
+        entries.push(Entry { name: "..".into(), is_dir: true });
+    }
+    if let Ok(rd) = std::fs::read_dir(p) {
+        let mut items: Vec<Entry> = rd
+            .flatten()
+            .map(|d| Entry {
+                name: d.file_name().to_string_lossy().into_owned(),
+                is_dir: d.file_type().map(|t| t.is_dir()).unwrap_or(false),
+            })
+            .collect();
+        items.sort_by(|a, b| {
+            b.is_dir
+                .cmp(&a.is_dir)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        entries.extend(items);
+    }
+    entries
+}
+
+impl Picker {
+    /// Seed the browser at `buf`'s directory (or its parent if `buf` names a
+    /// file), falling back to the home dir.
+    fn open(buf: &str) -> Picker {
+        let cwd = Self::seed_dir(buf);
+        let entries = list_dir(&cwd);
+        Picker { cwd, entries, cursor: 0 }
+    }
+
+    fn seed_dir(buf: &str) -> PathBuf {
+        let home = || dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        if buf.is_empty() {
+            return home();
+        }
+        let p = PathBuf::from(buf);
+        if p.is_dir() {
+            return p;
+        }
+        match p.parent() {
+            Some(parent) if parent.is_dir() => parent.to_path_buf(),
+            _ => home(),
+        }
+    }
+
+    fn up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn down(&mut self) {
+        if self.cursor + 1 < self.entries.len() {
+            self.cursor += 1;
+        }
+    }
+
+    fn ascend(&mut self) {
+        if let Some(parent) = self.cwd.parent().map(Path::to_path_buf) {
+            self.cwd = parent;
+            self.entries = list_dir(&self.cwd);
+            self.cursor = 0;
+        }
+    }
+
+    /// Enter/→ on the cursor: descend into a directory (or `..`) and return
+    /// `None`; on a file, return its full path (caller closes the picker).
+    fn activate(&mut self) -> Option<String> {
+        let entry = self.entries.get(self.cursor)?;
+        if entry.name == ".." {
+            self.ascend();
+            return None;
+        }
+        let target = self.cwd.join(&entry.name);
+        if entry.is_dir {
+            self.cwd = target;
+            self.entries = list_dir(&self.cwd);
+            self.cursor = 0;
+            None
+        } else {
+            Some(target.to_string_lossy().into_owned())
+        }
+    }
+
+    /// The current directory itself, as the selected value.
+    fn select_cwd(&self) -> String {
+        self.cwd.to_string_lossy().into_owned()
+    }
 }
 
 fn init_widget(f: &Field, s: &WizardSession) -> Widget {
@@ -64,6 +175,13 @@ fn init_widget(f: &Field, s: &WizardSession) -> Widget {
         FieldType::Toggle => Widget::Toggle {
             on: matches!(prior, Some(Value::Bool(true))),
         },
+        FieldType::Path => Widget::Path {
+            buf: match prior {
+                Some(Value::String(s)) => s,
+                _ => f.default.clone().unwrap_or_default(),
+            },
+            picker: None,
+        },
         _ => Widget::Input {
             buf: match prior {
                 Some(Value::String(s)) => s,
@@ -89,6 +207,7 @@ fn widget_value(w: &Widget) -> Value {
         ),
         Widget::Toggle { on } => Value::Bool(*on),
         Widget::Input { buf, .. } => Value::String(buf.clone()),
+        Widget::Path { buf, .. } => Value::String(buf.clone()),
     }
 }
 
@@ -109,6 +228,26 @@ fn vert_nav(cur: usize, len: usize, down: bool, focus: usize, n: usize) -> (usiz
     } else {
         (cur, focus.saturating_sub(1))
     }
+}
+
+/// A rectangle centered in `area`, `percent_x` × `percent_y` of its size.
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(v[1])[1]
 }
 
 /// Run the wizard interactively. Returns true if completed, false if quit.
@@ -209,11 +348,47 @@ pub fn run_wizard_tui(session: &mut WizardSession, pal: Palette) -> anyhow::Resu
                                 if focused { "_" } else { "" }
                             )));
                         }
+                        Widget::Path { buf, .. } => {
+                            items.push(ListItem::new(format!(
+                                "   {}{}",
+                                buf,
+                                if focused { "_   [Ctrl+B browse]" } else { "" }
+                            )));
+                        }
                     }
                 }
                 let body = List::new(items)
                     .block(Block::default().borders(Borders::ALL).title(" fields "));
                 fr.render_widget(body, rows[1]);
+
+                // Path browser overlay (captures all keys while open).
+                if let Some(Widget::Path { picker: Some(p), .. }) = widgets.get(focus) {
+                    let area = centered_rect(70, 70, fr.area());
+                    let rows_p: Vec<ListItem> = p
+                        .entries
+                        .iter()
+                        .map(|e| {
+                            let name = if e.is_dir && e.name != ".." {
+                                format!("{}/", e.name)
+                            } else {
+                                e.name.clone()
+                            };
+                            ListItem::new(name)
+                        })
+                        .collect();
+                    let title = format!(
+                        " {}  (↑↓ move · ↵ open · ← up · s select dir · Esc cancel) ",
+                        p.cwd.display()
+                    );
+                    let list = List::new(rows_p)
+                        .block(Block::default().borders(Borders::ALL).title(title))
+                        .highlight_style(Style::default().fg(pal.accent_fg).bg(pal.accent))
+                        .highlight_symbol("> ");
+                    let mut st = ListState::default();
+                    st.select(Some(p.cursor));
+                    fr.render_widget(Clear, area);
+                    fr.render_stateful_widget(list, area, &mut st);
+                }
 
                 let btn = |label: &str, idx: usize, enabled: bool| {
                     let st = if !enabled {
@@ -247,11 +422,51 @@ pub fn run_wizard_tui(session: &mut WizardSession, pal: Palette) -> anyhow::Resu
             if k.kind != KeyEventKind::Press {
                 continue;
             }
-            let editing = matches!(widgets.get(focus), Some(Widget::Input { .. }));
+
+            // Ctrl+C always quits, even with the browser open.
+            if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
+                return Ok(false);
+            }
+
+            // An open path browser owns every key until it closes.
+            if matches!(widgets.get(focus), Some(Widget::Path { picker: Some(_), .. })) {
+                if let Some(Widget::Path { buf, picker }) = widgets.get_mut(focus) {
+                    let p = picker.as_mut().expect("picker is Some");
+                    match k.code {
+                        KeyCode::Up => p.up(),
+                        KeyCode::Down => p.down(),
+                        KeyCode::Left | KeyCode::Backspace => p.ascend(),
+                        KeyCode::Enter | KeyCode::Right => {
+                            if let Some(path) = p.activate() {
+                                *buf = path;
+                                *picker = None;
+                            }
+                        }
+                        KeyCode::Char('s') => {
+                            *buf = p.select_cwd();
+                            *picker = None;
+                        }
+                        KeyCode::Esc => *picker = None,
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+
+            // Ctrl+B opens the browser on a focused path field.
+            if k.code == KeyCode::Char('b') && k.modifiers.contains(KeyModifiers::CONTROL) {
+                if let Some(Widget::Path { buf, picker }) = widgets.get_mut(focus) {
+                    *picker = Some(Picker::open(buf));
+                }
+                continue;
+            }
+
+            let editing = matches!(
+                widgets.get(focus),
+                Some(Widget::Input { .. }) | Some(Widget::Path { .. })
+            );
             // quit
-            if (k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL))
-                || (k.code == KeyCode::Char('q') && !editing)
-            {
+            if k.code == KeyCode::Char('q') && !editing {
                 return Ok(false);
             }
 
@@ -294,15 +509,19 @@ pub fn run_wizard_tui(session: &mut WizardSession, pal: Palette) -> anyhow::Resu
                     Widget::Multi { on, cur, .. } => on[*cur] = !on[*cur],
                     Widget::Single { sel, cur, .. } => *sel = Some(*cur),
                     Widget::Toggle { on } => *on = !*on,
-                    Widget::Input { buf, .. } => buf.push(' '),
+                    Widget::Input { buf, .. } | Widget::Path { buf, .. } => buf.push(' '),
                 },
                 KeyCode::Char(ch) if editing => {
-                    if let Widget::Input { buf, .. } = &mut widgets[focus] {
+                    if let Widget::Input { buf, .. } | Widget::Path { buf, .. } =
+                        &mut widgets[focus]
+                    {
                         buf.push(ch);
                     }
                 }
                 KeyCode::Backspace if editing => {
-                    if let Widget::Input { buf, .. } = &mut widgets[focus] {
+                    if let Widget::Input { buf, .. } | Widget::Path { buf, .. } =
+                        &mut widgets[focus]
+                    {
                         buf.pop();
                     }
                 }
@@ -372,7 +591,7 @@ impl Reporter for BarReporter {
 
 #[cfg(test)]
 mod tests {
-    use super::vert_nav;
+    use super::{list_dir, vert_nav, Picker};
 
     // 2 fields (n=2): focus 0,1 = fields; 2 = Back; 3 = Next.
     #[test]
@@ -406,5 +625,47 @@ mod tests {
         assert_eq!(vert_nav(0, 0, true, 3, 2), (0, 3));
         // Up from field 0 stays at 0
         assert_eq!(vert_nav(0, 0, false, 0, 2), (0, 0));
+    }
+
+    #[test]
+    fn list_dir_dotdot_first_then_dirs_before_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("zdir")).unwrap();
+        std::fs::write(dir.path().join("afile.txt"), b"x").unwrap();
+        let entries = list_dir(dir.path());
+        assert_eq!(entries[0].name, "..");
+        assert!(entries[0].is_dir);
+        // directory sorts before the file despite "zdir" > "afile"
+        assert_eq!(entries[1].name, "zdir");
+        assert!(entries[1].is_dir);
+        assert_eq!(entries[2].name, "afile.txt");
+        assert!(!entries[2].is_dir);
+    }
+
+    #[test]
+    fn picker_descends_ascends_and_selects_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("f.txt"), b"x").unwrap();
+
+        let mut p = Picker::open(&dir.path().to_string_lossy());
+        // [.., sub]; move onto "sub" and descend
+        p.down();
+        assert_eq!(p.entries[p.cursor].name, "sub");
+        assert_eq!(p.activate(), None);
+        assert_eq!(p.cwd, sub);
+
+        // now [.., f.txt]; selecting the file returns its full path
+        p.down();
+        assert_eq!(p.entries[p.cursor].name, "f.txt");
+        let got = p.activate().expect("file selection returns a path");
+        assert_eq!(std::path::PathBuf::from(got), sub.join("f.txt"));
+
+        // activating ".." ascends back to the parent
+        let mut q = Picker::open(&sub.to_string_lossy());
+        assert_eq!(q.entries[0].name, "..");
+        assert_eq!(q.activate(), None);
+        assert_eq!(q.cwd, dir.path());
     }
 }
