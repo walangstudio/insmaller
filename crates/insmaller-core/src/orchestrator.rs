@@ -328,7 +328,7 @@ async fn install_body(
     // (verbatim codetainyrrr semantics, run via bash with enriched PATH).
     if !e.post_install.is_empty() && !sent.post_install_done(&e.kind, key) {
         for cmd in &e.post_install {
-            run_sh(cmd, &cfg.settings.path_globs, None)
+            run_sh(cmd, &cfg.settings.path_globs, cfg.settings.prefer_bash_on_windows, None)
                 .await
                 .map_err(|err| {
                     EngineError::PostInstall {

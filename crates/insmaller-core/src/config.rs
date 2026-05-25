@@ -152,6 +152,12 @@ pub struct Settings {
     /// container/target, not on the machine that ran `setup`.
     #[serde(default)]
     pub setup_writes_config_only: bool,
+    /// Windows only: when a `bash` is discoverable on PATH, run shell steps
+    /// through it instead of PowerShell. Off by default to preserve the
+    /// "Windows recipes are PowerShell" contract; opt in when your catalog's
+    /// shell bodies are POSIX (e.g. a Git Bash dependency).
+    #[serde(default)]
+    pub prefer_bash_on_windows: bool,
 }
 
 /// Sentinel base resolution. `global` keeps the historical per-user location;
@@ -224,6 +230,7 @@ impl Default for Settings {
             sentinel_scope: SentinelScope::default(),
             sentinel_path: None,
             setup_writes_config_only: false,
+            prefer_bash_on_windows: false,
         }
     }
 }
@@ -649,6 +656,15 @@ mod tests {
         )
         .unwrap();
         assert!(cfg.settings.setup_writes_config_only);
+    }
+
+    #[test]
+    fn prefer_bash_on_windows_round_trip() {
+        let def = LoadedConfig::from_str("").unwrap();
+        assert!(!def.settings.prefer_bash_on_windows);
+        let cfg =
+            LoadedConfig::from_str("[settings]\nprefer_bash_on_windows = true\n").unwrap();
+        assert!(cfg.settings.prefer_bash_on_windows);
     }
 
     #[test]

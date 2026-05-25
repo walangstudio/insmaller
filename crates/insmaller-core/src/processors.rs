@@ -13,7 +13,15 @@ use crate::step::Step;
 use anyhow::{bail, Context as _, Result};
 use std::sync::Arc;
 
-type Globs = Arc<Vec<String>>;
+/// Shared shell environment for the built-in processors: the PATH globs plus
+/// the Windows bash-preference toggle. Bundled so a single `Arc` threads both
+/// from `settings` to every processor that spawns a shell.
+#[derive(Clone)]
+struct ShellEnv {
+    globs: Vec<String>,
+    prefer_bash: bool,
+}
+type Globs = Arc<ShellEnv>;
 
 /// Optional generic wait-loop on a step. Distinct from `Step.retries` (an
 /// on-error retry the engine applies): `poll` re-runs the processor's own
@@ -70,7 +78,10 @@ where
 /// Register all built-ins from engine `[settings]` (path globs + the
 /// download hardening knobs).
 pub fn builtins(settings: &crate::config::Settings) -> ProcessorRegistry {
-    let g: Globs = Arc::new(settings.path_globs.clone());
+    let g: Globs = Arc::new(ShellEnv {
+        globs: settings.path_globs.clone(),
+        prefer_bash: settings.prefer_bash_on_windows,
+    });
     let mut r = ProcessorRegistry::new();
     r.register(Arc::new(ShellProcessor(g.clone())));
     r.register(Arc::new(ExecProcessor(g.clone())));
@@ -79,7 +90,7 @@ pub fn builtins(settings: &crate::config::Settings) -> ProcessorRegistry {
     r.register(Arc::new(MergeCfgProcessor(g.clone(), CfgFmt::Yaml)));
     r.register(Arc::new(CheckCommandProcessor(g.clone())));
     r.register(Arc::new(SentinelMetaProcessor));
-    crate::processors_io::register(&mut r, g, settings);
+    crate::processors_io::register(&mut r, settings);
     r
 }
 
@@ -126,7 +137,10 @@ impl Processor for ShellProcessor {
     ) -> Result<StepOutput> {
         let script = resolve_script(step, ctx)?;
         let dir = step_dir(step, ctx)?;
-        with_poll(step, || run_sh(&script, &self.0, dir.as_deref())).await?;
+        with_poll(step, || {
+            run_sh(&script, &self.0.globs, self.0.prefer_bash, dir.as_deref())
+        })
+        .await?;
         Ok(StepOutput::ok())
     }
 }
@@ -175,7 +189,7 @@ impl Processor for ExecProcessor {
         let (program, args) = build_exec(step, ctx)?;
         let dir = step_dir(step, ctx)?;
         with_poll(step, || {
-            run_cmd(&program, &args, &self.0, dir.as_deref())
+            run_cmd(&program, &args, &self.0.globs, dir.as_deref())
         })
         .await?;
         Ok(StepOutput::ok())
@@ -225,7 +239,12 @@ impl Processor for MergeJsonProcessor {
         // Platform-aware (bash unix / powershell windows) — no hardcoded
         // bash; was a latent crash on a Windows host.
         let output =
-            crate::pathenv::run_capture(&command, &self.0, step_dir(step, ctx)?.as_deref())
+            crate::pathenv::run_capture(
+                &command,
+                &self.0.globs,
+                self.0.prefer_bash,
+                step_dir(step, ctx)?.as_deref(),
+            )
                 .await
             .with_context(|| format!("failed to run: {command}"))?;
         if !output.status.success() {
@@ -304,10 +323,14 @@ async fn run_merge(
     if ctx.dry_run() {
         return Ok(StepOutput::ok());
     }
-    let output =
-        crate::pathenv::run_capture(&command, &p.0, step_dir(step, ctx)?.as_deref())
-            .await
-            .with_context(|| format!("failed to run: {command}"))?;
+    let output = crate::pathenv::run_capture(
+        &command,
+        &p.0.globs,
+        p.0.prefer_bash,
+        step_dir(step, ctx)?.as_deref(),
+    )
+    .await
+    .with_context(|| format!("failed to run: {command}"))?;
     if !output.status.success() {
         bail!(
             "command '{}' failed ({}): {}",
@@ -381,7 +404,7 @@ impl Processor for CheckCommandProcessor {
         // `poll` lets this wait for a binary to appear on PATH (generic
         // wait-ready); without it, a single presence check as before.
         with_poll(step, || async {
-            if resolve_in_path(&program, &enriched_path(&self.0)).is_some() {
+            if resolve_in_path(&program, &enriched_path(&self.0.globs)).is_some() {
                 Ok(())
             } else {
                 Err(anyhow::anyhow!(msg.clone()))
@@ -574,7 +597,10 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let target = d.path().join("config.toml");
         std::fs::write(&target, "[a]\nkeep = 1\n").unwrap();
-        let p = MergeCfgProcessor(Arc::new(vec![]), CfgFmt::Toml);
+        let p = MergeCfgProcessor(
+            Arc::new(ShellEnv { globs: vec![], prefer_bash: false }),
+            CfgFmt::Toml,
+        );
         let mk = |dry: bool| {
             let s = step(&format!(
                 "type = \"merge_toml\"\ntarget = \"{}\"\ncommand = \"printf '{{\\\"a\\\":{{\\\"added\\\":true}}}}'\"\n",

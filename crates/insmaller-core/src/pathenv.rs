@@ -124,11 +124,16 @@ pub async fn run_cmd(
 
 /// Run a shell snippet with the enriched PATH. Unix: `bash -c` (verbatim from
 /// handlers/mod.rs::run_sh — the parity oracle, unchanged). Windows:
-/// `powershell -NoProfile -NonInteractive -Command` (Windows recipes must be
-/// PowerShell, not bash).
-pub async fn run_sh(script: &str, path_globs: &[String], dir: Option<&str>) -> Result<()> {
+/// `powershell -NoProfile -NonInteractive -Command`, unless `prefer_bash` and a
+/// `bash` is discoverable on PATH (see `shell_invocation`).
+pub async fn run_sh(
+    script: &str,
+    path_globs: &[String],
+    prefer_bash: bool,
+    dir: Option<&str>,
+) -> Result<()> {
     let path = enriched_path(path_globs);
-    let (prog, args) = shell_invocation(script); // single source of dispatch
+    let (prog, args) = shell_invocation(script, prefer_bash); // single source of dispatch
     let mut cmd = Command::new(prog);
     cmd.args(&args).env("PATH", &path);
     if let Some(d) = dir {
@@ -146,8 +151,11 @@ pub async fn run_sh(script: &str, path_globs: &[String], dir: Option<&str>) -> R
 
 /// `(program, args)` for running `script` in the platform shell — the single
 /// place the bash↔powershell choice is made (no processor hardcodes a shell).
-pub fn shell_invocation(script: &str) -> (&'static str, Vec<String>) {
-    if cfg!(windows) {
+/// Unix is always `bash -c`. Windows is `powershell …` unless `prefer_bash` is
+/// set AND a `bash` is on PATH, in which case `bash -c` (for catalogs whose
+/// shell bodies are POSIX, e.g. a Git Bash dependency).
+pub fn shell_invocation(script: &str, prefer_bash: bool) -> (&'static str, Vec<String>) {
+    let powershell = || {
         (
             "powershell",
             vec![
@@ -157,8 +165,17 @@ pub fn shell_invocation(script: &str) -> (&'static str, Vec<String>) {
                 script.into(),
             ],
         )
+    };
+    let bash = || ("bash", vec!["-c".into(), script.into()]);
+    if cfg!(windows) {
+        if prefer_bash && resolve_in_path("bash", &std::env::var("PATH").unwrap_or_default()).is_some()
+        {
+            bash()
+        } else {
+            powershell()
+        }
     } else {
-        ("bash", vec!["-c".into(), script.into()])
+        bash()
     }
 }
 
@@ -167,10 +184,11 @@ pub fn shell_invocation(script: &str) -> (&'static str, Vec<String>) {
 pub async fn run_capture(
     script: &str,
     path_globs: &[String],
+    prefer_bash: bool,
     dir: Option<&str>,
 ) -> Result<std::process::Output> {
     let path = enriched_path(path_globs);
-    let (prog, args) = shell_invocation(script);
+    let (prog, args) = shell_invocation(script, prefer_bash);
     let mut cmd = Command::new(prog);
     cmd.args(&args).env("PATH", &path);
     if let Some(d) = dir {
@@ -216,7 +234,8 @@ mod tests {
 
     #[test]
     fn shell_invocation_dispatches_per_platform() {
-        let (prog, args) = shell_invocation("echo hi");
+        // prefer_bash = false: unchanged platform default.
+        let (prog, args) = shell_invocation("echo hi", false);
         if cfg!(windows) {
             assert_eq!(prog, "powershell");
             assert_eq!(args.first().map(String::as_str), Some("-NoProfile"));
@@ -224,6 +243,25 @@ mod tests {
         } else {
             assert_eq!(prog, "bash");
             assert_eq!(args, vec!["-c".to_string(), "echo hi".to_string()]);
+        }
+    }
+
+    #[test]
+    fn shell_invocation_prefers_bash_on_windows_only_when_present() {
+        let (prog, args) = shell_invocation("echo hi", true);
+        if cfg!(windows) {
+            // bash iff discoverable on PATH; otherwise falls back to PowerShell.
+            let bash_present =
+                resolve_in_path("bash", &std::env::var("PATH").unwrap_or_default()).is_some();
+            if bash_present {
+                assert_eq!(prog, "bash");
+                assert_eq!(args, vec!["-c".to_string(), "echo hi".to_string()]);
+            } else {
+                assert_eq!(prog, "powershell");
+            }
+        } else {
+            // prefer_bash is a no-op off Windows.
+            assert_eq!(prog, "bash");
         }
     }
 

@@ -14,9 +14,7 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
-type Globs = Arc<Vec<String>>;
-
-pub fn register(r: &mut ProcessorRegistry, _g: Globs, settings: &crate::config::Settings) {
+pub fn register(r: &mut ProcessorRegistry, settings: &crate::config::Settings) {
     r.register(Arc::new(PromptProcessor));
     r.register(Arc::new(SaveInputProcessor));
     r.register(Arc::new(DownloadProcessor {
