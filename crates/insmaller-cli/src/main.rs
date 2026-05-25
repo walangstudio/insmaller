@@ -521,6 +521,12 @@ async fn cmd_setup(a: &[String], name: &str) -> ExitCode {
         render_outro();
         return ExitCode::SUCCESS;
     }
+    // config-only consumers (install runs in their container/target): stop after
+    // setup_output + outro, run zero host install scripts.
+    if cfg.settings.setup_writes_config_only {
+        render_outro();
+        return ExitCode::SUCCESS;
+    }
     let dry_run = has(a, "--dry-run");
     if !tui_used {
         let (s, verb) = run_op(

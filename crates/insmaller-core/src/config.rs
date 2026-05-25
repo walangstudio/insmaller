@@ -147,6 +147,11 @@ pub struct Settings {
     /// `sentinel_scope`. Absent ⇒ scope decides.
     #[serde(default)]
     pub sentinel_path: Option<String>,
+    /// true ⇒ `setup` stops after writing `setup_output` + outro and runs no
+    /// host install phase. For consumers whose catalog scripts run in a
+    /// container/target, not on the machine that ran `setup`.
+    #[serde(default)]
+    pub setup_writes_config_only: bool,
 }
 
 /// Sentinel base resolution. `global` keeps the historical per-user location;
@@ -218,6 +223,7 @@ impl Default for Settings {
             setup_output: None,
             sentinel_scope: SentinelScope::default(),
             sentinel_path: None,
+            setup_writes_config_only: false,
         }
     }
 }
@@ -629,6 +635,20 @@ mod tests {
     fn setup_output_defaults_to_none() {
         let cfg = LoadedConfig::from_str("").unwrap();
         assert!(cfg.settings.setup_output.is_none());
+    }
+
+    #[test]
+    fn setup_writes_config_only_round_trip() {
+        let def = LoadedConfig::from_str("").unwrap();
+        assert!(!def.settings.setup_writes_config_only);
+        let cfg = LoadedConfig::from_str(
+            r#"
+            [settings]
+            setup_writes_config_only = true
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.settings.setup_writes_config_only);
     }
 
     #[test]
