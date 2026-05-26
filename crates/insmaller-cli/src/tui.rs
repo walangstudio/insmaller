@@ -21,6 +21,7 @@ use ratatui::{
 };
 use crate::theme::Palette;
 use serde_json::{Map, Value};
+use std::collections::HashMap;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 
@@ -346,12 +347,34 @@ impl GroupDefaults {
             self.collapsed_default
         }
     }
-    fn for_groups(&self, groups: &[String]) -> Vec<bool> {
-        groups.iter().map(|g| self.is_collapsed(g)).collect()
+    /// Initial collapse per group: a prior user choice in `cache` (keyed by
+    /// field id + group) wins, else the configured default. Lets expand/collapse
+    /// survive leaving and re-entering a wizard page.
+    fn for_groups(&self, field_id: &str, groups: &[String], cache: &HashMap<String, bool>) -> Vec<bool> {
+        groups
+            .iter()
+            .map(|g| {
+                cache
+                    .get(&collapse_key(field_id, g))
+                    .copied()
+                    .unwrap_or_else(|| self.is_collapsed(g))
+            })
+            .collect()
     }
 }
 
-fn init_widget(f: &Field, s: &WizardSession, gd: &GroupDefaults) -> Widget {
+/// Cache key for a group's collapse state (NUL separates id from group so they
+/// can't collide).
+fn collapse_key(field_id: &str, group: &str) -> String {
+    format!("{field_id}\u{0}{group}")
+}
+
+fn init_widget(
+    f: &Field,
+    s: &WizardSession,
+    gd: &GroupDefaults,
+    collapse: &HashMap<String, bool>,
+) -> Widget {
     let prior = s.answer_for(&f.id).cloned();
     match f.field_type {
         FieldType::Multiselect => {
@@ -364,7 +387,7 @@ fn init_widget(f: &Field, s: &WizardSession, gd: &GroupDefaults) -> Widget {
                 })
                 .collect();
             let groups = group_list(&choices);
-            let collapsed = gd.for_groups(&groups);
+            let collapsed = gd.for_groups(&f.id, &groups, collapse);
             Widget::Multi { choices, on, groups, collapsed, cur: 0 }
         }
         FieldType::SingleSelect => {
@@ -374,7 +397,7 @@ fn init_widget(f: &Field, s: &WizardSession, gd: &GroupDefaults) -> Widget {
                 _ => None,
             };
             let groups = group_list(&choices);
-            let collapsed = gd.for_groups(&groups);
+            let collapsed = gd.for_groups(&f.id, &groups, collapse);
             Widget::Single { choices, sel, groups, collapsed, cur: 0 }
         }
         FieldType::Toggle => Widget::Toggle {
@@ -467,6 +490,10 @@ pub fn run_wizard_tui(
     let mut term: Terminal<CrosstermBackend<Stdout>> =
         Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
+    // Group collapse state, keyed by field id + group, persisted across page
+    // re-entries (the per-page widgets are rebuilt each time).
+    let mut collapse: HashMap<String, bool> = HashMap::new();
+
     while !session.is_done() {
         let fields: Vec<Field> = session
             .fields()
@@ -483,7 +510,7 @@ pub fn run_wizard_tui(
             })
             .collect();
         let mut widgets: Vec<Widget> =
-            fields.iter().map(|f| init_widget(f, session, gd)).collect();
+            fields.iter().map(|f| init_widget(f, session, gd, &collapse)).collect();
         // focus targets: 0..fields = field i; fields = Back; fields+1 = Next
         let n = fields.len();
         let mut focus = 0usize;
@@ -830,6 +857,16 @@ pub fn run_wizard_tui(
                 _ => {}
             }
         }
+        // Persist this page's group collapse state so it survives Back/Next.
+        for (w, f) in widgets.iter().zip(&fields) {
+            if let Widget::Multi { groups, collapsed, .. }
+            | Widget::Single { groups, collapsed, .. } = w
+            {
+                for (g, c) in groups.iter().zip(collapsed) {
+                    collapse.insert(collapse_key(&f.id, g), *c);
+                }
+            }
+        }
     }
     Ok(true)
 }
@@ -1086,6 +1123,18 @@ mod tests {
         };
         assert!(!open.is_collapsed("runtime"));
         assert!(open.is_collapsed("git"));
-        assert_eq!(open.for_groups(&["runtime".into(), "git".into()]), vec![false, true]);
+        let empty = std::collections::HashMap::new();
+        assert_eq!(
+            open.for_groups("f", &["runtime".into(), "git".into()], &empty),
+            vec![false, true]
+        );
+        // a cached prior choice overrides the default
+        let mut cache = std::collections::HashMap::new();
+        cache.insert(super::collapse_key("f", "git"), false);
+        assert_eq!(
+            open.for_groups("f", &["runtime".into(), "git".into()], &cache),
+            vec![false, false],
+            "cached expand of git overrides collapsed_groups default"
+        );
     }
 }

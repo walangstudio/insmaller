@@ -141,3 +141,24 @@ script = "echo b > {b}"
     assert!(std::path::Path::new(&a).exists(), "task a did not run");
     assert!(std::path::Path::new(&b).exists(), "task b did not run");
 }
+
+#[test]
+fn jobs_zero_is_rejected() {
+    let bin = env!("CARGO_BIN_EXE_insmaller");
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("installer.toml"),
+        "[task.t]\n[[task.t.steps]]\ntype = \"shell\"\nscript = \"echo hi\"\n",
+    )
+    .unwrap();
+    let out = Command::new(bin)
+        .args(["task", "t", "--jobs", "0"])
+        .current_dir(dir.path())
+        .output()
+        .expect("run");
+    assert!(!out.status.success(), "--jobs 0 must be rejected");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--jobs must be >= 1"),
+        "expected a clear --jobs error",
+    );
+}

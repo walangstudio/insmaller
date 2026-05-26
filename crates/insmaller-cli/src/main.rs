@@ -651,6 +651,10 @@ async fn cmd_task(a: &[String], name: &str) -> ExitCode {
     let force_parallel = has(a, "--parallel") || has(a, "-p");
     let max_parallel = match opt_opt(a, "--jobs").or_else(|| opt_opt(a, "-j")) {
         Some(j) => match j.parse::<usize>() {
+            Ok(0) => {
+                eprintln!("--jobs must be >= 1 (use 1 for sequential; omit it for the configured default)");
+                return ExitCode::FAILURE;
+            }
             Ok(n) => n,
             Err(_) => {
                 eprintln!("--jobs expects a number, got '{j}'");

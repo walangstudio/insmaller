@@ -420,9 +420,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn run_tasks_actually_overlaps_in_wall_time() {
         let sleep_cmd = if std::env::consts::OS == "windows" {
-            "Start-Sleep -Seconds 1"
+            "Start-Sleep -Seconds 2"
         } else {
-            "sleep 1"
+            "sleep 2"
         };
         let c = cfg(&format!(
             r#"
@@ -441,9 +441,9 @@ mod tests {
         let t = std::time::Instant::now();
         run_batch(&["a", "b"], &c, 0, false).await.unwrap();
         let elapsed = t.elapsed();
-        // Two 1s sleeps run concurrently must finish well under 2s.
+        // Two 2s sleeps run concurrently must finish well under 4s.
         assert!(
-            elapsed < std::time::Duration::from_millis(1800),
+            elapsed < std::time::Duration::from_millis(3000),
             "expected overlap, took {elapsed:?}"
         );
     }
@@ -462,12 +462,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn unflagged_tasks_run_exclusively_no_overlap() {
-        // Same two 1s-sleep tasks but WITHOUT parallel=true → they must run
-        // one at a time (exclusive), so wall time is ~2s, not ~1s.
+        // Same two 2s-sleep tasks but WITHOUT parallel=true → they must run
+        // one at a time (exclusive), so wall time is ~4s, not ~2s.
         let sleep_cmd = if std::env::consts::OS == "windows" {
-            "Start-Sleep -Seconds 1"
+            "Start-Sleep -Seconds 2"
         } else {
-            "sleep 1"
+            "sleep 2"
         };
         let c = cfg(&format!(
             r#"
@@ -484,18 +484,18 @@ mod tests {
         let t = std::time::Instant::now();
         run_batch(&["a", "b"], &c, 0, false).await.unwrap();
         assert!(
-            t.elapsed() >= std::time::Duration::from_millis(1800),
+            t.elapsed() >= std::time::Duration::from_millis(3000),
             "exclusive tasks must not overlap"
         );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn force_parallel_overrides_unflagged_tasks() {
-        // No parallel flags, but force_parallel=true → they overlap (~1s).
+        // No parallel flags, but force_parallel=true → they overlap (~2s).
         let sleep_cmd = if std::env::consts::OS == "windows" {
-            "Start-Sleep -Seconds 1"
+            "Start-Sleep -Seconds 2"
         } else {
-            "sleep 1"
+            "sleep 2"
         };
         let c = cfg(&format!(
             r#"
@@ -512,7 +512,7 @@ mod tests {
         let t = std::time::Instant::now();
         run_batch(&["a", "b"], &c, 0, true).await.unwrap();
         assert!(
-            t.elapsed() < std::time::Duration::from_millis(1800),
+            t.elapsed() < std::time::Duration::from_millis(3000),
             "force_parallel should overlap unflagged tasks"
         );
     }

@@ -362,6 +362,17 @@ pub async fn install_many(
     install_many_with(src, cfg, reg, rep, inp, sent, keys, RunOpts::default(), None).await
 }
 
+/// Acquire the sentinel's cross-process lock without blocking an async worker:
+/// the wait (a blocking syscall) runs on the blocking pool. `None` ⇒ locking
+/// unavailable; the caller proceeds unlocked.
+async fn acquire_lock(sent: &Sentinel) -> Option<crate::sentinel::LockGuard> {
+    let s = sent.clone();
+    tokio::task::spawn_blocking(move || s.lock())
+        .await
+        .ok()
+        .flatten()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn install_many_with(
     src: &dyn EntrySource,
@@ -375,7 +386,9 @@ pub async fn install_many_with(
     run_vars: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> InstallSummary {
     // Serialize mutating runs across processes (dry-run reads/installs nothing).
-    let _lock = if opts.dry_run { None } else { sent.lock() };
+    // The wait is a blocking syscall, so acquire it on the blocking pool rather
+    // than parking an async worker.
+    let _lock = if opts.dry_run { None } else { acquire_lock(sent).await };
     let empty = serde_json::Map::new();
     let ec = EngineCtx {
         src,
@@ -455,7 +468,7 @@ pub async fn uninstall_many_with(
     keys: &[String],
     opts: RunOpts,
 ) -> InstallSummary {
-    let _lock = if opts.dry_run { None } else { sent.lock() };
+    let _lock = if opts.dry_run { None } else { acquire_lock(sent).await };
     let empty = serde_json::Map::new();
     let ec = EngineCtx {
         src,
