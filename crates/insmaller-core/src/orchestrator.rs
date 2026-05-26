@@ -374,6 +374,8 @@ pub async fn install_many_with(
     opts: RunOpts,
     run_vars: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> InstallSummary {
+    // Serialize mutating runs across processes (dry-run reads/installs nothing).
+    let _lock = if opts.dry_run { None } else { sent.lock() };
     let empty = serde_json::Map::new();
     let ec = EngineCtx {
         src,
@@ -453,6 +455,7 @@ pub async fn uninstall_many_with(
     keys: &[String],
     opts: RunOpts,
 ) -> InstallSummary {
+    let _lock = if opts.dry_run { None } else { sent.lock() };
     let empty = serde_json::Map::new();
     let ec = EngineCtx {
         src,
