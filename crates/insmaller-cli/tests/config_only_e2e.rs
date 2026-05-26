@@ -77,3 +77,28 @@ format = "env"
         "install step ran despite setup_writes_config_only=true",
     );
 }
+
+#[test]
+fn no_args_runs_default_command() {
+    let bin = env!("CARGO_BIN_EXE_insmaller");
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("installer.toml"),
+        "[settings]\ndefault_command = \"status\"\n",
+    )
+    .unwrap();
+
+    // No args → dispatch to `status` (always succeeds) instead of usage+fail.
+    let out = Command::new(bin).current_dir(dir.path()).output().expect("run");
+    assert!(
+        out.status.success(),
+        "no-arg default_command=status should exit 0\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    // Without default_command, no-args must still fail with usage.
+    let dir2 = tempfile::tempdir().unwrap();
+    fs::write(dir2.path().join("installer.toml"), "[settings]\n").unwrap();
+    let out2 = Command::new(bin).current_dir(dir2.path()).output().expect("run");
+    assert!(!out2.status.success(), "no default_command → usage + failure");
+}

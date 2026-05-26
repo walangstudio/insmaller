@@ -266,12 +266,37 @@ async fn main() -> ExitCode {
             println!("{name} {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        Some("-h") | Some("--help") | Some("help") | None => {
-            eprintln!("{}", usage_text(&name));
-            if args.is_empty() { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+        Some("-h") | Some("--help") | Some("help") => {
+            println!("{}", usage_text(&name));
+            ExitCode::SUCCESS
         }
+        // No args: run `[settings] default_command` if configured, else usage.
+        None => run_default_command(&name).await,
         // insmaller is an installer: anything else is treated as install keys.
         _ => cmd_op(&args, Op::Install, &name).await,
+    }
+}
+
+/// No-arg behavior: dispatch to `[settings] default_command` if the discovered
+/// config sets one; otherwise print usage and fail (the historical behavior).
+async fn run_default_command(name: &str) -> ExitCode {
+    let cfg_p = discover_config(None, name);
+    let default = LoadedConfig::from_path(Path::new(&cfg_p))
+        .ok()
+        .and_then(|c| c.settings.default_command.clone());
+    match default.as_deref() {
+        Some("setup") => cmd_setup(&[], name).await,
+        Some("install") => cmd_op(&[], Op::Install, name).await,
+        Some("status") | Some("query") => cmd_status(&[], name).await,
+        Some(other) => {
+            eprintln!("config error: unknown default_command '{other}'");
+            eprintln!("{}", usage_text(name));
+            ExitCode::FAILURE
+        }
+        None => {
+            eprintln!("{}", usage_text(name));
+            ExitCode::FAILURE
+        }
     }
 }
 

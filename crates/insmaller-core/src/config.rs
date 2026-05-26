@@ -169,6 +169,10 @@ pub struct Settings {
     /// over `collapsed_groups`).
     #[serde(default)]
     pub expanded_groups: Vec<String>,
+    /// Command run when the binary is invoked with no arguments, e.g.
+    /// `"setup"`. Absent ⇒ print usage (the historical behavior).
+    #[serde(default)]
+    pub default_command: Option<String>,
 }
 
 /// Sentinel base resolution. `global` keeps the historical per-user location;
@@ -245,6 +249,7 @@ impl Default for Settings {
             start_groups_collapsed: false,
             collapsed_groups: vec![],
             expanded_groups: vec![],
+            default_command: None,
         }
     }
 }
