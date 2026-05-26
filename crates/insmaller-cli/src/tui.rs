@@ -214,13 +214,15 @@ struct Picker {
     cursor: usize,
 }
 
-/// Directory listing for the browser: `..` first (unless at a root), then
-/// directories before files, each group case-insensitively sorted. Returns
-/// `(entries, readable)` — `readable` is false when the dir can't be opened, so
-/// callers can distinguish "empty" from "denied". Pure given the filesystem —
-/// unit-testable against a tempdir.
+/// Directory listing for the browser: `.` (pick this folder) first, then `..`
+/// (parent, unless at a root), then directories before files, each group
+/// case-insensitively sorted. Returns `(entries, readable)` — `readable` is
+/// false when the dir can't be opened, so callers can distinguish "empty" from
+/// "denied". Pure given the filesystem — unit-testable against a tempdir.
 fn list_dir(p: &Path) -> (Vec<Entry>, bool) {
     let mut entries: Vec<Entry> = Vec::new();
+    // `.` always selects the current directory as the value.
+    entries.push(Entry { name: ".".into(), is_dir: true });
     if p.parent().is_some() {
         entries.push(Entry { name: "..".into(), is_dir: true });
     }
@@ -303,6 +305,9 @@ impl Picker {
     /// `None`; on a file, return its full path (caller closes the picker).
     fn activate(&mut self) -> Option<String> {
         let entry = self.entries.get(self.cursor)?;
+        if entry.name == "." {
+            return Some(self.select_cwd());
+        }
         if entry.name == ".." {
             self.ascend();
             return None;
@@ -555,15 +560,11 @@ pub fn run_wizard_tui(
                                 let p = if focused && *cur == pos { ">" } else { " " };
                                 match row {
                                     Row::Header(gi) => {
+                                        // No radio mark on a single-select header
+                                        // — a group isn't itself selectable.
                                         let g = &groups[*gi];
                                         let tri = if collapsed[*gi] { "▶" } else { "▼" };
-                                        let any = sel.is_some_and(|s| {
-                                            choices[s].group.as_deref() == Some(g.as_str())
-                                        });
-                                        let mark = if any { "(o)" } else { "( )" };
-                                        items.push(ListItem::new(format!(
-                                            "   {p}{tri} {mark} {g}"
-                                        )));
+                                        items.push(ListItem::new(format!("   {p}{tri} {g}")));
                                     }
                                     Row::Item(i) => {
                                         let mark = if *sel == Some(*i) { "(o)" } else { "( )" };
@@ -613,17 +614,18 @@ pub fn run_wizard_tui(
                         .entries
                         .iter()
                         .map(|e| {
-                            let name = if e.is_dir && e.name != ".." {
-                                format!("{}/", e.name)
-                            } else {
-                                e.name.clone()
+                            let name = match e.name.as_str() {
+                                "." => ".    (select this folder)".to_string(),
+                                ".." => "..   (parent folder)".to_string(),
+                                _ if e.is_dir => format!("{}/", e.name),
+                                _ => e.name.clone(),
                             };
                             ListItem::new(name)
                         })
                         .collect();
                     let state = if p.readable { "" } else { "  [unreadable]" };
                     let title = format!(
-                        " {}{}  (↑↓ move · ↵ open · ← up · s select dir · Esc cancel) ",
+                        " {}{}  (↑↓ move · ↵ open/select · ← up · Esc cancel) ",
                         p.cwd.display(),
                         state
                     );
@@ -924,32 +926,35 @@ mod tests {
     }
 
     #[test]
-    fn list_dir_dotdot_first_then_dirs_before_files() {
+    fn list_dir_dot_dotdot_then_dirs_before_files() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("zdir")).unwrap();
         std::fs::write(dir.path().join("afile.txt"), b"x").unwrap();
         let (entries, readable) = list_dir(dir.path());
         assert!(readable);
-        assert_eq!(entries[0].name, "..");
-        assert!(entries[0].is_dir);
+        // "." (select this folder) first, then ".." (parent)
+        assert_eq!(entries[0].name, ".");
+        assert_eq!(entries[1].name, "..");
         // directory sorts before the file despite "zdir" > "afile"
-        assert_eq!(entries[1].name, "zdir");
-        assert!(entries[1].is_dir);
-        assert_eq!(entries[2].name, "afile.txt");
-        assert!(!entries[2].is_dir);
+        assert_eq!(entries[2].name, "zdir");
+        assert!(entries[2].is_dir);
+        assert_eq!(entries[3].name, "afile.txt");
+        assert!(!entries[3].is_dir);
     }
 
     #[test]
     fn list_dir_reports_unreadable() {
         // A path that is not a directory cannot be listed → readable=false,
-        // and only the synthetic ".." entry is present.
+        // and only the synthetic "." and ".." entries are present.
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("not_a_dir.txt");
         std::fs::write(&file, b"x").unwrap();
         let (entries, readable) = list_dir(&file);
         assert!(!readable);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name, "..");
+        assert_eq!(
+            entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec![".", ".."]
+        );
     }
 
     #[test]
@@ -960,13 +965,23 @@ mod tests {
         std::fs::write(sub.join("f.txt"), b"x").unwrap();
 
         let mut p = Picker::open(&dir.path().to_string_lossy());
-        // [.., sub]; move onto "sub" and descend
+        // [., .., sub]; cursor 0 is "." which selects this very folder
+        assert_eq!(p.entries[p.cursor].name, ".");
+        assert_eq!(
+            p.activate().map(std::path::PathBuf::from),
+            Some(dir.path().to_path_buf()),
+            "'.' selects the current folder"
+        );
+
+        // move onto "sub" (skip ., ..) and descend
+        p.down();
         p.down();
         assert_eq!(p.entries[p.cursor].name, "sub");
         assert_eq!(p.activate(), None);
         assert_eq!(p.cwd, sub);
 
-        // now [.., f.txt]; selecting the file returns its full path
+        // now [., .., f.txt]; selecting the file returns its full path
+        p.down();
         p.down();
         assert_eq!(p.entries[p.cursor].name, "f.txt");
         let got = p.activate().expect("file selection returns a path");
@@ -974,7 +989,8 @@ mod tests {
 
         // activating ".." ascends back to the parent
         let mut q = Picker::open(&sub.to_string_lossy());
-        assert_eq!(q.entries[0].name, "..");
+        q.down(); // onto ".."
+        assert_eq!(q.entries[q.cursor].name, "..");
         assert_eq!(q.activate(), None);
         assert_eq!(q.cwd, dir.path());
     }
