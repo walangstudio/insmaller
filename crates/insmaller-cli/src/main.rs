@@ -383,7 +383,7 @@ fn collect_keys(a: &[String]) -> Vec<String> {
     let mut i = 0;
     while i < a.len() {
         match a[i].as_str() {
-            "--config" | "--catalog" => i += 2,
+            "--config" | "--catalog" | "--jobs" | "-j" => i += 2,
             "--dry-run" | "--json" | "--force" | "--parallel" | "-p" => i += 1,
             k => {
                 keys.push(k.to_string());
@@ -645,43 +645,37 @@ async fn cmd_task(a: &[String], name: &str) -> ExitCode {
     let mut reg = builtins(&cfg.settings);
     insmaller_core::register_external(&mut reg, &cfg.plugins);
 
-    // `--parallel`/`-p`: run the named tasks concurrently (assumes they're
-    // independent). Default is sequential, fail-fast. Parallel runs every task
-    // to completion and reports all failures.
-    if has(a, "--parallel") || has(a, "-p") {
-        let results = futures::future::join_all(names.iter().map(|name| async {
-            let r = insmaller_core::run_task(
-                name,
-                &cfg,
-                &reg,
-                &StdoutReporter,
-                &EnvResolver,
-                &run_vars,
-            )
-            .await;
-            (name.clone(), r)
-        }))
-        .await;
-        let mut ok = true;
-        for (name, r) in results {
-            if let Err(e) = r {
-                eprintln!("task '{name}' failed: {e:#}");
-                ok = false;
+    // Concurrency for the task DAG. Precedence: --jobs N / -j N → --parallel/-p
+    // (unbounded) → `[settings] max_parallel_tasks` (default 1 = sequential).
+    let max_parallel = match opt_opt(a, "--jobs").or_else(|| opt_opt(a, "-j")) {
+        Some(j) => match j.parse::<usize>() {
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!("--jobs expects a number, got '{j}'");
+                return ExitCode::FAILURE;
             }
-        }
-        return if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE };
-    }
+        },
+        None if has(a, "--parallel") || has(a, "-p") => 0,
+        None => cfg.settings.max_parallel_tasks,
+    };
 
-    for name in &names {
-        if let Err(e) =
-            insmaller_core::run_task(name, &cfg, &reg, &StdoutReporter, &EnvResolver, &run_vars)
-                .await
-        {
-            eprintln!("task '{name}' failed: {e:#}");
-            return ExitCode::FAILURE;
+    match insmaller_core::run_tasks(
+        &names,
+        &cfg,
+        &reg,
+        &StdoutReporter,
+        &EnvResolver,
+        &run_vars,
+        max_parallel,
+    )
+    .await
+    {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("task failed: {e:#}");
+            ExitCode::FAILURE
         }
     }
-    ExitCode::SUCCESS
 }
 
 /// `insmaller status [<key>]` — read-only listing of what the scope-aware

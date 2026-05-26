@@ -11,7 +11,7 @@ use crate::orchestrator::run_step_pipeline;
 use crate::registry::ProcessorRegistry;
 use crate::reporter::Reporter;
 use serde_json::{Map, Value};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 /// Run task `name`: its `needs` first (each once, cycle-guarded), then the
 /// OS-selected step pipeline. `run_vars` (project.extra + env + answers) are
@@ -56,7 +56,25 @@ async fn run_inner(
     }
     stack.pop();
 
-    // Per-OS override (probe = std::env::consts::OS), else the default steps.
+    run_task_body(name, cfg, reg, rep, inp, run_vars).await?;
+    done.insert(name.to_string());
+    Ok(())
+}
+
+/// Run a single task's own step pipeline (its `needs` are NOT run here — the
+/// caller orders them). Per-OS override probed via `std::env::consts::OS`.
+async fn run_task_body(
+    name: &str,
+    cfg: &LoadedConfig,
+    reg: &ProcessorRegistry,
+    rep: &dyn Reporter,
+    inp: &dyn InputResolver,
+    run_vars: &Map<String, Value>,
+) -> Result<()> {
+    let task = cfg
+        .tasks
+        .get(name)
+        .ok_or_else(|| EngineError::NotFound(format!("task '{name}'")))?;
     let os = std::env::consts::OS;
     let steps = task.os_steps.get(os).unwrap_or(&task.steps);
 
@@ -66,8 +84,69 @@ async fn run_inner(
     }
     ctx.set("task", name);
     rep.log(&format!("[task {name}] {} step(s)", steps.len()));
-    run_step_pipeline(reg, rep, inp, steps, &ctx, name).await?;
-    done.insert(name.to_string());
+    run_step_pipeline(reg, rep, inp, steps, &ctx, name).await
+}
+
+/// Run a batch of tasks as a bounded-concurrency DAG: every task whose `needs`
+/// are satisfied runs concurrently, up to `max_parallel` at once (`0` =
+/// unbounded, `1` = sequential). `needs` are pulled into the run automatically
+/// and each task runs once. Fail-fast: the first error returned after the
+/// current wave aborts scheduling. The `needs` graph is cycle/unknown-checked
+/// at config load, so the schedule always makes progress.
+pub async fn run_tasks(
+    names: &[String],
+    cfg: &LoadedConfig,
+    reg: &ProcessorRegistry,
+    rep: &dyn Reporter,
+    inp: &dyn InputResolver,
+    run_vars: &Map<String, Value>,
+    max_parallel: usize,
+) -> Result<()> {
+    // Transitive closure of requested tasks + their needs (BFS, deterministic).
+    let mut all: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<String> = names.iter().cloned().collect();
+    while let Some(n) = queue.pop_front() {
+        if !seen.insert(n.clone()) {
+            continue;
+        }
+        let task = cfg
+            .tasks
+            .get(&n)
+            .ok_or_else(|| EngineError::NotFound(format!("task '{n}'")))?;
+        for d in &task.needs {
+            queue.push_back(d.clone());
+        }
+        all.push(n);
+    }
+
+    let cap = if max_parallel == 0 { usize::MAX } else { max_parallel.max(1) };
+    let mut done: HashSet<String> = HashSet::new();
+    while done.len() < all.len() {
+        let ready: Vec<String> = all
+            .iter()
+            .filter(|n| {
+                !done.contains(*n) && cfg.tasks[*n].needs.iter().all(|d| done.contains(d))
+            })
+            .take(cap)
+            .cloned()
+            .collect();
+        if ready.is_empty() {
+            return Err(EngineError::Cycle(
+                "task scheduler stalled (no runnable task)".into(),
+            ));
+        }
+        let results = futures::future::join_all(
+            ready
+                .iter()
+                .map(|n| run_task_body(n, cfg, reg, rep, inp, run_vars)),
+        )
+        .await;
+        for (n, r) in ready.iter().zip(results) {
+            r?;
+            done.insert(n.clone());
+        }
+    }
     Ok(())
 }
 
@@ -245,5 +324,78 @@ mod tests {
         ));
         run("r", &c, &Map::new()).await.unwrap();
         assert_eq!(std::fs::read_to_string(&o).unwrap().trim(), "default");
+    }
+
+    async fn run_batch(
+        names: &[&str],
+        cfg: &LoadedConfig,
+        max_parallel: usize,
+    ) -> Result<()> {
+        let reg = crate::builtins(&cfg.settings);
+        let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        run_tasks(&names, cfg, &reg, &NullReporter, &EnvResolver, &Map::new(), max_parallel).await
+    }
+
+    #[tokio::test]
+    async fn run_tasks_concurrent_runs_all_independent() {
+        if std::env::consts::OS == "windows" {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a").to_string_lossy().replace('\\', "/");
+        let b = dir.path().join("b").to_string_lossy().replace('\\', "/");
+        let c = cfg(&format!(
+            r#"
+            [task.a]
+            [[task.a.steps]]
+            type = "shell"
+            script = "echo a > '{a}'"
+            [task.b]
+            [[task.b.steps]]
+            type = "shell"
+            script = "echo b > '{b}'"
+            "#
+        ));
+        // unbounded concurrency; both must run
+        run_batch(&["a", "b"], &c, 0).await.unwrap();
+        assert!(std::path::Path::new(&a).exists());
+        assert!(std::path::Path::new(&b).exists());
+    }
+
+    #[tokio::test]
+    async fn run_tasks_honors_needs_even_when_parallel() {
+        // a needs b; even with concurrency, b must finish before a runs.
+        if std::env::consts::OS == "windows" {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("m").to_string_lossy().replace('\\', "/");
+        let c = cfg(&format!(
+            r#"
+            [task.b]
+            [[task.b.steps]]
+            type = "shell"
+            script = "echo b > '{marker}'"
+            [task.a]
+            needs = ["b"]
+            [[task.a.steps]]
+            type = "shell"
+            script = "test -f '{marker}'"
+            "#
+        ));
+        // request only `a`; `b` is pulled in as a need and ordered first
+        run_batch(&["a"], &c, 4).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_tasks_sequential_when_cap_is_one() {
+        if std::env::consts::OS == "windows" {
+            return;
+        }
+        let c = cfg(&format!(
+            "[task.go]\n[[task.go.steps]]\n{}",
+            echo_ok(std::env::consts::OS)
+        ));
+        run_batch(&["go"], &c, 1).await.unwrap();
     }
 }

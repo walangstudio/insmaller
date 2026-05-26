@@ -173,6 +173,15 @@ pub struct Settings {
     /// `"setup"`. Absent ⇒ print usage (the historical behavior).
     #[serde(default)]
     pub default_command: Option<String>,
+    /// Max tasks the `task` DAG scheduler runs concurrently. `1` (default) =
+    /// sequential/deterministic; `0` = unbounded; `n` = at most n at once.
+    /// Independent tasks run together; `needs` ordering is always honored.
+    #[serde(default = "default_max_parallel_tasks")]
+    pub max_parallel_tasks: usize,
+}
+
+fn default_max_parallel_tasks() -> usize {
+    1
 }
 
 /// Sentinel base resolution. `global` keeps the historical per-user location;
@@ -250,6 +259,7 @@ impl Default for Settings {
             collapsed_groups: vec![],
             expanded_groups: vec![],
             default_command: None,
+            max_parallel_tasks: 1,
         }
     }
 }
@@ -675,6 +685,14 @@ mod tests {
         )
         .unwrap();
         assert!(cfg.settings.setup_writes_config_only);
+    }
+
+    #[test]
+    fn max_parallel_tasks_defaults_to_one() {
+        let def = LoadedConfig::from_str("").unwrap();
+        assert_eq!(def.settings.max_parallel_tasks, 1);
+        let cfg = LoadedConfig::from_str("[settings]\nmax_parallel_tasks = 4\n").unwrap();
+        assert_eq!(cfg.settings.max_parallel_tasks, 4);
     }
 
     #[test]

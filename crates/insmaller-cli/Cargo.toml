@@ -20,7 +20,6 @@ ratatui.workspace = true
 crossterm.workspace = true
 indicatif.workspace = true
 dirs.workspace = true
-futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 
 [dev-dependencies]
 tempfile = "3"
