@@ -463,7 +463,12 @@ async fn cmd_setup(a: &[String], name: &str) -> ExitCode {
         }
     } else {
         let mut session = WizardSession::new(&wiz, &cat, group_order.clone());
-        match tui::run_wizard_tui(&mut session, palette) {
+        let gd = tui::GroupDefaults {
+            collapsed_default: cfg.settings.start_groups_collapsed,
+            collapsed: cfg.settings.collapsed_groups.clone(),
+            expanded: cfg.settings.expanded_groups.clone(),
+        };
+        match tui::run_wizard_tui(&mut session, palette, &gd) {
             Ok(true) => (session.finish(), true),
             Ok(false) => {
                 println!("Setup cancelled.");

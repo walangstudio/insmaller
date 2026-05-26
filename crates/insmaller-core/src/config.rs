@@ -158,6 +158,17 @@ pub struct Settings {
     /// shell bodies are POSIX (e.g. a Git Bash dependency).
     #[serde(default)]
     pub prefer_bash_on_windows: bool,
+    /// TUI: whether catalog group headers start collapsed. Default false
+    /// (expanded). `expanded_groups`/`collapsed_groups` override per group.
+    #[serde(default)]
+    pub start_groups_collapsed: bool,
+    /// Group names that always start collapsed (overrides the baseline).
+    #[serde(default)]
+    pub collapsed_groups: Vec<String>,
+    /// Group names that always start expanded (overrides the baseline; wins
+    /// over `collapsed_groups`).
+    #[serde(default)]
+    pub expanded_groups: Vec<String>,
 }
 
 /// Sentinel base resolution. `global` keeps the historical per-user location;
@@ -231,6 +242,9 @@ impl Default for Settings {
             sentinel_path: None,
             setup_writes_config_only: false,
             prefer_bash_on_windows: false,
+            start_groups_collapsed: false,
+            collapsed_groups: vec![],
+            expanded_groups: vec![],
         }
     }
 }

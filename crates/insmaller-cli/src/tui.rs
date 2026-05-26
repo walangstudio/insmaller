@@ -322,7 +322,31 @@ impl Picker {
     }
 }
 
-fn init_widget(f: &Field, s: &WizardSession) -> Widget {
+/// Per-group initial collapse policy: a baseline plus name overrides.
+/// `expanded` wins over `collapsed`, both win over the baseline.
+#[derive(Default, Clone)]
+pub struct GroupDefaults {
+    pub collapsed_default: bool,
+    pub collapsed: Vec<String>,
+    pub expanded: Vec<String>,
+}
+
+impl GroupDefaults {
+    fn is_collapsed(&self, group: &str) -> bool {
+        if self.expanded.iter().any(|g| g == group) {
+            false
+        } else if self.collapsed.iter().any(|g| g == group) {
+            true
+        } else {
+            self.collapsed_default
+        }
+    }
+    fn for_groups(&self, groups: &[String]) -> Vec<bool> {
+        groups.iter().map(|g| self.is_collapsed(g)).collect()
+    }
+}
+
+fn init_widget(f: &Field, s: &WizardSession, gd: &GroupDefaults) -> Widget {
     let prior = s.answer_for(&f.id).cloned();
     match f.field_type {
         FieldType::Multiselect => {
@@ -335,7 +359,7 @@ fn init_widget(f: &Field, s: &WizardSession) -> Widget {
                 })
                 .collect();
             let groups = group_list(&choices);
-            let collapsed = vec![false; groups.len()];
+            let collapsed = gd.for_groups(&groups);
             Widget::Multi { choices, on, groups, collapsed, cur: 0 }
         }
         FieldType::SingleSelect => {
@@ -345,7 +369,7 @@ fn init_widget(f: &Field, s: &WizardSession) -> Widget {
                 _ => None,
             };
             let groups = group_list(&choices);
-            let collapsed = vec![false; groups.len()];
+            let collapsed = gd.for_groups(&groups);
             Widget::Single { choices, sel, groups, collapsed, cur: 0 }
         }
         FieldType::Toggle => Widget::Toggle {
@@ -427,7 +451,11 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 }
 
 /// Run the wizard interactively. Returns true if completed, false if quit.
-pub fn run_wizard_tui(session: &mut WizardSession, pal: Palette) -> anyhow::Result<bool> {
+pub fn run_wizard_tui(
+    session: &mut WizardSession,
+    pal: Palette,
+    gd: &GroupDefaults,
+) -> anyhow::Result<bool> {
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
     let _g = TermGuard;
@@ -450,7 +478,7 @@ pub fn run_wizard_tui(session: &mut WizardSession, pal: Palette) -> anyhow::Resu
             })
             .collect();
         let mut widgets: Vec<Widget> =
-            fields.iter().map(|f| init_widget(f, session)).collect();
+            fields.iter().map(|f| init_widget(f, session, gd)).collect();
         // focus targets: 0..fields = field i; fields = Back; fields+1 = Next
         let n = fields.len();
         let mut focus = 0usize;
@@ -847,7 +875,8 @@ impl Reporter for BarReporter {
 #[cfg(test)]
 mod tests {
     use super::{
-        group_list, group_mark_multi, item_label, list_dir, vert_nav, visible_rows, Picker, Row,
+        group_list, group_mark_multi, item_label, list_dir, vert_nav, visible_rows, GroupDefaults,
+        Picker, Row,
     };
     use insmaller_core::Choice;
 
@@ -1019,5 +1048,28 @@ mod tests {
         };
         assert_eq!(item_label(&c), "bun — fast");
         assert_eq!(item_label(&ch("x", None)), "x");
+    }
+
+    #[test]
+    fn group_defaults_precedence() {
+        let gd = GroupDefaults {
+            collapsed_default: true,
+            collapsed: vec!["x".into()],
+            expanded: vec!["y".into()],
+        };
+        // baseline applies when not named
+        assert!(gd.is_collapsed("other"));
+        // expanded wins even over the collapsed baseline / collapsed list
+        assert!(!gd.is_collapsed("y"));
+        assert!(gd.is_collapsed("x"));
+
+        let open = GroupDefaults {
+            collapsed_default: false,
+            collapsed: vec!["git".into()],
+            expanded: vec![],
+        };
+        assert!(!open.is_collapsed("runtime"));
+        assert!(open.is_collapsed("git"));
+        assert_eq!(open.for_groups(&["runtime".into(), "git".into()]), vec![false, true]);
     }
 }
