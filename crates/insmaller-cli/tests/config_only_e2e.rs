@@ -102,3 +102,42 @@ fn no_args_runs_default_command() {
     let out2 = Command::new(bin).current_dir(dir2.path()).output().expect("run");
     assert!(!out2.status.success(), "no default_command → usage + failure");
 }
+
+#[test]
+fn parallel_runs_all_named_tasks() {
+    let bin = env!("CARGO_BIN_EXE_insmaller");
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.done").display().to_string().replace('\\', "/");
+    let b = dir.path().join("b.done").display().to_string().replace('\\', "/");
+    fs::write(
+        dir.path().join("installer.toml"),
+        format!(
+            r#"[settings]
+
+[task.a]
+[[task.a.steps]]
+type = "shell"
+script = "echo a > {a}"
+
+[task.b]
+[[task.b.steps]]
+type = "shell"
+script = "echo b > {b}"
+"#
+        ),
+    )
+    .unwrap();
+
+    let out = Command::new(bin)
+        .args(["task", "a", "b", "--parallel"])
+        .current_dir(dir.path())
+        .output()
+        .expect("run");
+    assert!(
+        out.status.success(),
+        "parallel task run failed\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(std::path::Path::new(&a).exists(), "task a did not run");
+    assert!(std::path::Path::new(&b).exists(), "task b did not run");
+}

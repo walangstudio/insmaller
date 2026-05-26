@@ -384,7 +384,7 @@ fn collect_keys(a: &[String]) -> Vec<String> {
     while i < a.len() {
         match a[i].as_str() {
             "--config" | "--catalog" => i += 2,
-            "--dry-run" | "--json" | "--force" => i += 1,
+            "--dry-run" | "--json" | "--force" | "--parallel" | "-p" => i += 1,
             k => {
                 keys.push(k.to_string());
                 i += 1;
@@ -644,6 +644,34 @@ async fn cmd_task(a: &[String], name: &str) -> ExitCode {
     inject_exe_vars(&mut run_vars, std::env::current_exe().ok());
     let mut reg = builtins(&cfg.settings);
     insmaller_core::register_external(&mut reg, &cfg.plugins);
+
+    // `--parallel`/`-p`: run the named tasks concurrently (assumes they're
+    // independent). Default is sequential, fail-fast. Parallel runs every task
+    // to completion and reports all failures.
+    if has(a, "--parallel") || has(a, "-p") {
+        let results = futures::future::join_all(names.iter().map(|name| async {
+            let r = insmaller_core::run_task(
+                name,
+                &cfg,
+                &reg,
+                &StdoutReporter,
+                &EnvResolver,
+                &run_vars,
+            )
+            .await;
+            (name.clone(), r)
+        }))
+        .await;
+        let mut ok = true;
+        for (name, r) in results {
+            if let Err(e) = r {
+                eprintln!("task '{name}' failed: {e:#}");
+                ok = false;
+            }
+        }
+        return if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE };
+    }
+
     for name in &names {
         if let Err(e) =
             insmaller_core::run_task(name, &cfg, &reg, &StdoutReporter, &EnvResolver, &run_vars)
