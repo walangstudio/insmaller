@@ -387,6 +387,35 @@ mod tests {
         run_batch(&["a"], &c, 4).await.unwrap();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn run_tasks_actually_overlaps_in_wall_time() {
+        let sleep_cmd = if std::env::consts::OS == "windows" {
+            "Start-Sleep -Seconds 1"
+        } else {
+            "sleep 1"
+        };
+        let c = cfg(&format!(
+            r#"
+            [task.a]
+            [[task.a.steps]]
+            type = "shell"
+            script = "{sleep_cmd}"
+            [task.b]
+            [[task.b.steps]]
+            type = "shell"
+            script = "{sleep_cmd}"
+            "#
+        ));
+        let t = std::time::Instant::now();
+        run_batch(&["a", "b"], &c, 0).await.unwrap();
+        let elapsed = t.elapsed();
+        // Two 1s sleeps run concurrently must finish well under 2s.
+        assert!(
+            elapsed < std::time::Duration::from_millis(1800),
+            "expected overlap, took {elapsed:?}"
+        );
+    }
+
     #[tokio::test]
     async fn run_tasks_sequential_when_cap_is_one() {
         if std::env::consts::OS == "windows" {
