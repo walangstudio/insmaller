@@ -34,13 +34,167 @@ impl Drop for TermGuard {
 }
 
 enum Widget {
-    Multi { choices: Vec<insmaller_core::Choice>, on: Vec<bool>, cur: usize },
-    Single { choices: Vec<insmaller_core::Choice>, sel: Option<usize>, cur: usize },
+    Multi {
+        choices: Vec<insmaller_core::Choice>,
+        on: Vec<bool>,
+        groups: Vec<String>,
+        collapsed: Vec<bool>,
+        cur: usize,
+    },
+    Single {
+        choices: Vec<insmaller_core::Choice>,
+        sel: Option<usize>,
+        groups: Vec<String>,
+        collapsed: Vec<bool>,
+        cur: usize,
+    },
     Toggle { on: bool },
     Input { buf: String, secret: bool },
     /// A filesystem path. Editable as text; `Ctrl+B` opens an interactive
     /// directory/file browser (`picker = Some`).
     Path { buf: String, picker: Option<Picker> },
+}
+
+/// A visible line in a select's collapsible tree: a group `Header` (index into
+/// the group list) or an `Item` (index into the choices vec).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Row {
+    Header(usize),
+    Item(usize),
+}
+
+/// Distinct catalog groups in first-appearance order. Ungrouped choices are
+/// excluded (they render at the top with no header).
+fn group_list(choices: &[insmaller_core::Choice]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for c in choices {
+        if let Some(g) = &c.group {
+            if !out.iter().any(|x| x == g) {
+                out.push(g.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Choice label without the redundant `[group] ` prefix (the group is shown by
+/// its header in the tree).
+fn item_label(c: &insmaller_core::Choice) -> &str {
+    if let Some(g) = &c.group {
+        if let Some(rest) = c.label.strip_prefix(&format!("[{g}] ")) {
+            return rest;
+        }
+    }
+    &c.label
+}
+
+/// Checkbox glyph for a multiselect group header: all / some / none selected.
+fn group_mark_multi(choices: &[insmaller_core::Choice], on: &[bool], group: &str) -> &'static str {
+    let idxs: Vec<usize> = (0..choices.len())
+        .filter(|&i| choices[i].group.as_deref() == Some(group))
+        .collect();
+    let sel = idxs.iter().filter(|&&i| on[i]).count();
+    if sel == 0 {
+        "[ ]"
+    } else if sel == idxs.len() {
+        "[x]"
+    } else {
+        "[~]"
+    }
+}
+
+/// Visible rows for a select: ungrouped items first, then each group header
+/// followed by its items unless the group is collapsed. `collapsed` aligns to
+/// `groups`. With no groups this is just every item in order (a flat list).
+fn visible_rows(
+    choices: &[insmaller_core::Choice],
+    groups: &[String],
+    collapsed: &[bool],
+) -> Vec<Row> {
+    let mut rows: Vec<Row> = Vec::new();
+    for (i, c) in choices.iter().enumerate() {
+        if c.group.is_none() {
+            rows.push(Row::Item(i));
+        }
+    }
+    for (gi, g) in groups.iter().enumerate() {
+        rows.push(Row::Header(gi));
+        if !collapsed.get(gi).copied().unwrap_or(false) {
+            for (i, c) in choices.iter().enumerate() {
+                if c.group.as_deref() == Some(g.as_str()) {
+                    rows.push(Row::Item(i));
+                }
+            }
+        }
+    }
+    rows
+}
+
+/// Visible rows of a select widget (`None` for non-selects).
+fn tree_rows_of(w: &Widget) -> Option<Vec<Row>> {
+    match w {
+        Widget::Multi { choices, groups, collapsed, .. }
+        | Widget::Single { choices, groups, collapsed, .. } => {
+            Some(visible_rows(choices, groups, collapsed))
+        }
+        _ => None,
+    }
+}
+
+/// A select's tree cursor (0 otherwise).
+fn cur_of(w: &Widget) -> usize {
+    match w {
+        Widget::Multi { cur, .. } | Widget::Single { cur, .. } => *cur,
+        _ => 0,
+    }
+}
+
+/// The row under the cursor of a select widget.
+fn current_row(w: &Widget) -> Option<Row> {
+    tree_rows_of(w).and_then(|rows| rows.get(cur_of(w)).copied())
+}
+
+/// True for a select that actually has group headers (so ←/→ drive the tree
+/// rather than field-focus navigation).
+fn widget_has_groups(w: &Widget) -> bool {
+    matches!(
+        w,
+        Widget::Multi { groups, .. } | Widget::Single { groups, .. } if !groups.is_empty()
+    )
+}
+
+/// Clamp the tree cursor to the current visible-row count (after a collapse
+/// shrinks the list).
+fn clamp_cur(w: &mut Widget) {
+    let max = match tree_rows_of(w) {
+        Some(rows) => rows.len().saturating_sub(1),
+        None => return,
+    };
+    if let Widget::Multi { cur, .. } | Widget::Single { cur, .. } = w {
+        *cur = (*cur).min(max);
+    }
+}
+
+/// Move the cursor onto the header of `item`'s group (← from an item).
+fn cursor_to_header_of(w: &mut Widget, item: usize) {
+    let rows = match tree_rows_of(w) {
+        Some(r) => r,
+        None => return,
+    };
+    let gi = match &*w {
+        Widget::Multi { choices, groups, .. } | Widget::Single { choices, groups, .. } => choices
+            .get(item)
+            .and_then(|c| c.group.as_ref())
+            .and_then(|g| groups.iter().position(|x| x == g)),
+        _ => None,
+    };
+    let Some(gi) = gi else { return };
+    let Some(pos) = rows.iter().position(|r| *r == Row::Header(gi)) else {
+        return;
+    };
+    if let Widget::Multi { cur, .. } | Widget::Single { cur, .. } = w {
+        *cur = pos;
+    }
 }
 
 /// One row in the file browser.
@@ -180,7 +334,9 @@ fn init_widget(f: &Field, s: &WizardSession) -> Widget {
                     _ => c.default,
                 })
                 .collect();
-            Widget::Multi { choices, on, cur: 0 }
+            let groups = group_list(&choices);
+            let collapsed = vec![false; groups.len()];
+            Widget::Multi { choices, on, groups, collapsed, cur: 0 }
         }
         FieldType::SingleSelect => {
             let choices = s.choices(f);
@@ -188,7 +344,9 @@ fn init_widget(f: &Field, s: &WizardSession) -> Widget {
                 Some(Value::String(v)) => choices.iter().position(|c| &c.value == v),
                 _ => None,
             };
-            Widget::Single { choices, sel, cur: 0 }
+            let groups = group_list(&choices);
+            let collapsed = vec![false; groups.len()];
+            Widget::Single { choices, sel, groups, collapsed, cur: 0 }
         }
         FieldType::Toggle => Widget::Toggle {
             on: matches!(prior, Some(Value::Bool(true))),
@@ -336,18 +494,59 @@ pub fn run_wizard_tui(session: &mut WizardSession, pal: Palette) -> anyhow::Resu
                         Style::default().add_modifier(Modifier::BOLD),
                     )));
                     match &widgets[i] {
-                        Widget::Multi { choices, on, cur } => {
-                            for (j, c) in choices.iter().enumerate() {
-                                let mark = if on[j] { "[x]" } else { "[ ]" };
-                                let p = if focused && *cur == j { ">" } else { " " };
-                                items.push(ListItem::new(format!("   {p}{mark} {}", c.label)));
+                        Widget::Multi { choices, on, groups, collapsed, cur } => {
+                            for (pos, row) in
+                                visible_rows(choices, groups, collapsed).iter().enumerate()
+                            {
+                                let p = if focused && *cur == pos { ">" } else { " " };
+                                match row {
+                                    Row::Header(gi) => {
+                                        let g = &groups[*gi];
+                                        let tri = if collapsed[*gi] { "▶" } else { "▼" };
+                                        let mark = group_mark_multi(choices, on, g);
+                                        items.push(ListItem::new(format!(
+                                            "   {p}{tri} {mark} {g}"
+                                        )));
+                                    }
+                                    Row::Item(i) => {
+                                        let mark = if on[*i] { "[x]" } else { "[ ]" };
+                                        let indent =
+                                            if choices[*i].group.is_some() { "     " } else { "   " };
+                                        items.push(ListItem::new(format!(
+                                            "{indent}{p}{mark} {}",
+                                            item_label(&choices[*i])
+                                        )));
+                                    }
+                                }
                             }
                         }
-                        Widget::Single { choices, sel, cur } => {
-                            for (j, c) in choices.iter().enumerate() {
-                                let mark = if *sel == Some(j) { "(o)" } else { "( )" };
-                                let p = if focused && *cur == j { ">" } else { " " };
-                                items.push(ListItem::new(format!("   {p}{mark} {}", c.label)));
+                        Widget::Single { choices, sel, groups, collapsed, cur } => {
+                            for (pos, row) in
+                                visible_rows(choices, groups, collapsed).iter().enumerate()
+                            {
+                                let p = if focused && *cur == pos { ">" } else { " " };
+                                match row {
+                                    Row::Header(gi) => {
+                                        let g = &groups[*gi];
+                                        let tri = if collapsed[*gi] { "▶" } else { "▼" };
+                                        let any = sel.is_some_and(|s| {
+                                            choices[s].group.as_deref() == Some(g.as_str())
+                                        });
+                                        let mark = if any { "(o)" } else { "( )" };
+                                        items.push(ListItem::new(format!(
+                                            "   {p}{tri} {mark} {g}"
+                                        )));
+                                    }
+                                    Row::Item(i) => {
+                                        let mark = if *sel == Some(*i) { "(o)" } else { "( )" };
+                                        let indent =
+                                            if choices[*i].group.is_some() { "     " } else { "   " };
+                                        items.push(ListItem::new(format!(
+                                            "{indent}{p}{mark} {}",
+                                            item_label(&choices[*i])
+                                        )));
+                                    }
+                                }
                             }
                         }
                         Widget::Toggle { on } => items.push(ListItem::new(format!(
@@ -427,7 +626,7 @@ pub fn run_wizard_tui(session: &mut WizardSession, pal: Palette) -> anyhow::Resu
                     Span::raw("   "),
                     Span::styled(
                         err.clone().unwrap_or_else(|| {
-                            "Tab/←→ focus · ↑↓ move within/between fields · Space toggle · Enter next · Esc back · q quit".into()
+                            "Tab focus · ↑↓ move · ←→ expand/collapse · Space toggle · Enter next · Esc back · q quit".into()
                         }),
                         Style::default().fg(if err.is_some() { pal.error } else { pal.muted }),
                     ),
@@ -499,6 +698,31 @@ pub fn run_wizard_tui(session: &mut WizardSession, pal: Palette) -> anyhow::Resu
             };
 
             match k.code {
+                // On a grouped select, →/← drive expand/collapse instead of
+                // field focus (focus still moves via Tab / ↑↓).
+                KeyCode::Right if focus < n && widget_has_groups(&widgets[focus]) => {
+                    if let Some(Row::Header(gi)) = current_row(&widgets[focus]) {
+                        if let Widget::Multi { collapsed, .. }
+                        | Widget::Single { collapsed, .. } = &mut widgets[focus]
+                        {
+                            collapsed[gi] = false;
+                        }
+                    }
+                }
+                KeyCode::Left if focus < n && widget_has_groups(&widgets[focus]) => {
+                    match current_row(&widgets[focus]) {
+                        Some(Row::Header(gi)) => {
+                            if let Widget::Multi { collapsed, .. }
+                            | Widget::Single { collapsed, .. } = &mut widgets[focus]
+                            {
+                                collapsed[gi] = true;
+                            }
+                            clamp_cur(&mut widgets[focus]);
+                        }
+                        Some(Row::Item(i)) => cursor_to_header_of(&mut widgets[focus], i),
+                        None => {}
+                    }
+                }
                 KeyCode::Tab | KeyCode::Right if !editing => focus = (focus + 1) % (n + 2),
                 KeyCode::BackTab | KeyCode::Left if !editing => {
                     focus = (focus + n + 1) % (n + 2)
@@ -512,11 +736,10 @@ pub fn run_wizard_tui(session: &mut WizardSession, pal: Palette) -> anyhow::Resu
                 }
                 KeyCode::Up | KeyCode::Down if focus < n => {
                     let down = k.code == KeyCode::Down;
-                    let (cur, len) = match &widgets[focus] {
-                        Widget::Multi { choices, cur, .. }
-                        | Widget::Single { choices, cur, .. } => (*cur, choices.len()),
-                        _ => (0, 0),
-                    };
+                    // For selects, the cursor ranges over visible tree rows
+                    // (headers + items), not the raw choices.
+                    let len = tree_rows_of(&widgets[focus]).map_or(0, |r| r.len());
+                    let cur = cur_of(&widgets[focus]);
                     let (new_cur, new_focus) = vert_nav(cur, len, down, focus, n);
                     if let Widget::Multi { cur, .. } | Widget::Single { cur, .. } =
                         &mut widgets[focus]
@@ -525,12 +748,24 @@ pub fn run_wizard_tui(session: &mut WizardSession, pal: Palette) -> anyhow::Resu
                     }
                     focus = new_focus;
                 }
-                KeyCode::Char(' ') if focus < n => match &mut widgets[focus] {
-                    Widget::Multi { on, cur, .. } => on[*cur] = !on[*cur],
-                    Widget::Single { sel, cur, .. } => *sel = Some(*cur),
-                    Widget::Toggle { on } => *on = !*on,
-                    Widget::Input { buf, .. } | Widget::Path { buf, .. } => buf.push(' '),
-                },
+                KeyCode::Char(' ') if focus < n => {
+                    let row = current_row(&widgets[focus]);
+                    match &mut widgets[focus] {
+                        Widget::Multi { on, collapsed, .. } => match row {
+                            Some(Row::Item(i)) => on[i] = !on[i],
+                            Some(Row::Header(gi)) => collapsed[gi] = !collapsed[gi],
+                            None => {}
+                        },
+                        Widget::Single { sel, collapsed, .. } => match row {
+                            Some(Row::Item(i)) => *sel = Some(i),
+                            Some(Row::Header(gi)) => collapsed[gi] = !collapsed[gi],
+                            None => {}
+                        },
+                        Widget::Toggle { on } => *on = !*on,
+                        Widget::Input { buf, .. } | Widget::Path { buf, .. } => buf.push(' '),
+                    }
+                    clamp_cur(&mut widgets[focus]);
+                }
                 KeyCode::Char(ch) if editing => {
                     if let Widget::Input { buf, .. } | Widget::Path { buf, .. } =
                         &mut widgets[focus]
@@ -611,7 +846,19 @@ impl Reporter for BarReporter {
 
 #[cfg(test)]
 mod tests {
-    use super::{list_dir, vert_nav, Picker};
+    use super::{
+        group_list, group_mark_multi, item_label, list_dir, vert_nav, visible_rows, Picker, Row,
+    };
+    use insmaller_core::Choice;
+
+    fn ch(value: &str, group: Option<&str>) -> Choice {
+        Choice {
+            value: value.into(),
+            label: value.into(),
+            default: false,
+            group: group.map(str::to_string),
+        }
+    }
 
     // 2 fields (n=2): focus 0,1 = fields; 2 = Back; 3 = Next.
     #[test]
@@ -701,5 +948,76 @@ mod tests {
         assert_eq!(q.entries[0].name, "..");
         assert_eq!(q.activate(), None);
         assert_eq!(q.cwd, dir.path());
+    }
+
+    #[test]
+    fn group_list_first_appearance_order_excludes_ungrouped() {
+        let choices = vec![
+            ch("a", None),
+            ch("bun", Some("runtime")),
+            ch("node", Some("runtime")),
+            ch("claude", Some("ai")),
+        ];
+        assert_eq!(group_list(&choices), vec!["runtime".to_string(), "ai".to_string()]);
+    }
+
+    #[test]
+    fn visible_rows_ungrouped_first_then_headers_and_collapse() {
+        let choices = vec![
+            ch("a", None),
+            ch("bun", Some("runtime")),
+            ch("node", Some("runtime")),
+            ch("claude", Some("ai")),
+        ];
+        let groups = group_list(&choices);
+        let rows = visible_rows(&choices, &groups, &[false, false]);
+        assert_eq!(
+            rows,
+            vec![
+                Row::Item(0),
+                Row::Header(0),
+                Row::Item(1),
+                Row::Item(2),
+                Row::Header(1),
+                Row::Item(3),
+            ]
+        );
+        // collapsing "runtime" hides its two items but keeps the header
+        let rows = visible_rows(&choices, &groups, &[true, false]);
+        assert_eq!(
+            rows,
+            vec![Row::Item(0), Row::Header(0), Row::Header(1), Row::Item(3)]
+        );
+    }
+
+    #[test]
+    fn no_groups_renders_flat() {
+        let choices = vec![ch("a", None), ch("b", None)];
+        let groups = group_list(&choices);
+        assert!(groups.is_empty());
+        assert_eq!(
+            visible_rows(&choices, &groups, &[]),
+            vec![Row::Item(0), Row::Item(1)]
+        );
+    }
+
+    #[test]
+    fn group_mark_all_some_none() {
+        let choices = vec![ch("bun", Some("runtime")), ch("node", Some("runtime"))];
+        assert_eq!(group_mark_multi(&choices, &[false, false], "runtime"), "[ ]");
+        assert_eq!(group_mark_multi(&choices, &[true, false], "runtime"), "[~]");
+        assert_eq!(group_mark_multi(&choices, &[true, true], "runtime"), "[x]");
+    }
+
+    #[test]
+    fn item_label_strips_group_prefix() {
+        let c = Choice {
+            value: "bun".into(),
+            label: "[runtime] bun — fast".into(),
+            default: false,
+            group: Some("runtime".into()),
+        };
+        assert_eq!(item_label(&c), "bun — fast");
+        assert_eq!(item_label(&ch("x", None)), "x");
     }
 }

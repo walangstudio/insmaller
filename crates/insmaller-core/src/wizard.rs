@@ -122,6 +122,9 @@ pub struct Choice {
     pub value: String,
     pub label: String,
     pub default: bool,
+    /// Catalog `group`/`category` this option belongs to, if any. Drives the
+    /// collapsible group headers in the TUI; `None` ⇒ rendered ungrouped.
+    pub group: Option<String>,
 }
 
 /// An answer for a field. `Skip` = optional field the user declined.
@@ -330,6 +333,7 @@ pub fn choices_for_vars(
                         (None, Some(d)) => format!("{} — {d}", o.key),
                         (None, None) => o.key.clone(),
                     },
+                    group: o.group.clone(),
                     value: o.key,
                     default: o.default,
                 })
@@ -343,6 +347,7 @@ pub fn choices_for_vars(
             value: v.clone(),
             label: v.clone(),
             default: false,
+            group: None,
         })
         .collect()
 }
