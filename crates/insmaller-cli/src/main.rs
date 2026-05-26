@@ -645,8 +645,10 @@ async fn cmd_task(a: &[String], name: &str) -> ExitCode {
     let mut reg = builtins(&cfg.settings);
     insmaller_core::register_external(&mut reg, &cfg.plugins);
 
-    // Concurrency for the task DAG. Precedence: --jobs N / -j N → --parallel/-p
-    // (unbounded) → `[settings] max_parallel_tasks` (default 1 = sequential).
+    // Concurrency is opt-in per task (`[task].parallel`). `--parallel`/`-p`
+    // forces every task to behave as parallel for this run; `--jobs N`/`-j`
+    // throttles concurrent parallel tasks (overriding max_parallel_tasks).
+    let force_parallel = has(a, "--parallel") || has(a, "-p");
     let max_parallel = match opt_opt(a, "--jobs").or_else(|| opt_opt(a, "-j")) {
         Some(j) => match j.parse::<usize>() {
             Ok(n) => n,
@@ -655,7 +657,6 @@ async fn cmd_task(a: &[String], name: &str) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         },
-        None if has(a, "--parallel") || has(a, "-p") => 0,
         None => cfg.settings.max_parallel_tasks,
     };
 
@@ -667,6 +668,7 @@ async fn cmd_task(a: &[String], name: &str) -> ExitCode {
         &EnvResolver,
         &run_vars,
         max_parallel,
+        force_parallel,
     )
     .await
     {

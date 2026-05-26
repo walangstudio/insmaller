@@ -62,6 +62,12 @@ pub struct TaskDef {
     /// Other tasks to run first (ordered, cycle-guarded).
     #[serde(default)]
     pub needs: Vec<String>,
+    /// Opt in to concurrent execution: a `parallel` task may run alongside
+    /// other `parallel` tasks whose `needs` are met (throttled by
+    /// `settings.max_parallel_tasks`). Default false ⇒ the task runs
+    /// exclusively (nothing else runs while it does).
+    #[serde(default)]
+    pub parallel: bool,
 }
 
 /// Parsed [`TaskDef`]: step tables resolved into `Step`s at load.
@@ -71,6 +77,7 @@ pub struct CompiledTask {
     pub steps: Vec<Step>,
     pub os_steps: BTreeMap<String, Vec<Step>>,
     pub needs: Vec<String>,
+    pub parallel: bool,
 }
 
 /// A `[[plugin]]` declaration. P2 uses `path` (recipe-pack). `command`/`kinds`
@@ -173,15 +180,12 @@ pub struct Settings {
     /// `"setup"`. Absent ⇒ print usage (the historical behavior).
     #[serde(default)]
     pub default_command: Option<String>,
-    /// Max tasks the `task` DAG scheduler runs concurrently. `1` (default) =
-    /// sequential/deterministic; `0` = unbounded; `n` = at most n at once.
-    /// Independent tasks run together; `needs` ordering is always honored.
-    #[serde(default = "default_max_parallel_tasks")]
+    /// Throttle on how many `parallel = true` tasks run at once. `0` (default)
+    /// = unbounded; `n` = at most n concurrently. Concurrency is opt-in per
+    /// task (see `[task].parallel`); this only caps it. `needs` ordering is
+    /// always honored, and non-`parallel` tasks always run exclusively.
+    #[serde(default)]
     pub max_parallel_tasks: usize,
-}
-
-fn default_max_parallel_tasks() -> usize {
-    1
 }
 
 /// Sentinel base resolution. `global` keeps the historical per-user location;
@@ -259,7 +263,7 @@ impl Default for Settings {
             collapsed_groups: vec![],
             expanded_groups: vec![],
             default_command: None,
-            max_parallel_tasks: 1,
+            max_parallel_tasks: 0,
         }
     }
 }
@@ -389,6 +393,7 @@ fn compile_tasks(raw: BTreeMap<String, TaskDef>) -> Result<BTreeMap<String, Comp
                 steps,
                 os_steps,
                 needs: t.needs,
+                parallel: t.parallel,
             },
         );
     }
@@ -688,11 +693,21 @@ mod tests {
     }
 
     #[test]
-    fn max_parallel_tasks_defaults_to_one() {
+    fn max_parallel_tasks_defaults_to_unbounded() {
         let def = LoadedConfig::from_str("").unwrap();
-        assert_eq!(def.settings.max_parallel_tasks, 1);
+        assert_eq!(def.settings.max_parallel_tasks, 0);
         let cfg = LoadedConfig::from_str("[settings]\nmax_parallel_tasks = 4\n").unwrap();
         assert_eq!(cfg.settings.max_parallel_tasks, 4);
+    }
+
+    #[test]
+    fn task_parallel_flag_round_trip() {
+        let cfg = LoadedConfig::from_str(
+            "[task.a]\nparallel = true\n[[task.a.steps]]\ntype = \"shell\"\nscript = \"x\"\n[task.b]\n[[task.b.steps]]\ntype = \"shell\"\nscript = \"y\"\n",
+        )
+        .unwrap();
+        assert!(cfg.tasks["a"].parallel);
+        assert!(!cfg.tasks["b"].parallel, "default is exclusive");
     }
 
     #[test]
