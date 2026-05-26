@@ -53,43 +53,65 @@ struct Entry {
 struct Picker {
     cwd: PathBuf,
     entries: Vec<Entry>,
+    /// false ⇒ `cwd` could not be read (permissions, gone). `entries` then
+    /// holds only `..`; the modal shows the state so the user isn't left
+    /// staring at a silently-empty list.
+    readable: bool,
     cursor: usize,
 }
 
 /// Directory listing for the browser: `..` first (unless at a root), then
-/// directories before files, each group case-insensitively sorted. Unreadable
-/// dirs yield just the `..` entry. Pure given the filesystem — unit-testable
-/// against a tempdir.
-fn list_dir(p: &Path) -> Vec<Entry> {
+/// directories before files, each group case-insensitively sorted. Returns
+/// `(entries, readable)` — `readable` is false when the dir can't be opened, so
+/// callers can distinguish "empty" from "denied". Pure given the filesystem —
+/// unit-testable against a tempdir.
+fn list_dir(p: &Path) -> (Vec<Entry>, bool) {
     let mut entries: Vec<Entry> = Vec::new();
     if p.parent().is_some() {
         entries.push(Entry { name: "..".into(), is_dir: true });
     }
-    if let Ok(rd) = std::fs::read_dir(p) {
-        let mut items: Vec<Entry> = rd
-            .flatten()
-            .map(|d| Entry {
-                name: d.file_name().to_string_lossy().into_owned(),
-                is_dir: d.file_type().map(|t| t.is_dir()).unwrap_or(false),
-            })
-            .collect();
-        items.sort_by(|a, b| {
-            b.is_dir
-                .cmp(&a.is_dir)
-                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        });
-        entries.extend(items);
+    match std::fs::read_dir(p) {
+        Ok(rd) => {
+            let mut items: Vec<Entry> = rd
+                .flatten()
+                .map(|d| Entry {
+                    name: d.file_name().to_string_lossy().into_owned(),
+                    is_dir: d.file_type().map(|t| t.is_dir()).unwrap_or(false),
+                })
+                .collect();
+            items.sort_by(|a, b| {
+                b.is_dir
+                    .cmp(&a.is_dir)
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            });
+            entries.extend(items);
+            (entries, true)
+        }
+        Err(_) => (entries, false),
     }
-    entries
 }
 
 impl Picker {
     /// Seed the browser at `buf`'s directory (or its parent if `buf` names a
     /// file), falling back to the home dir.
     fn open(buf: &str) -> Picker {
-        let cwd = Self::seed_dir(buf);
-        let entries = list_dir(&cwd);
-        Picker { cwd, entries, cursor: 0 }
+        let mut p = Picker {
+            cwd: PathBuf::new(),
+            entries: Vec::new(),
+            readable: true,
+            cursor: 0,
+        };
+        p.set_dir(Self::seed_dir(buf));
+        p
+    }
+
+    /// Move to `dir`: relist, reset the cursor, record readability.
+    fn set_dir(&mut self, dir: PathBuf) {
+        let (entries, readable) = list_dir(&dir);
+        self.cwd = dir;
+        self.entries = entries;
+        self.readable = readable;
+        self.cursor = 0;
     }
 
     fn seed_dir(buf: &str) -> PathBuf {
@@ -119,9 +141,7 @@ impl Picker {
 
     fn ascend(&mut self) {
         if let Some(parent) = self.cwd.parent().map(Path::to_path_buf) {
-            self.cwd = parent;
-            self.entries = list_dir(&self.cwd);
-            self.cursor = 0;
+            self.set_dir(parent);
         }
     }
 
@@ -135,9 +155,7 @@ impl Picker {
         }
         let target = self.cwd.join(&entry.name);
         if entry.is_dir {
-            self.cwd = target;
-            self.entries = list_dir(&self.cwd);
-            self.cursor = 0;
+            self.set_dir(target);
             None
         } else {
             Some(target.to_string_lossy().into_owned())
@@ -376,9 +394,11 @@ pub fn run_wizard_tui(session: &mut WizardSession, pal: Palette) -> anyhow::Resu
                             ListItem::new(name)
                         })
                         .collect();
+                    let state = if p.readable { "" } else { "  [unreadable]" };
                     let title = format!(
-                        " {}  (↑↓ move · ↵ open · ← up · s select dir · Esc cancel) ",
-                        p.cwd.display()
+                        " {}{}  (↑↓ move · ↵ open · ← up · s select dir · Esc cancel) ",
+                        p.cwd.display(),
+                        state
                     );
                     let list = List::new(rows_p)
                         .block(Block::default().borders(Borders::ALL).title(title))
@@ -632,7 +652,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("zdir")).unwrap();
         std::fs::write(dir.path().join("afile.txt"), b"x").unwrap();
-        let entries = list_dir(dir.path());
+        let (entries, readable) = list_dir(dir.path());
+        assert!(readable);
         assert_eq!(entries[0].name, "..");
         assert!(entries[0].is_dir);
         // directory sorts before the file despite "zdir" > "afile"
@@ -640,6 +661,19 @@ mod tests {
         assert!(entries[1].is_dir);
         assert_eq!(entries[2].name, "afile.txt");
         assert!(!entries[2].is_dir);
+    }
+
+    #[test]
+    fn list_dir_reports_unreadable() {
+        // A path that is not a directory cannot be listed → readable=false,
+        // and only the synthetic ".." entry is present.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not_a_dir.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let (entries, readable) = list_dir(&file);
+        assert!(!readable);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "..");
     }
 
     #[test]

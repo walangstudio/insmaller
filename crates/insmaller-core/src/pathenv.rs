@@ -133,7 +133,7 @@ pub async fn run_sh(
     dir: Option<&str>,
 ) -> Result<()> {
     let path = enriched_path(path_globs);
-    let (prog, args) = shell_invocation(script, prefer_bash); // single source of dispatch
+    let (prog, args) = shell_invocation(script, prefer_bash, &path); // single source of dispatch
     let mut cmd = Command::new(prog);
     cmd.args(&args).env("PATH", &path);
     if let Some(d) = dir {
@@ -152,9 +152,16 @@ pub async fn run_sh(
 /// `(program, args)` for running `script` in the platform shell — the single
 /// place the bash↔powershell choice is made (no processor hardcodes a shell).
 /// Unix is always `bash -c`. Windows is `powershell …` unless `prefer_bash` is
-/// set AND a `bash` is on PATH, in which case `bash -c` (for catalogs whose
-/// shell bodies are POSIX, e.g. a Git Bash dependency).
-pub fn shell_invocation(script: &str, prefer_bash: bool) -> (&'static str, Vec<String>) {
+/// set AND a `bash` is discoverable in `path`, in which case `bash -c` (for
+/// catalogs whose shell bodies are POSIX, e.g. a Git Bash dependency). `path`
+/// is the same enriched PATH the caller spawns the shell with, so detection
+/// and execution agree — a `bash` installed only into a `path_globs` dir is
+/// still found.
+pub fn shell_invocation(
+    script: &str,
+    prefer_bash: bool,
+    path: &str,
+) -> (&'static str, Vec<String>) {
     let powershell = || {
         (
             "powershell",
@@ -168,8 +175,7 @@ pub fn shell_invocation(script: &str, prefer_bash: bool) -> (&'static str, Vec<S
     };
     let bash = || ("bash", vec!["-c".into(), script.into()]);
     if cfg!(windows) {
-        if prefer_bash && resolve_in_path("bash", &std::env::var("PATH").unwrap_or_default()).is_some()
-        {
+        if prefer_bash && resolve_in_path("bash", path).is_some() {
             bash()
         } else {
             powershell()
@@ -188,7 +194,7 @@ pub async fn run_capture(
     dir: Option<&str>,
 ) -> Result<std::process::Output> {
     let path = enriched_path(path_globs);
-    let (prog, args) = shell_invocation(script, prefer_bash);
+    let (prog, args) = shell_invocation(script, prefer_bash, &path);
     let mut cmd = Command::new(prog);
     cmd.args(&args).env("PATH", &path);
     if let Some(d) = dir {
@@ -234,8 +240,8 @@ mod tests {
 
     #[test]
     fn shell_invocation_dispatches_per_platform() {
-        // prefer_bash = false: unchanged platform default.
-        let (prog, args) = shell_invocation("echo hi", false);
+        // prefer_bash = false: unchanged platform default, regardless of PATH.
+        let (prog, args) = shell_invocation("echo hi", false, "");
         if cfg!(windows) {
             assert_eq!(prog, "powershell");
             assert_eq!(args.first().map(String::as_str), Some("-NoProfile"));
@@ -247,21 +253,28 @@ mod tests {
     }
 
     #[test]
-    fn shell_invocation_prefers_bash_on_windows_only_when_present() {
-        let (prog, args) = shell_invocation("echo hi", true);
+    fn shell_invocation_prefers_bash_on_windows_using_given_path() {
+        // Detection runs against the PATH passed in (the enriched spawn PATH),
+        // not the process environment. Put a fake `bash` in a tempdir and feed
+        // that dir as PATH.
+        let dir = tempfile::tempdir().unwrap();
+        let bash_name = if cfg!(windows) { "bash.exe" } else { "bash" };
+        std::fs::write(dir.path().join(bash_name), b"#!/bin/sh\n").unwrap();
+        let path = dir.path().to_string_lossy().into_owned();
+
+        let (prog, _) = shell_invocation("echo hi", true, &path);
         if cfg!(windows) {
-            // bash iff discoverable on PATH; otherwise falls back to PowerShell.
-            let bash_present =
-                resolve_in_path("bash", &std::env::var("PATH").unwrap_or_default()).is_some();
-            if bash_present {
-                assert_eq!(prog, "bash");
-                assert_eq!(args, vec!["-c".to_string(), "echo hi".to_string()]);
-            } else {
-                assert_eq!(prog, "powershell");
-            }
+            assert_eq!(prog, "bash", "bash in the given PATH must be detected");
         } else {
-            // prefer_bash is a no-op off Windows.
             assert_eq!(prog, "bash");
+        }
+
+        // Empty PATH on Windows ⇒ no bash found ⇒ PowerShell.
+        let (prog_empty, _) = shell_invocation("echo hi", true, "");
+        if cfg!(windows) {
+            assert_eq!(prog_empty, "powershell");
+        } else {
+            assert_eq!(prog_empty, "bash");
         }
     }
 
