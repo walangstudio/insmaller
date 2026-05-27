@@ -1,4 +1,4 @@
-//! Filesystem install markers. Ported from codetainyrrr sentinel.rs. The dir
+//! Filesystem install markers. Ported from the reference installer's sentinel.rs. The dir
 //! name comes from `[settings].sentinel_dir_name` (no global OnceLock — a
 //! `Sentinel` value carries the base, which also makes it test-injectable).
 

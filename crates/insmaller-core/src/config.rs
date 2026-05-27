@@ -114,7 +114,7 @@ pub struct Settings {
     pub path_globs: Vec<String>,
     // ── opt-in hardening (defaults preserve current behavior) ──────────────
     /// false ⇒ disable the `shell_literal` catch-all entirely (a spec with
-    /// no matching prefix always errors). Default true (codetainyrrr parity).
+    /// no matching prefix always errors). Default true (reference parity).
     #[serde(default = "default_true")]
     pub allow_shell_literal: bool,
     /// If non-empty, `download` may only send an `auth_bearer_env` token to a
@@ -281,7 +281,7 @@ pub struct DesugarRule {
 }
 
 /// Fixed set of remainder parsers. Each variant RELOCATES the corresponding
-/// codetainyrrr handler's parse logic verbatim (the parity guarantee) — it is
+/// reference handler's parse logic verbatim (the parity guarantee) — it is
 /// not a reimplementation. See `desugar.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]

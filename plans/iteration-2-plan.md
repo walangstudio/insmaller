@@ -62,7 +62,7 @@ Step attrs `timeout`/`retries`.
 
 **P4 verify + dry-run + structured Reporter:** per-recipe `verify: Vec<Step>` + `verify`
 phase; orchestrator `dry_run` (no-op+report, never fail on missing optional input); JSON
-event Reporter (powers codetainyrrr catalog-smoke).
+event Reporter (powers the reference installer catalog-smoke).
 
 **P5 WASM + native dynamic (E4):** WASM via `extism` (sandboxed, ABI handled),
 `[[plugin]] wasm= kinds=[..]`, `--features wasm`. Native cdylib via `libloading`,
@@ -166,14 +166,14 @@ fixed (user chose "everything incl. refactors"):
 - Verify: **114 tests, 0 failures**; default + `--features cdylib` build with
   **zero warnings**.
 
-## Compatibility audit (codetainyrrr + sibling projects) — gaps closed
+## Compatibility audit (the reference installer + sibling projects) — gaps closed
 
-2 parallel Explore audits: codetainyrrr 12/13 handlers verbatim/equivalent,
+2 parallel Explore audits: the reference installer 12/13 handlers verbatim/equivalent,
 `json_catalog` deserializes the real catalog.json losslessly, sentinel kinds
 match. The one engine gap (`python:tools`) is **closed**: `python-tools`
 recipe (install+uninstall embedded verbatim in `scripts.rs`, `python:` desugar).
 "CLI-first ordering" / "supported_clis filter" are caller/wizard concerns (the
-strangler adapter keeps codetainyrrr's wizard+entrypoint) — not engine work.
+strangler adapter keeps the reference installer's wizard+entrypoint) — not engine work.
 
 Sibling projects (mememo/magent/chatgipite/CEAuto/pair-pressure): the dominant
 "MCP server → register into ~/.claude.json" pattern works today
@@ -210,7 +210,7 @@ robustness). All actioned:
 
 ## Wizard/pages + progress TUI (W1) — DONE
 
-- Engine: `wizard.rs` — `WizardDef`/`Page`/`Field`, codetainyrrr-parity
+- Engine: `wizard.rs` — `WizardDef`/`Page`/`Field`, the reference installer-parity
   condition eval, pure `run_wizard` + `Answerer`/`StaticAnswerer` (non-blocking,
   InputResolver-keystone parity), and **`WizardSession`** (pure navigable
   state machine: active-page recompute on every move so back-editing re-gates

@@ -12,7 +12,7 @@ nothing else to install.
 
 ## Why this exists
 
-This came out of codetainyrrr, which had a Rust function per installable tool.
+This came out of a reference installer that had a Rust function per installable tool.
 Every new tool, every package manager, every "also symlink this" meant editing
 and recompiling the binary. The install logic and the list of things to install
 were the same code.
@@ -165,10 +165,10 @@ plugin transport is written up but not enabled, because the WASM runtime is not
 in this machine's offline build cache; it is one dependency and one transport
 away when built online.
 
-What is not done is the migration back into codetainyrrr (the M0 to M5 plan):
+What is not done is the migration back into the reference installer (the M0 to M5 plan):
 insmaller currently stands alone and is not yet wired into it.
 
 - [`SECURITY.md`](SECURITY.md) describes the trust model. The config, catalog,
   and recipes are trusted input, equivalent to running `curl ... | bash`.
 - [`plans/`](plans/) has the design and iteration notes, including where each
-  piece was lifted from in codetainyrrr.
+  piece was lifted from in the reference installer.

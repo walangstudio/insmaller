@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 /// Engine-level typed errors. Processors and the orchestrator use `anyhow`
-/// internally (mirrors the codetainyrrr convention); this enum is for the
+/// internally (mirrors the reference installer's convention); this enum is for the
 /// boundaries where callers need to branch on the failure kind.
 #[derive(Debug, Error)]
 pub enum EngineError {

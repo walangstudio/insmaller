@@ -5,7 +5,7 @@
 //! catalog keys to install + a vars map (seeded into the env so the engine's
 //! `prompt`/`save_input`/`EnvResolver` pick them up).
 //!
-//! Condition syntax mirrors codetainyrrr wizard.json:
+//! Condition syntax mirrors the reference installer wizard.json:
 //!   `${VAR} == 'lit'` · `${VAR} != 'lit'` · `${VAR} in 'a,b,c'` ·
 //!   `'item' in ${VAR}` (CSV membership; a multiselect joins with ',').
 
@@ -228,7 +228,7 @@ fn version_cmp(a: &str, b: &str) -> Option<std::cmp::Ordering> {
     Some(std::cmp::Ordering::Equal)
 }
 
-/// Evaluate a condition against collected vars. Mirrors codetainyrrr, plus
+/// Evaluate a condition against collected vars. Mirrors the reference installer, plus
 /// version-compare operators (`>= <= > <`, and semver-aware `== !=`) — the
 /// single expression grammar reused by entries, item conditions, and pages.
 pub fn eval_condition(expr: &str, vars: &Map<String, Value>) -> bool {

@@ -12,7 +12,7 @@ those sources.
 > (`EntrySource`), or a `[[plugin]]`, do not run them. No engine setting makes
 > an untrusted recipe safe.
 
-This matches the origin project (codetainyrrr) where handlers were verbatim
+This matches the origin/reference project where handlers were verbatim
 `curl|bash`/`npm`/`git` shells. The engine does not weaken that model; it also
 does not pretend to sandbox it.
 
@@ -24,7 +24,7 @@ These are intentional and equivalent to operator-supplied shell. They are
 - **`shell` recipe / `shell_literal`** — runs a script via `bash -c`
   (unix) / `powershell -Command` (windows). Template (`{{ }}`) values are
   interpolated before execution. Catalog values flow into shell here.
-- **`exec` `argline`** — whitespace-split into argv (mirrors codetainyrrr
+- **`exec` `argline`** — whitespace-split into argv (mirrors the reference installer
   `npm` handler). Use the `args` array form when a value may contain spaces
   or when the program is itself an interpreter.
 - **`post_install`** — raw shell commands, run once via the platform shell.

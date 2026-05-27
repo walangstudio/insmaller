@@ -150,7 +150,7 @@ impl Processor for ShellProcessor {
 pub struct ExecProcessor(Globs);
 
 /// Build (program, args) from `program` + either `args` (array) or `argline`
-/// (string, whitespace-split — mirrors codetainyrrr npm.rs split_whitespace).
+/// (string, whitespace-split — mirrors the reference installer npm.rs split_whitespace).
 fn build_exec(step: &Step, ctx: &Ctx) -> Result<(String, Vec<String>)> {
     let program = ctx.render(
         step.param_str("program")
@@ -200,7 +200,7 @@ impl Processor for ExecProcessor {
 
 pub struct MergeJsonProcessor(Globs);
 
-/// Verbatim from codetainyrrr merge_json.rs::merge_json.
+/// Verbatim from the reference installer's merge_json.rs::merge_json.
 fn deep_merge(base: &mut serde_json::Value, overlay: serde_json::Value) {
     if let (Some(base_obj), Some(over_obj)) = (base.as_object_mut(), overlay.as_object()) {
         for (k, v) in over_obj {

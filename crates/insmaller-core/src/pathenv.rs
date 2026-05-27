@@ -1,4 +1,4 @@
-//! PATH + home-expansion helpers. Ported from codetainyrrr handlers/mod.rs
+//! PATH + home-expansion helpers. Ported from reference-installer handlers/mod.rs
 //! verbatim, except `enriched_path` is driven by `settings.path_globs`
 //! instead of a hardcoded list (the only intended generalization).
 
@@ -291,7 +291,7 @@ mod tests {
     }
 
     // The colon-separated PATH scan is POSIX (the engine runs in a Linux
-    // container, verbatim from codetainyrrr). A Windows tempdir path carries a
+    // container, verbatim from the reference installer). A Windows tempdir path carries a
     // `C:` drive colon that would mis-split, so scope this to unix.
     #[cfg(unix)]
     #[test]
