@@ -62,6 +62,19 @@ pub struct TaskDef {
     /// Other tasks to run first (ordered, cycle-guarded).
     #[serde(default)]
     pub needs: Vec<String>,
+    /// Opt in to concurrent execution: a `parallel` task may run alongside
+    /// other `parallel` tasks whose `needs` are met (throttled by
+    /// `settings.max_parallel_tasks`). Default false ⇒ the task runs
+    /// exclusively (nothing else runs while it does).
+    #[serde(default)]
+    pub parallel: bool,
+    /// Run only if this predicate holds (same grammar as step `when`). A gated
+    /// task is skipped — treated as satisfied so its dependents still run.
+    #[serde(default)]
+    pub when: Option<String>,
+    /// Skip if this predicate holds (inverse of `when`).
+    #[serde(default)]
+    pub unless: Option<String>,
 }
 
 /// Parsed [`TaskDef`]: step tables resolved into `Step`s at load.
@@ -71,6 +84,9 @@ pub struct CompiledTask {
     pub steps: Vec<Step>,
     pub os_steps: BTreeMap<String, Vec<Step>>,
     pub needs: Vec<String>,
+    pub parallel: bool,
+    pub when: Option<String>,
+    pub unless: Option<String>,
 }
 
 /// A `[[plugin]]` declaration. P2 uses `path` (recipe-pack). `command`/`kinds`
@@ -107,7 +123,7 @@ pub struct Settings {
     pub path_globs: Vec<String>,
     // ── opt-in hardening (defaults preserve current behavior) ──────────────
     /// false ⇒ disable the `shell_literal` catch-all entirely (a spec with
-    /// no matching prefix always errors). Default true (codetainyrrr parity).
+    /// no matching prefix always errors). Default true (reference parity).
     #[serde(default = "default_true")]
     pub allow_shell_literal: bool,
     /// If non-empty, `download` may only send an `auth_bearer_env` token to a
@@ -147,6 +163,38 @@ pub struct Settings {
     /// `sentinel_scope`. Absent ⇒ scope decides.
     #[serde(default)]
     pub sentinel_path: Option<String>,
+    /// true ⇒ `setup` stops after writing `setup_output` + outro and runs no
+    /// host install phase. For consumers whose catalog scripts run in a
+    /// container/target, not on the machine that ran `setup`.
+    #[serde(default)]
+    pub setup_writes_config_only: bool,
+    /// Windows only: when a `bash` is discoverable on PATH, run shell steps
+    /// through it instead of PowerShell. Off by default to preserve the
+    /// "Windows recipes are PowerShell" contract; opt in when your catalog's
+    /// shell bodies are POSIX (e.g. a Git Bash dependency).
+    #[serde(default)]
+    pub prefer_bash_on_windows: bool,
+    /// TUI: whether catalog group headers start collapsed. Default false
+    /// (expanded). `expanded_groups`/`collapsed_groups` override per group.
+    #[serde(default)]
+    pub start_groups_collapsed: bool,
+    /// Group names that always start collapsed (overrides the baseline).
+    #[serde(default)]
+    pub collapsed_groups: Vec<String>,
+    /// Group names that always start expanded (overrides the baseline; wins
+    /// over `collapsed_groups`).
+    #[serde(default)]
+    pub expanded_groups: Vec<String>,
+    /// Command run when the binary is invoked with no arguments, e.g.
+    /// `"setup"`. Absent ⇒ print usage (the historical behavior).
+    #[serde(default)]
+    pub default_command: Option<String>,
+    /// Throttle on how many `parallel = true` tasks run at once. `0` (default)
+    /// = unbounded; `n` = at most n concurrently. Concurrency is opt-in per
+    /// task (see `[task].parallel`); this only caps it. `needs` ordering is
+    /// always honored, and non-`parallel` tasks always run exclusively.
+    #[serde(default)]
+    pub max_parallel_tasks: usize,
 }
 
 /// Sentinel base resolution. `global` keeps the historical per-user location;
@@ -218,6 +266,13 @@ impl Default for Settings {
             setup_output: None,
             sentinel_scope: SentinelScope::default(),
             sentinel_path: None,
+            setup_writes_config_only: false,
+            prefer_bash_on_windows: false,
+            start_groups_collapsed: false,
+            collapsed_groups: vec![],
+            expanded_groups: vec![],
+            default_command: None,
+            max_parallel_tasks: 0,
         }
     }
 }
@@ -235,7 +290,7 @@ pub struct DesugarRule {
 }
 
 /// Fixed set of remainder parsers. Each variant RELOCATES the corresponding
-/// codetainyrrr handler's parse logic verbatim (the parity guarantee) — it is
+/// reference handler's parse logic verbatim (the parity guarantee) — it is
 /// not a reimplementation. See `desugar.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -347,6 +402,9 @@ fn compile_tasks(raw: BTreeMap<String, TaskDef>) -> Result<BTreeMap<String, Comp
                 steps,
                 os_steps,
                 needs: t.needs,
+                parallel: t.parallel,
+                when: t.when,
+                unless: t.unless,
             },
         );
     }
@@ -629,6 +687,47 @@ mod tests {
     fn setup_output_defaults_to_none() {
         let cfg = LoadedConfig::from_str("").unwrap();
         assert!(cfg.settings.setup_output.is_none());
+    }
+
+    #[test]
+    fn setup_writes_config_only_round_trip() {
+        let def = LoadedConfig::from_str("").unwrap();
+        assert!(!def.settings.setup_writes_config_only);
+        let cfg = LoadedConfig::from_str(
+            r#"
+            [settings]
+            setup_writes_config_only = true
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.settings.setup_writes_config_only);
+    }
+
+    #[test]
+    fn max_parallel_tasks_defaults_to_unbounded() {
+        let def = LoadedConfig::from_str("").unwrap();
+        assert_eq!(def.settings.max_parallel_tasks, 0);
+        let cfg = LoadedConfig::from_str("[settings]\nmax_parallel_tasks = 4\n").unwrap();
+        assert_eq!(cfg.settings.max_parallel_tasks, 4);
+    }
+
+    #[test]
+    fn task_parallel_flag_round_trip() {
+        let cfg = LoadedConfig::from_str(
+            "[task.a]\nparallel = true\n[[task.a.steps]]\ntype = \"shell\"\nscript = \"x\"\n[task.b]\n[[task.b.steps]]\ntype = \"shell\"\nscript = \"y\"\n",
+        )
+        .unwrap();
+        assert!(cfg.tasks["a"].parallel);
+        assert!(!cfg.tasks["b"].parallel, "default is exclusive");
+    }
+
+    #[test]
+    fn prefer_bash_on_windows_round_trip() {
+        let def = LoadedConfig::from_str("").unwrap();
+        assert!(!def.settings.prefer_bash_on_windows);
+        let cfg =
+            LoadedConfig::from_str("[settings]\nprefer_bash_on_windows = true\n").unwrap();
+        assert!(cfg.settings.prefer_bash_on_windows);
     }
 
     #[test]

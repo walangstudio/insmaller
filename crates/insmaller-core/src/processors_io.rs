@@ -14,9 +14,7 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
-type Globs = Arc<Vec<String>>;
-
-pub fn register(r: &mut ProcessorRegistry, _g: Globs, settings: &crate::config::Settings) {
+pub fn register(r: &mut ProcessorRegistry, settings: &crate::config::Settings) {
     r.register(Arc::new(PromptProcessor));
     r.register(Arc::new(SaveInputProcessor));
     r.register(Arc::new(DownloadProcessor {
@@ -41,8 +39,13 @@ pub(crate) fn atomic_write(path: &Path, content: &[u8], mode: Option<u32>) -> Re
             std::fs::create_dir_all(parent)?;
         }
     }
+    // Per-writer temp name (pid + a process-local counter) so two insmaller
+    // instances writing the same target never clobber each other's temp file
+    // mid-rename.
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
+    tmp.push(format!(".{}.{}.tmp", std::process::id(), seq));
     let tmp = std::path::PathBuf::from(tmp);
     let write_then_rename = || -> Result<()> {
         std::fs::write(&tmp, content)?;

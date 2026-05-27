@@ -1,6 +1,6 @@
 # insmaller engine config. Processors are built-in code; this file declares
 # settings, the default lifecycle, the desugar table (terse spec -> recipe),
-# and the recipes. Recipes reproduce each codetainyrrr handler VERBATIM so the
+# and the recipes. Recipes reproduce each the reference installer handler VERBATIM so the
 # existing e2e suite stays the regression oracle.
 #
 # expand_home note: params named `dest` / `target` are home-expanded by the
@@ -15,7 +15,7 @@
 # go_lang.rs scripts.
 
 [settings]
-sentinel_dir_name = "codetainyrrr"
+sentinel_dir_name = "insmaller"
 # Replaces the hardcoded enriched_path() list (handlers/mod.rs). Globs are
 # expanded fresh on every PATH resolve so nvm-then-npm works with no PATH step.
 path_globs = [
@@ -37,7 +37,7 @@ path_globs = [
 
 # ── desugar: terse spec prefix -> recipe + remainder parser ────────────────
 # Order is priority. shell_literal is the catch-all (matched only when no
-# prefix rule fits), mirroring codetainyrrr registry's curl|bash path.
+# prefix rule fits), mirroring the reference installer's registry's curl|bash path.
 
 [[desugar]]
 prefix = "npm:"

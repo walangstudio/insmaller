@@ -24,6 +24,9 @@ chrono.workspace = true
 dirs.workspace = true
 glob.workspace = true
 walkdir.workspace = true
+regex = "1"
+# Bounded-concurrency task scheduler (join_all over the needs DAG).
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 
 # P1 processors: download (http+hash) + extract (archive formats).
 # ureq (sync, rustls, no wasm subtree) — avoids reqwest's js-sys/web-sys

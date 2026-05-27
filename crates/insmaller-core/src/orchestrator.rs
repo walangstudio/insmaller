@@ -1,5 +1,5 @@
 //! Dependency resolution + sentinel idempotency + pipeline execution. Ported
-//! from codetainyrrr orchestrator.rs, step-based. Dep-resolve and sentinels
+//! from the reference installer's orchestrator.rs, step-based. Dep-resolve and sentinels
 //! are infrastructure WRAPPING the pipeline — not steps.
 
 use crate::config::LoadedConfig;
@@ -18,14 +18,14 @@ use std::collections::HashSet;
 /// is the seam the host implements (the JSON `Catalog` adapter is B5).
 #[derive(Debug, Clone)]
 pub struct EntryRef {
-    /// Sentinel namespace (codetainyrrr used "cli"/"tools"/"plugins").
+    /// Sentinel namespace (the reference installer used "cli"/"tools"/"plugins").
     pub kind: String,
     /// Terse spec to desugar, OR `None` for inline `steps` / a meta entry.
     pub spec: Option<String>,
     /// Inline steps (bypass desugar). Mutually exclusive with a recipe spec.
     pub steps: Option<Vec<Step>>,
     pub deps: Vec<String>,
-    /// Verbatim codetainyrrr behavior: bash commands run once per install.
+    /// Verbatim reference-installer behavior: bash commands run once per install.
     pub post_install: Vec<String>,
     /// Availability / install guard. Evaluated against the run's vars; false
     /// ⇒ the entry is skipped (reported, not failed).
@@ -201,7 +201,7 @@ async fn run_steps(
 
 /// Run options. `dry_run` previews (no spawn, no sentinel, no fail on missing
 /// optional input). Added as a struct so `install_many`'s signature stays
-/// stable for existing callers (the strangler/codetainyrrr contract).
+/// stable for existing callers (the strangler/host-integration contract).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RunOpts {
     pub dry_run: bool,
@@ -224,7 +224,7 @@ struct DepState {
 /// install/uninstall recursion. Bundled so adding a cross-cutting concern
 /// later is one field, not five signature edits. Public entry points
 /// (`install_many*`, `uninstall_many*`) keep their flat signatures — that is
-/// the stable codetainyrrr-integration contract.
+/// the stable host-integration contract.
 struct EngineCtx<'a> {
     src: &'a dyn EntrySource,
     cfg: &'a LoadedConfig,
@@ -325,10 +325,10 @@ async fn install_body(
     }
 
     // post_install: once per install, gated by the `.post` sentinel
-    // (verbatim codetainyrrr semantics, run via bash with enriched PATH).
+    // (verbatim reference-installer semantics, run via bash with enriched PATH).
     if !e.post_install.is_empty() && !sent.post_install_done(&e.kind, key) {
         for cmd in &e.post_install {
-            run_sh(cmd, &cfg.settings.path_globs, None)
+            run_sh(cmd, &cfg.settings.path_globs, cfg.settings.prefer_bash_on_windows, None)
                 .await
                 .map_err(|err| {
                     EngineError::PostInstall {
@@ -346,7 +346,7 @@ async fn install_body(
 }
 
 /// Install a list of keys, resolving deps. Top-level errors are collected, not
-/// propagated — siblings keep going (verbatim codetainyrrr `install_many`).
+/// propagated — siblings keep going (verbatim reference-installer `install_many`).
 /// Signature kept stable for existing callers; use `install_many_with` for
 /// dry-run.
 #[allow(clippy::too_many_arguments)]
@@ -362,6 +362,17 @@ pub async fn install_many(
     install_many_with(src, cfg, reg, rep, inp, sent, keys, RunOpts::default(), None).await
 }
 
+/// Acquire the sentinel's cross-process lock without blocking an async worker:
+/// the wait (a blocking syscall) runs on the blocking pool. `None` ⇒ locking
+/// unavailable; the caller proceeds unlocked.
+async fn acquire_lock(sent: &Sentinel) -> Option<crate::sentinel::LockGuard> {
+    let s = sent.clone();
+    tokio::task::spawn_blocking(move || s.lock())
+        .await
+        .ok()
+        .flatten()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn install_many_with(
     src: &dyn EntrySource,
@@ -374,6 +385,10 @@ pub async fn install_many_with(
     opts: RunOpts,
     run_vars: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> InstallSummary {
+    // Serialize mutating runs across processes (dry-run reads/installs nothing).
+    // The wait is a blocking syscall, so acquire it on the blocking pool rather
+    // than parking an async worker.
+    let _lock = if opts.dry_run { None } else { acquire_lock(sent).await };
     let empty = serde_json::Map::new();
     let ec = EngineCtx {
         src,
@@ -420,14 +435,14 @@ async fn uninstall_one(ec: &EngineCtx<'_>, key: &str, opts: RunOpts) -> Result<(
         }
     }
     // Clear both markers so a later reinstall re-fires install + post_install
-    // (verbatim codetainyrrr registry::uninstall semantics).
+    // (verbatim reference-installer registry::uninstall semantics).
     sent.remove(&e.kind, key)?;
     sent.remove_post(&e.kind, key)?;
     Ok(())
 }
 
 /// Uninstall a list of keys. Non-recursive by design: removing X must not
-/// remove its dependencies (others may need them) — mirrors codetainyrrr.
+/// remove its dependencies (others may need them) — mirrors the reference installer.
 /// Errors are collected per key, like `install_many`.
 #[allow(clippy::too_many_arguments)]
 pub async fn uninstall_many(
@@ -453,6 +468,7 @@ pub async fn uninstall_many_with(
     keys: &[String],
     opts: RunOpts,
 ) -> InstallSummary {
+    let _lock = if opts.dry_run { None } else { acquire_lock(sent).await };
     let empty = serde_json::Map::new();
     let ec = EngineCtx {
         src,

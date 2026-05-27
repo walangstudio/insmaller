@@ -1,4 +1,4 @@
-//! Terse-spec → recipe + params. Each parser RELOCATES the codetainyrrr
+//! Terse-spec → recipe + params. Each parser RELOCATES the reference installer's
 //! handler's parse logic verbatim (parity guarantee). Source handlers:
 //! npm.rs, uv.rs, git_clone.rs, github_release.rs, nvm.rs, marketplace.rs,
 //! merge_json.rs. Behavior — including bail conditions — is identical.
@@ -33,7 +33,7 @@ pub fn desugar(spec: &str, cfg: &LoadedConfig) -> Result<Desugared> {
         }
     }
     // shell_literal is the catch-all ONLY for genuine shell pipelines
-    // (codetainyrrr registry's real condition). A typo'd/unknown spec must
+    // (the reference installer registry's real condition). A typo'd/unknown spec must
     // error loudly, not silently execute as a shell script.
     if cfg.settings.allow_shell_literal && looks_like_shell(spec) {
         if let Some(rule) = cfg.desugar.iter().find(|r| r.parse == ParseKind::ShellLiteral) {
@@ -46,7 +46,7 @@ pub fn desugar(spec: &str, cfg: &LoadedConfig) -> Result<Desugared> {
     Err(EngineError::NoDesugar(spec.to_string()))
 }
 
-/// Mirrors codetainyrrr registry: a raw shell spec starts with a fetcher or
+/// Mirrors the reference installer registry: a raw shell spec starts with a fetcher or
 /// pipes into a shell. Anything else with no prefix rule is a config error.
 fn looks_like_shell(spec: &str) -> bool {
     let s = spec.trim_start();
@@ -186,7 +186,7 @@ mod tests {
         m.get(k).unwrap().as_str().unwrap()
     }
 
-    // ── ported from codetainyrrr uv.rs::tests ──────────────────────────────
+    // ── ported from the reference installer's uv.rs::tests ──────────────────────────────
     #[test]
     fn uv_plain_package() {
         let m = pmap(ParseKind::UvSpec, "uv:", "uv:aider-chat");
@@ -220,7 +220,7 @@ mod tests {
         assert_eq!(g(&m, "from"), "https://example.com/foo.tar.gz");
     }
 
-    // ── ported from codetainyrrr git_clone.rs::tests ───────────────────────
+    // ── ported from the reference installer's git_clone.rs::tests ───────────────────────
     #[test]
     fn git_https_url_with_colon_splits_at_last_colon() {
         let m = pmap(

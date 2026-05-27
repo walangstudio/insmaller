@@ -1,5 +1,5 @@
-//! Reference `EntrySource` over a codetainyrrr-shaped catalog.json. The host
-//! adapter (only codetainyrrr-coupled glue). Ships so the engine is usable
+//! Reference `EntrySource` over a host-shaped catalog.json. The host
+//! adapter (only host-coupled glue). Ships so the engine is usable
 //! out of the box and the strangler integration has a drop-in.
 //!
 //! An entry installs via EITHER a terse `install` spec (desugared) OR an

@@ -64,7 +64,7 @@ fn find_config(start: &Path, names: &[&str], exists: impl Fn(&Path) -> bool) -> 
 
 /// Program name derived from argv0 — `Path::file_stem` strips `.exe`; falls
 /// back to `"insmaller"` when argv0 is missing/unreadable. Lets a rebranded
-/// copy (binary renamed to `codetainyrrr`) report and discover under its own
+/// copy (binary renamed to `mytool`) report and discover under its own
 /// name without recompilation.
 fn program_name_from(argv0: Option<&str>) -> String {
     argv0
@@ -266,12 +266,37 @@ async fn main() -> ExitCode {
             println!("{name} {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        Some("-h") | Some("--help") | Some("help") | None => {
-            eprintln!("{}", usage_text(&name));
-            if args.is_empty() { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+        Some("-h") | Some("--help") | Some("help") => {
+            println!("{}", usage_text(&name));
+            ExitCode::SUCCESS
         }
+        // No args: run `[settings] default_command` if configured, else usage.
+        None => run_default_command(&name).await,
         // insmaller is an installer: anything else is treated as install keys.
         _ => cmd_op(&args, Op::Install, &name).await,
+    }
+}
+
+/// No-arg behavior: dispatch to `[settings] default_command` if the discovered
+/// config sets one; otherwise print usage and fail (the historical behavior).
+async fn run_default_command(name: &str) -> ExitCode {
+    let cfg_p = discover_config(None, name);
+    let default = LoadedConfig::from_path(Path::new(&cfg_p))
+        .ok()
+        .and_then(|c| c.settings.default_command.clone());
+    match default.as_deref() {
+        Some("setup") => cmd_setup(&[], name).await,
+        Some("install") => cmd_op(&[], Op::Install, name).await,
+        Some("status") | Some("query") => cmd_status(&[], name).await,
+        Some(other) => {
+            eprintln!("config error: unknown default_command '{other}'");
+            eprintln!("{}", usage_text(name));
+            ExitCode::FAILURE
+        }
+        None => {
+            eprintln!("{}", usage_text(name));
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -358,8 +383,8 @@ fn collect_keys(a: &[String]) -> Vec<String> {
     let mut i = 0;
     while i < a.len() {
         match a[i].as_str() {
-            "--config" | "--catalog" => i += 2,
-            "--dry-run" | "--json" | "--force" => i += 1,
+            "--config" | "--catalog" | "--jobs" | "-j" => i += 2,
+            "--dry-run" | "--json" | "--force" | "--parallel" | "-p" => i += 1,
             k => {
                 keys.push(k.to_string());
                 i += 1;
@@ -463,7 +488,12 @@ async fn cmd_setup(a: &[String], name: &str) -> ExitCode {
         }
     } else {
         let mut session = WizardSession::new(&wiz, &cat, group_order.clone());
-        match tui::run_wizard_tui(&mut session, palette) {
+        let gd = tui::GroupDefaults {
+            collapsed_default: cfg.settings.start_groups_collapsed,
+            collapsed: cfg.settings.collapsed_groups.clone(),
+            expanded: cfg.settings.expanded_groups.clone(),
+        };
+        match tui::run_wizard_tui(&mut session, palette, &gd) {
             Ok(true) => (session.finish(), true),
             Ok(false) => {
                 println!("Setup cancelled.");
@@ -518,6 +548,12 @@ async fn cmd_setup(a: &[String], name: &str) -> ExitCode {
     println!("Selected: {:?}", outcome.selected_keys);
     if outcome.selected_keys.is_empty() {
         println!("Nothing selected.");
+        render_outro();
+        return ExitCode::SUCCESS;
+    }
+    // config-only consumers (install runs in their container/target): stop after
+    // setup_output + outro, run zero host install scripts.
+    if cfg.settings.setup_writes_config_only {
         render_outro();
         return ExitCode::SUCCESS;
     }
@@ -608,16 +644,44 @@ async fn cmd_task(a: &[String], name: &str) -> ExitCode {
     inject_exe_vars(&mut run_vars, std::env::current_exe().ok());
     let mut reg = builtins(&cfg.settings);
     insmaller_core::register_external(&mut reg, &cfg.plugins);
-    for name in &names {
-        if let Err(e) =
-            insmaller_core::run_task(name, &cfg, &reg, &StdoutReporter, &EnvResolver, &run_vars)
-                .await
-        {
-            eprintln!("task '{name}' failed: {e:#}");
-            return ExitCode::FAILURE;
+
+    // Concurrency is opt-in per task (`[task].parallel`). `--parallel`/`-p`
+    // forces every task to behave as parallel for this run; `--jobs N`/`-j`
+    // throttles concurrent parallel tasks (overriding max_parallel_tasks).
+    let force_parallel = has(a, "--parallel") || has(a, "-p");
+    let max_parallel = match opt_opt(a, "--jobs").or_else(|| opt_opt(a, "-j")) {
+        Some(j) => match j.parse::<usize>() {
+            Ok(0) => {
+                eprintln!("--jobs must be >= 1 (use 1 for sequential; omit it for the configured default)");
+                return ExitCode::FAILURE;
+            }
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!("--jobs expects a number, got '{j}'");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => cfg.settings.max_parallel_tasks,
+    };
+
+    match insmaller_core::run_tasks(
+        &names,
+        &cfg,
+        &reg,
+        &StdoutReporter,
+        &EnvResolver,
+        &run_vars,
+        max_parallel,
+        force_parallel,
+    )
+    .await
+    {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("task failed: {e:#}");
+            ExitCode::FAILURE
         }
     }
-    ExitCode::SUCCESS
 }
 
 /// `insmaller status [<key>]` — read-only listing of what the scope-aware
@@ -758,11 +822,11 @@ mod tests {
 
     #[test]
     fn program_name_strips_exe_and_dir() {
-        assert_eq!(program_name_from(Some("/usr/local/bin/codetainyrrr")), "codetainyrrr");
+        assert_eq!(program_name_from(Some("/usr/local/bin/mytool")), "mytool");
         // `\` is only a path separator on Windows; on Unix the whole string is
         // one component, so file_stem can't strip the dir/`.exe` here.
         #[cfg(windows)]
-        assert_eq!(program_name_from(Some(r"C:\bin\codetainyrrr.exe")), "codetainyrrr");
+        assert_eq!(program_name_from(Some(r"C:\bin\mytool.exe")), "mytool");
         assert_eq!(program_name_from(Some("insmaller")), "insmaller");
     }
 
@@ -774,7 +838,7 @@ mod tests {
 
     #[test]
     fn explicit_config_flag_wins_over_everything() {
-        let app_home = vec![PathBuf::from("/home/u/.codetainyrrr/installer.toml")];
+        let app_home = vec![PathBuf::from("/home/u/.mytool/installer.toml")];
         let got = discover_config_in(
             Some("/tmp/explicit.toml".into()),
             Path::new("/cwd"),
@@ -787,21 +851,21 @@ mod tests {
 
     #[test]
     fn app_home_discovered_when_only_app_home_present() {
-        // argv0=codetainyrrr, only ~/.codetainyrrr/installer.toml on disk → discovered.
-        let app_home = vec![PathBuf::from("/home/u/.codetainyrrr/installer.toml")];
+        // argv0=mytool, only ~/.mytool/installer.toml on disk → discovered.
+        let app_home = vec![PathBuf::from("/home/u/.mytool/installer.toml")];
         let got = discover_config_in(
             None,
             Path::new("/some/cwd"),
             &[],
             &app_home,
-            |p| p == Path::new("/home/u/.codetainyrrr/installer.toml"),
+            |p| p == Path::new("/home/u/.mytool/installer.toml"),
         );
-        assert_eq!(got, "/home/u/.codetainyrrr/installer.toml");
+        assert_eq!(got, "/home/u/.mytool/installer.toml");
     }
 
     #[test]
     fn cwd_wins_over_app_home_when_both_present() {
-        let app_home = vec![PathBuf::from("/home/u/.codetainyrrr/installer.toml")];
+        let app_home = vec![PathBuf::from("/home/u/.mytool/installer.toml")];
         let cwd_cfg = PathBuf::from("/proj/installer.toml");
         let present = vec![cwd_cfg.clone(), app_home[0].clone()];
         let got = discover_config_in(
@@ -826,13 +890,13 @@ mod tests {
 
     #[test]
     fn exe_sibling_discovered_from_unrelated_cwd() {
-        // bin at /b/codetainyrrr + /b/installer.toml, cwd=/elsewhere, no --config.
+        // bin at /b/mytool + /b/installer.toml, cwd=/elsewhere, no --config.
         let exe_sibling = vec![PathBuf::from("/b/installer.toml")];
         let got = discover_config_in(
             None,
             Path::new("/elsewhere"),
             &exe_sibling,
-            &[PathBuf::from("/home/u/.codetainyrrr/installer.toml")],
+            &[PathBuf::from("/home/u/.mytool/installer.toml")],
             |p| p == Path::new("/b/installer.toml"),
         );
         assert_eq!(got, "/b/installer.toml");
@@ -858,7 +922,7 @@ mod tests {
     #[test]
     fn exe_sibling_wins_over_app_home_when_both_present() {
         let exe_sibling = vec![PathBuf::from("/b/installer.toml")];
-        let app_home = vec![PathBuf::from("/home/u/.codetainyrrr/installer.toml")];
+        let app_home = vec![PathBuf::from("/home/u/.mytool/installer.toml")];
         let present = [exe_sibling[0].clone(), app_home[0].clone()];
         let got = discover_config_in(
             None,
@@ -888,8 +952,8 @@ mod tests {
     #[test]
     fn inject_exe_vars_sets_self_exe_and_exe_dir() {
         let mut rv: Map<String, Value> = Map::new();
-        inject_exe_vars(&mut rv, Some(PathBuf::from("/b/codetainyrrr")));
-        assert_eq!(rv.get("self_exe").and_then(Value::as_str), Some("/b/codetainyrrr"));
+        inject_exe_vars(&mut rv, Some(PathBuf::from("/b/mytool")));
+        assert_eq!(rv.get("self_exe").and_then(Value::as_str), Some("/b/mytool"));
         assert_eq!(rv.get("exe_dir").and_then(Value::as_str), Some("/b"));
     }
 
@@ -899,7 +963,7 @@ mod tests {
         let mut rv: Map<String, Value> = Map::new();
         rv.insert("self_exe".into(), Value::String("/override/bin".into()));
         rv.insert("exe_dir".into(), Value::String("/override".into()));
-        inject_exe_vars(&mut rv, Some(PathBuf::from("/b/codetainyrrr")));
+        inject_exe_vars(&mut rv, Some(PathBuf::from("/b/mytool")));
         assert_eq!(rv.get("self_exe").and_then(Value::as_str), Some("/override/bin"));
         assert_eq!(rv.get("exe_dir").and_then(Value::as_str), Some("/override"));
     }
@@ -923,10 +987,10 @@ mod tests {
 
     #[test]
     fn usage_string_uses_derived_program_name() {
-        let u = usage_text("codetainyrrr");
-        assert!(u.contains("codetainyrrr <key…>"));
-        assert!(u.contains("codetainyrrr install"));
-        assert!(u.contains("codetainyrrr task"));
+        let u = usage_text("mytool");
+        assert!(u.contains("mytool <key…>"));
+        assert!(u.contains("mytool install"));
+        assert!(u.contains("mytool task"));
         // Default name still works for direct usage.
         assert!(usage_text("insmaller").contains("insmaller install"));
     }
@@ -935,52 +999,52 @@ mod tests {
     fn posix_app_home_xdg_when_set() {
         // POSIX: $XDG_CONFIG_HOME/<name>/installer.toml comes first.
         let cands = app_home_candidates_posix(
-            "codetainyrrr",
+            "mytool",
             Some("/tmp/xdg"),
             Some(Path::new("/home/u/.config")),
             Some(Path::new("/home/u")),
         );
-        assert_eq!(cands[0], PathBuf::from("/tmp/xdg/codetainyrrr/installer.toml"));
-        assert_eq!(cands[1], PathBuf::from("/home/u/.codetainyrrr/installer.toml"));
-        assert_eq!(cands[2], PathBuf::from("/etc/codetainyrrr/installer.toml"));
+        assert_eq!(cands[0], PathBuf::from("/tmp/xdg/mytool/installer.toml"));
+        assert_eq!(cands[1], PathBuf::from("/home/u/.mytool/installer.toml"));
+        assert_eq!(cands[2], PathBuf::from("/etc/mytool/installer.toml"));
     }
 
     #[test]
     fn posix_app_home_config_dir_fallback_when_xdg_unset() {
         let cands = app_home_candidates_posix(
-            "codetainyrrr",
+            "mytool",
             None,
             Some(Path::new("/home/u/.config")),
             Some(Path::new("/home/u")),
         );
         assert_eq!(
             cands[0],
-            PathBuf::from("/home/u/.config/codetainyrrr/installer.toml")
+            PathBuf::from("/home/u/.config/mytool/installer.toml")
         );
     }
 
     #[test]
     fn posix_app_home_empty_xdg_treated_as_unset() {
         // `XDG_CONFIG_HOME=` (empty) must fall back to config_dir, not produce
-        // a relative `codetainyrrr/installer.toml`.
+        // a relative `mytool/installer.toml`.
         let cands = app_home_candidates_posix(
-            "codetainyrrr",
+            "mytool",
             Some(""),
             Some(Path::new("/home/u/.config")),
             Some(Path::new("/home/u")),
         );
         assert_eq!(
             cands[0],
-            PathBuf::from("/home/u/.config/codetainyrrr/installer.toml")
+            PathBuf::from("/home/u/.config/mytool/installer.toml")
         );
         // Not the bogus relative candidate that an unfiltered empty var produces.
-        assert_ne!(cands[0], PathBuf::from("codetainyrrr").join("installer.toml"));
+        assert_ne!(cands[0], PathBuf::from("mytool").join("installer.toml"));
     }
 
     #[test]
     fn windows_app_home_appdata_when_set() {
         let cands = app_home_candidates_windows(
-            "codetainyrrr",
+            "mytool",
             Some(r"C:\Users\u\AppData\Roaming"),
             None,
             Some(Path::new(r"C:\Users\u")),
@@ -991,15 +1055,15 @@ mod tests {
         // on every platform (a backslash literal is one component on Unix).
         assert_eq!(
             cands[0],
-            PathBuf::from(r"C:\Users\u\AppData\Roaming").join("codetainyrrr").join("installer.toml")
+            PathBuf::from(r"C:\Users\u\AppData\Roaming").join("mytool").join("installer.toml")
         );
         assert_eq!(
             cands[1],
-            PathBuf::from(r"C:\Users\u").join(".codetainyrrr").join("installer.toml")
+            PathBuf::from(r"C:\Users\u").join(".mytool").join("installer.toml")
         );
         assert_eq!(
             cands[2],
-            PathBuf::from(r"C:\ProgramData").join("codetainyrrr").join("installer.toml")
+            PathBuf::from(r"C:\ProgramData").join("mytool").join("installer.toml")
         );
     }
 
@@ -1008,7 +1072,7 @@ mod tests {
         // Empty `%APPDATA%` and `%PROGRAMDATA%` fall back to config_dir/data_dir
         // rather than producing relative candidates.
         let cands = app_home_candidates_windows(
-            "codetainyrrr",
+            "mytool",
             Some(""),
             Some(Path::new(r"C:\Users\u\AppData\Roaming")),
             Some(Path::new(r"C:\Users\u")),
@@ -1017,18 +1081,18 @@ mod tests {
         );
         assert_eq!(
             cands[0],
-            PathBuf::from(r"C:\Users\u\AppData\Roaming").join("codetainyrrr").join("installer.toml")
+            PathBuf::from(r"C:\Users\u\AppData\Roaming").join("mytool").join("installer.toml")
         );
         assert_eq!(
             cands[2],
-            PathBuf::from(r"C:\ProgramData").join("codetainyrrr").join("installer.toml")
+            PathBuf::from(r"C:\ProgramData").join("mytool").join("installer.toml")
         );
     }
 
     #[test]
     fn windows_app_home_config_dir_fallback_when_appdata_unset() {
         let cands = app_home_candidates_windows(
-            "codetainyrrr",
+            "mytool",
             None,
             Some(Path::new(r"C:\Users\u\AppData\Roaming")),
             Some(Path::new(r"C:\Users\u")),
@@ -1037,11 +1101,11 @@ mod tests {
         );
         assert_eq!(
             cands[0],
-            PathBuf::from(r"C:\Users\u\AppData\Roaming").join("codetainyrrr").join("installer.toml")
+            PathBuf::from(r"C:\Users\u\AppData\Roaming").join("mytool").join("installer.toml")
         );
         assert_eq!(
             cands[2],
-            PathBuf::from(r"C:\ProgramData").join("codetainyrrr").join("installer.toml")
+            PathBuf::from(r"C:\ProgramData").join("mytool").join("installer.toml")
         );
     }
 }

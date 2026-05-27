@@ -5,7 +5,7 @@
 //! catalog keys to install + a vars map (seeded into the env so the engine's
 //! `prompt`/`save_input`/`EnvResolver` pick them up).
 //!
-//! Condition syntax mirrors codetainyrrr wizard.json:
+//! Condition syntax mirrors the reference installer wizard.json:
 //!   `${VAR} == 'lit'` · `${VAR} != 'lit'` · `${VAR} in 'a,b,c'` ·
 //!   `'item' in ${VAR}` (CSV membership; a multiselect joins with ',').
 
@@ -23,6 +23,133 @@ pub enum FieldType {
     Secret,
     Path,
     Toggle,
+}
+
+/// Named value validators for text-like fields (alternative/addition to a raw
+/// `pattern` regex).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldFormat {
+    Integer,
+    Number,
+    Alpha,
+    Alnum,
+    Email,
+}
+
+impl FieldFormat {
+    fn label(self) -> &'static str {
+        match self {
+            FieldFormat::Integer => "an integer",
+            FieldFormat::Number => "a number",
+            FieldFormat::Alpha => "letters only",
+            FieldFormat::Alnum => "letters and digits only",
+            FieldFormat::Email => "an email address",
+        }
+    }
+    fn accepts(self, v: &str) -> bool {
+        match self {
+            FieldFormat::Integer => v.parse::<i64>().is_ok(),
+            // reject NaN/inf — they parse as f64 but aren't meaningful values
+            // and would silently slip past min/max (NaN compares false to both).
+            FieldFormat::Number => v.parse::<f64>().map(|n| n.is_finite()).unwrap_or(false),
+            FieldFormat::Alpha => v.chars().all(|c| c.is_alphabetic()),
+            FieldFormat::Alnum => v.chars().all(|c| c.is_alphanumeric()),
+            // intentionally minimal: local@domain.tld shape, no full RFC 5322.
+            FieldFormat::Email => {
+                let mut parts = v.splitn(2, '@');
+                let local = parts.next().unwrap_or("");
+                let domain = parts.next().unwrap_or("");
+                !local.is_empty() && domain.contains('.') && !domain.starts_with('.')
+                    && !domain.ends_with('.')
+            }
+        }
+    }
+}
+
+/// Validation flags shared by `Field` and the catalog's `requires_input`
+/// declarations. All optional; applied to the scalar string value of a
+/// text/secret/path field (empties are handled by `required`).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Validate {
+    /// Regex the value must match in full (anchored automatically).
+    #[serde(default)]
+    pub pattern: Option<String>,
+    /// Named convenience validator.
+    #[serde(default)]
+    pub format: Option<FieldFormat>,
+    #[serde(default)]
+    pub min_length: Option<usize>,
+    #[serde(default)]
+    pub max_length: Option<usize>,
+    /// Numeric bounds (value is parsed as f64; implies a numeric value).
+    #[serde(default)]
+    pub min: Option<f64>,
+    #[serde(default)]
+    pub max: Option<f64>,
+    /// Custom message shown instead of the generated one.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl Validate {
+    /// Validate a non-empty scalar value. `Ok(())` when it passes or when no
+    /// rules are set. `field_id` is used for the error.
+    pub fn check(&self, field_id: &str, value: &str) -> Result<()> {
+        if value.is_empty() {
+            return Ok(());
+        }
+        let fail = |reason: String| {
+            Err(EngineError::InvalidInput {
+                field: field_id.to_string(),
+                message: self.error.clone().unwrap_or(reason),
+            })
+        };
+        let len = value.chars().count();
+        if let Some(min) = self.min_length {
+            if len < min {
+                return fail(format!("must be at least {min} character(s)"));
+            }
+        }
+        if let Some(max) = self.max_length {
+            if len > max {
+                return fail(format!("must be at most {max} character(s)"));
+            }
+        }
+        if let Some(fmt) = self.format {
+            if !fmt.accepts(value) {
+                return fail(format!("must be {}", fmt.label()));
+            }
+        }
+        if self.min.is_some() || self.max.is_some() {
+            match value.parse::<f64>() {
+                // reject NaN/inf: NaN passes every bound (all comparisons false).
+                Ok(n) if n.is_finite() => {
+                    if let Some(min) = self.min {
+                        if n < min {
+                            return fail(format!("must be >= {min}"));
+                        }
+                    }
+                    if let Some(max) = self.max {
+                        if n > max {
+                            return fail(format!("must be <= {max}"));
+                        }
+                    }
+                }
+                // non-finite Ok (NaN/inf) or parse error → not a usable number.
+                _ => return fail("must be a number".into()),
+            }
+        }
+        if let Some(pat) = &self.pattern {
+            let re = regex::Regex::new(&format!("^(?:{pat})$")).map_err(|e| {
+                EngineError::Config(format!("field '{field_id}' has an invalid pattern: {e}"))
+            })?;
+            if !re.is_match(value) {
+                return fail(format!("must match {pat}"));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -45,6 +172,9 @@ pub struct Field {
     pub options: Vec<String>,
     #[serde(default)]
     pub condition: Option<String>,
+    /// Value validators (text/secret/path fields).
+    #[serde(flatten)]
+    pub validate: Validate,
 }
 
 fn default_true() -> bool {
@@ -71,6 +201,8 @@ pub struct InputDecl {
     pub default: Option<String>,
     #[serde(default)]
     pub condition: Option<String>,
+    #[serde(flatten)]
+    pub validate: Validate,
 }
 
 impl InputDecl {
@@ -86,6 +218,7 @@ impl InputDecl {
             source: None,
             options: Vec::new(),
             condition: None,
+            validate: self.validate.clone(),
         }
     }
 }
@@ -122,6 +255,9 @@ pub struct Choice {
     pub value: String,
     pub label: String,
     pub default: bool,
+    /// Catalog `group`/`category` this option belongs to, if any. Drives the
+    /// collapsible group headers in the TUI; `None` ⇒ rendered ungrouped.
+    pub group: Option<String>,
 }
 
 /// An answer for a field. `Skip` = optional field the user declined.
@@ -225,7 +361,7 @@ fn version_cmp(a: &str, b: &str) -> Option<std::cmp::Ordering> {
     Some(std::cmp::Ordering::Equal)
 }
 
-/// Evaluate a condition against collected vars. Mirrors codetainyrrr, plus
+/// Evaluate a condition against collected vars. Mirrors the reference installer, plus
 /// version-compare operators (`>= <= > <`, and semver-aware `== !=`) — the
 /// single expression grammar reused by entries, item conditions, and pages.
 pub fn eval_condition(expr: &str, vars: &Map<String, Value>) -> bool {
@@ -330,6 +466,7 @@ pub fn choices_for_vars(
                         (None, Some(d)) => format!("{} — {d}", o.key),
                         (None, None) => o.key.clone(),
                     },
+                    group: o.group.clone(),
                     value: o.key,
                     default: o.default,
                 })
@@ -343,6 +480,7 @@ pub fn choices_for_vars(
             value: v.clone(),
             label: v.clone(),
             default: false,
+            group: None,
         })
         .collect()
 }
@@ -396,6 +534,9 @@ pub fn run_wizard(
                         WizValue::One(s) | WizValue::Text(s) => Value::String(s),
                         WizValue::Bool(b) => Value::Bool(b),
                     };
+                    if let Value::String(s) = &stored {
+                        synthetic.validate.check(&synthetic.id, s)?;
+                    }
                     out.vars.insert(synthetic.id.clone(), stored);
                 }
                 continue;
@@ -419,6 +560,9 @@ pub fn run_wizard(
                 WizValue::Text(s) => Value::String(s),
                 WizValue::Bool(b) => Value::Bool(b),
             };
+            if let Value::String(s) = &stored {
+                field.validate.check(&field.id, s)?;
+            }
             out.vars.insert(field.id.clone(), stored);
         }
     }
@@ -581,6 +725,9 @@ impl<'a> WizardSession<'a> {
                     if !(matches!(v, Value::String(s) if s.is_empty())
                         || matches!(v, Value::Array(a) if a.is_empty())) =>
                 {
+                    if let Value::String(s) = v {
+                        f.validate.check(&f.id, s)?;
+                    }
                     self.vars.insert(f.id.clone(), v.clone());
                 }
                 _ => {
@@ -896,6 +1043,7 @@ mod tests {
             source: Some("catalog.clis".into()),
             options: vec![],
             condition: None,
+            validate: Validate::default(),
         };
         let mut vars = Map::new();
         vars.insert("OS".into(), Value::String("macos".into()));
@@ -916,6 +1064,7 @@ mod tests {
             source: Some("catalog.clis".into()),
             options: vec![],
             condition: None,
+            validate: Validate::default(),
         };
         let mut vars = Map::new();
         vars.insert("OS".into(), Value::String("linux".into()));
@@ -957,4 +1106,91 @@ mod tests {
         // version ops on non-version values → false (no panic).
         assert!(!eval_condition("${MODE} >= '1.0'", &m));
     }
+
+    #[test]
+    fn validate_format_and_bounds() {
+        let v = Validate { format: Some(FieldFormat::Integer), ..Default::default() };
+        assert!(v.check("PORT", "8080").is_ok());
+        assert!(v.check("PORT", "8a").is_err());
+        assert!(v.check("PORT", "").is_ok()); // emptiness is `required`'s job
+
+        let r = Validate {
+            format: Some(FieldFormat::Integer),
+            min: Some(1.0),
+            max: Some(65535.0),
+            ..Default::default()
+        };
+        assert!(r.check("PORT", "443").is_ok());
+        assert!(r.check("PORT", "0").is_err());
+        assert!(r.check("PORT", "70000").is_err());
+
+        assert!(Validate { format: Some(FieldFormat::Alpha), ..Default::default() }
+            .check("N", "abcZ")
+            .is_ok());
+        assert!(Validate { format: Some(FieldFormat::Alpha), ..Default::default() }
+            .check("N", "ab1")
+            .is_err());
+        assert!(Validate { format: Some(FieldFormat::Email), ..Default::default() }
+            .check("E", "a@b.co")
+            .is_ok());
+        assert!(Validate { format: Some(FieldFormat::Email), ..Default::default() }
+            .check("E", "nope")
+            .is_err());
+    }
+
+    #[test]
+    fn validate_rejects_nan_and_inf() {
+        // NaN compares false to every bound, so it must be rejected outright,
+        // both as a `number` format and under min/max bounds.
+        let num = Validate { format: Some(FieldFormat::Number), ..Default::default() };
+        assert!(num.check("X", "nan").is_err());
+        assert!(num.check("X", "inf").is_err());
+        assert!(num.check("X", "3.14").is_ok());
+
+        let bounded = Validate { min: Some(1.0), max: Some(10.0), ..Default::default() };
+        assert!(bounded.check("X", "nan").is_err(), "NaN must not slip past bounds");
+        assert!(bounded.check("X", "inf").is_err());
+        assert!(bounded.check("X", "5").is_ok());
+    }
+
+    #[test]
+    fn validate_pattern_is_full_match_and_length() {
+        let v = Validate { pattern: Some("[a-z]+".into()), ..Default::default() };
+        assert!(v.check("S", "abc").is_ok());
+        assert!(v.check("S", "abc1").is_err(), "anchored: trailing digit rejected");
+
+        let l = Validate { max_length: Some(3), ..Default::default() };
+        assert!(l.check("S", "abc").is_ok());
+        assert!(l.check("S", "abcd").is_err());
+    }
+
+    #[test]
+    fn validate_custom_error_message() {
+        let v = Validate {
+            format: Some(FieldFormat::Integer),
+            error: Some("ports are numbers".into()),
+            ..Default::default()
+        };
+        assert!(format!("{}", v.check("PORT", "x").unwrap_err()).contains("ports are numbers"));
+    }
+
+    #[test]
+    fn invalid_pattern_is_config_error() {
+        let v = Validate { pattern: Some("(".into()), ..Default::default() };
+        assert!(matches!(v.check("S", "x"), Err(EngineError::Config(_))));
+    }
+
+    #[test]
+    fn run_wizard_rejects_invalid_answer() {
+        let wiz = WizardDef::from_str(
+            "[[page]]\nid = \"p\"\n[[page.field]]\nid = \"PORT\"\ntype = \"text\"\nformat = \"integer\"\n",
+        )
+        .unwrap();
+        let cat = Catalog::default();
+        let mut m = Map::new();
+        m.insert("PORT".into(), Value::String("abc".into()));
+        let r = run_wizard(&wiz, &cat, &StaticAnswerer(m), &[]);
+        assert!(matches!(r, Err(EngineError::InvalidInput { .. })));
+    }
 }
+

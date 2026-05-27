@@ -10,7 +10,7 @@ use std::fs;
 use std::process::Command;
 
 fn shipped_name() -> &'static str {
-    if cfg!(windows) { "codetainyrrr.exe" } else { "codetainyrrr" }
+    if cfg!(windows) { "mytool.exe" } else { "mytool" }
 }
 
 #[test]
