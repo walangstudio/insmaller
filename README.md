@@ -1,9 +1,9 @@
 # insmaller
 
-![version](https://img.shields.io/badge/version-0.3.3-blue)
+![version](https://img.shields.io/badge/version-0.4.0-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![rust](https://img.shields.io/badge/rust-1.78%2B-orange)
-![tests](https://img.shields.io/badge/tests-246%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-283%20passing-brightgreen)
 
 insmaller installs things by reading a config file instead of running
 hand-written install code. You describe each tool as a list of steps in TOML,
@@ -160,7 +160,7 @@ installer can trip AV heuristics and how to reduce it.
 
 ## Status
 
-The engine is built and passing: `cargo test --workspace` is 224 tests, no
+The engine is built and passing: `cargo test --workspace` is 283 tests, no
 failures, no ignored, clippy clean. It works on its own through the CLI today.
 
 The optional native plugin transport builds with `--features cdylib`. The WASM

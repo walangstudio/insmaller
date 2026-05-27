@@ -1,3 +1,6 @@
 /target
 **/*.rs.bk
 *.pdb
+
+# locally-kept prebuilt binaries (not source)
+/insmaller-linux
