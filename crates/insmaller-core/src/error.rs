@@ -55,6 +55,9 @@ pub enum EngineError {
     #[error("required input '{0}' is not available (non-interactive context)")]
     MissingInput(String),
 
+    #[error("invalid value for '{field}': {message}")]
+    InvalidInput { field: String, message: String },
+
     #[error("template render failed for {what}: {source}")]
     Render {
         what: String,

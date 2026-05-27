@@ -56,9 +56,31 @@ async fn run_inner(
     }
     stack.pop();
 
+    if task_gated_off(task, run_vars) {
+        rep.log(&format!("[task {name}] skipped (condition)"));
+        done.insert(name.to_string());
+        return Ok(());
+    }
     run_task_body(name, cfg, reg, rep, inp, run_vars).await?;
     done.insert(name.to_string());
     Ok(())
+}
+
+/// A task's `when`/`unless` predicate decides if it runs. Gated-off tasks are
+/// skipped (treated as satisfied so dependents still run). Same grammar as
+/// step `when`/`unless`.
+fn task_gated_off(task: &crate::config::CompiledTask, run_vars: &Map<String, Value>) -> bool {
+    if let Some(w) = &task.when {
+        if !crate::wizard::eval_condition(w, run_vars) {
+            return true;
+        }
+    }
+    if let Some(u) = &task.unless {
+        if crate::wizard::eval_condition(u, run_vars) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Run a single task's own step pipeline (its `needs` are NOT run here — the
@@ -138,6 +160,19 @@ pub async fn run_tasks(
             return Err(EngineError::Cycle(
                 "task scheduler stalled (no runnable task)".into(),
             ));
+        }
+        // Gated-off ready tasks are skipped (satisfied) so dependents proceed.
+        let gated: Vec<String> = ready
+            .iter()
+            .filter(|n| task_gated_off(&cfg.tasks[**n], run_vars))
+            .map(|n| (*n).clone())
+            .collect();
+        if !gated.is_empty() {
+            for n in gated {
+                rep.log(&format!("[task {n}] skipped (condition)"));
+                done.insert(n);
+            }
+            continue;
         }
         // Parallel-eligible ready tasks run together (capped); otherwise a
         // single exclusive task runs alone this wave.
@@ -515,5 +550,65 @@ mod tests {
             t.elapsed() < std::time::Duration::from_millis(3000),
             "force_parallel should overlap unflagged tasks"
         );
+    }
+
+    async fn run_batch_vars(
+        names: &[&str],
+        cfg: &LoadedConfig,
+        v: &Map<String, Value>,
+    ) -> Result<()> {
+        let reg = crate::builtins(&cfg.settings);
+        let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        run_tasks(&names, cfg, &reg, &NullReporter, &EnvResolver, v, 0, false).await
+    }
+
+    #[tokio::test]
+    async fn task_when_gates_execution() {
+        if std::env::consts::OS == "windows" {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let m = dir.path().join("ran").to_string_lossy().replace('\\', "/");
+        let c = cfg(&format!(
+            r#"
+            [task.t]
+            when = "${{ON}} == '1'"
+            [[task.t.steps]]
+            type = "shell"
+            script = "echo x > '{m}'"
+            "#
+        ));
+        // condition false → skipped, no marker
+        run_batch_vars(&["t"], &c, &vars(&[("ON", "0")])).await.unwrap();
+        assert!(!std::path::Path::new(&m).exists(), "gated-off task must not run");
+        // condition true → runs
+        run_batch_vars(&["t"], &c, &vars(&[("ON", "1")])).await.unwrap();
+        assert!(std::path::Path::new(&m).exists(), "gated-on task must run");
+    }
+
+    #[tokio::test]
+    async fn dependent_runs_even_when_its_need_is_gated_off() {
+        if std::env::consts::OS == "windows" {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let m = dir.path().join("a-ran").to_string_lossy().replace('\\', "/");
+        let c = cfg(&format!(
+            r#"
+            [task.b]
+            when = "${{NEVER}} == '1'"   # NEVER is unset → gated off
+            [[task.b.steps]]
+            type = "shell"
+            script = "exit 1"
+            [task.a]
+            needs = ["b"]
+            [[task.a.steps]]
+            type = "shell"
+            script = "echo x > '{m}'"
+            "#
+        ));
+        // b is skipped (treated satisfied); a still runs.
+        run_batch_vars(&["a"], &c, &Map::new()).await.unwrap();
+        assert!(std::path::Path::new(&m).exists(), "dependent must run when need is gated off");
     }
 }

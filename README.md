@@ -74,9 +74,12 @@ entry on a predicate); `requires_input` on an entry plus a `selected.inputs`
 wizard page that collects the union of declared inputs of the selection;
 `[settings.setup_output]` to emit the resolved vars to a single env file
 atomically; named `[task.*]` lifecycle pipelines (`insmaller task <name>`) with
-`needs` ordering and per-OS step overrides; and a `[project]` block of
-presentation strings and opaque pass-through `extra` for task templating. All
-of it is optional and additive — existing catalogs are unaffected.
+`needs` ordering, per-task `parallel`/`when`/`unless`, and per-OS step
+overrides; field validators (`pattern`, `format`, `min`/`max`,
+`min_length`/`max_length`); and a `[project]` block of presentation strings and
+opaque pass-through `extra` for task templating. All of it is optional and
+additive — existing catalogs are unaffected. See
+[`docs/fields.md`](docs/fields.md) for the full field/flag/task reference.
 
 `insmaller status` (alias `query`) lists what the install markers record, as a
 table or `--json`. Marker location is global per-user by default;

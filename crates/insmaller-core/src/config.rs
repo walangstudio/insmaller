@@ -68,6 +68,13 @@ pub struct TaskDef {
     /// exclusively (nothing else runs while it does).
     #[serde(default)]
     pub parallel: bool,
+    /// Run only if this predicate holds (same grammar as step `when`). A gated
+    /// task is skipped — treated as satisfied so its dependents still run.
+    #[serde(default)]
+    pub when: Option<String>,
+    /// Skip if this predicate holds (inverse of `when`).
+    #[serde(default)]
+    pub unless: Option<String>,
 }
 
 /// Parsed [`TaskDef`]: step tables resolved into `Step`s at load.
@@ -78,6 +85,8 @@ pub struct CompiledTask {
     pub os_steps: BTreeMap<String, Vec<Step>>,
     pub needs: Vec<String>,
     pub parallel: bool,
+    pub when: Option<String>,
+    pub unless: Option<String>,
 }
 
 /// A `[[plugin]]` declaration. P2 uses `path` (recipe-pack). `command`/`kinds`
@@ -394,6 +403,8 @@ fn compile_tasks(raw: BTreeMap<String, TaskDef>) -> Result<BTreeMap<String, Comp
                 os_steps,
                 needs: t.needs,
                 parallel: t.parallel,
+                when: t.when,
+                unless: t.unless,
             },
         );
     }

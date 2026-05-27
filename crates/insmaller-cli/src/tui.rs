@@ -495,20 +495,7 @@ pub fn run_wizard_tui(
     let mut collapse: HashMap<String, bool> = HashMap::new();
 
     while !session.is_done() {
-        let fields: Vec<Field> = session
-            .fields()
-            .into_iter()
-            .map(|f| Field {
-                id: f.id.clone(),
-                field_type: f.field_type,
-                prompt: f.prompt.clone(),
-                default: f.default.clone(),
-                required: f.required,
-                source: f.source.clone(),
-                options: f.options.clone(),
-                condition: f.condition.clone(),
-            })
-            .collect();
+        let fields: Vec<Field> = session.fields();
         let mut widgets: Vec<Widget> =
             fields.iter().map(|f| init_widget(f, session, gd, &collapse)).collect();
         // focus targets: 0..fields = field i; fields = Back; fields+1 = Next

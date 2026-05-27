@@ -923,6 +923,7 @@ dependencies = [
  "glob",
  "libloading",
  "minijinja",
+ "regex",
  "serde",
  "serde_json",
  "serde_yaml",
