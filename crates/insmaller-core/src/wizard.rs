@@ -50,7 +50,9 @@ impl FieldFormat {
     fn accepts(self, v: &str) -> bool {
         match self {
             FieldFormat::Integer => v.parse::<i64>().is_ok(),
-            FieldFormat::Number => v.parse::<f64>().is_ok(),
+            // reject NaN/inf — they parse as f64 but aren't meaningful values
+            // and would silently slip past min/max (NaN compares false to both).
+            FieldFormat::Number => v.parse::<f64>().map(|n| n.is_finite()).unwrap_or(false),
             FieldFormat::Alpha => v.chars().all(|c| c.is_alphabetic()),
             FieldFormat::Alnum => v.chars().all(|c| c.is_alphanumeric()),
             // intentionally minimal: local@domain.tld shape, no full RFC 5322.
@@ -121,7 +123,8 @@ impl Validate {
         }
         if self.min.is_some() || self.max.is_some() {
             match value.parse::<f64>() {
-                Ok(n) => {
+                // reject NaN/inf: NaN passes every bound (all comparisons false).
+                Ok(n) if n.is_finite() => {
                     if let Some(min) = self.min {
                         if n < min {
                             return fail(format!("must be >= {min}"));
@@ -133,7 +136,8 @@ impl Validate {
                         }
                     }
                 }
-                Err(_) => return fail("must be a number".into()),
+                // non-finite Ok (NaN/inf) or parse error → not a usable number.
+                _ => return fail("must be a number".into()),
             }
         }
         if let Some(pat) = &self.pattern {
@@ -1135,6 +1139,21 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_nan_and_inf() {
+        // NaN compares false to every bound, so it must be rejected outright,
+        // both as a `number` format and under min/max bounds.
+        let num = Validate { format: Some(FieldFormat::Number), ..Default::default() };
+        assert!(num.check("X", "nan").is_err());
+        assert!(num.check("X", "inf").is_err());
+        assert!(num.check("X", "3.14").is_ok());
+
+        let bounded = Validate { min: Some(1.0), max: Some(10.0), ..Default::default() };
+        assert!(bounded.check("X", "nan").is_err(), "NaN must not slip past bounds");
+        assert!(bounded.check("X", "inf").is_err());
+        assert!(bounded.check("X", "5").is_ok());
+    }
+
+    #[test]
     fn validate_pattern_is_full_match_and_length() {
         let v = Validate { pattern: Some("[a-z]+".into()), ..Default::default() };
         assert!(v.check("S", "abc").is_ok());
@@ -1174,3 +1193,4 @@ mod tests {
         assert!(matches!(r, Err(EngineError::InvalidInput { .. })));
     }
 }
+
