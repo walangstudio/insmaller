@@ -4,6 +4,37 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-05-26
+
+### Added
+- **Wizard field validators** on fields and catalog `requires_input`: `pattern`
+  (regex, anchored), `format` (`integer`/`number`/`alpha`/`alnum`/`email`),
+  `min`/`max`, `min_length`/`max_length`, and a custom `error` message. Enforced
+  interactively (re-ask) and on the unattended `--answers` path; NaN/inf
+  rejected. See `docs/fields.md`.
+- **Declarative task concurrency.** Per-task `parallel` opt-in (default
+  exclusive); the `needs` DAG runs independent tasks concurrently, throttled by
+  `[settings] max_parallel_tasks`; CLI `--jobs N` / `--parallel`.
+- **Task gating** via `[task].when` / `unless` (a gated-off task is skipped and
+  treated as satisfied so dependents still run).
+- **`[settings] default_command`** — a bare `insmaller` invocation runs it (e.g.
+  `setup`).
+- **TUI:** arrow navigation between fields; a collapsible catalog group tree
+  (default collapse via `start_groups_collapsed` / `collapsed_groups` /
+  `expanded_groups`, persisted across pages); a `Ctrl+B` file/dir picker
+  (folders selectable, not just files).
+- **`[settings] setup_writes_config_only`** (collect config + write
+  `setup_output`, run no host install) and **`prefer_bash_on_windows`** (run
+  POSIX shell steps through Git Bash when present, detected against the enriched
+  PATH).
+- **Multi-instance safety:** a cross-process sentinel lock (acquired off the
+  async executor) and per-process unique `atomic_write` temp names.
+- **AV hardening:** embedded Windows version resource + `asInvoker` manifest,
+  stripped/LTO release profile, an opt-in signing step, and `docs/antivirus.md`.
+
+### Changed
+- Removed consumer-specific branding from the engine; identifiers are generic.
+
 ## [0.3.3] - 2026-05-23
 
 ### Added
