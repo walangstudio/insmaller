@@ -18,7 +18,7 @@ mode    = 0o600
 
 [project]
 name           = "E2E"
-about          = "insmaller codetainyrrr e2e fixture"
+about          = "insmaller e2e fixture"
 intro_template = "Welcome to {{ name }}"
 outro_template = "Done. token={{ ALPHA_TOKEN }} img={{ image_tag }}"
 default_cli    = "alpha"

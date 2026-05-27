@@ -51,7 +51,7 @@ pub use orchestrator::{
     EntryRef, EntrySource, InstallSummary, RunOpts,
 };
 pub use processors_io::write_setup_output;
-pub use tasks::run_task;
+pub use tasks::{run_task, run_tasks};
 pub use plugin::{
     register_external, ExternalProcessor, PluginResponse, PluginTransport, PROTOCOL,
 };

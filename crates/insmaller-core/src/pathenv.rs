@@ -1,4 +1,4 @@
-//! PATH + home-expansion helpers. Ported from codetainyrrr handlers/mod.rs
+//! PATH + home-expansion helpers. Ported from reference-installer handlers/mod.rs
 //! verbatim, except `enriched_path` is driven by `settings.path_globs`
 //! instead of a hardcoded list (the only intended generalization).
 
@@ -124,11 +124,16 @@ pub async fn run_cmd(
 
 /// Run a shell snippet with the enriched PATH. Unix: `bash -c` (verbatim from
 /// handlers/mod.rs::run_sh — the parity oracle, unchanged). Windows:
-/// `powershell -NoProfile -NonInteractive -Command` (Windows recipes must be
-/// PowerShell, not bash).
-pub async fn run_sh(script: &str, path_globs: &[String], dir: Option<&str>) -> Result<()> {
+/// `powershell -NoProfile -NonInteractive -Command`, unless `prefer_bash` and a
+/// `bash` is discoverable on PATH (see `shell_invocation`).
+pub async fn run_sh(
+    script: &str,
+    path_globs: &[String],
+    prefer_bash: bool,
+    dir: Option<&str>,
+) -> Result<()> {
     let path = enriched_path(path_globs);
-    let (prog, args) = shell_invocation(script); // single source of dispatch
+    let (prog, args) = shell_invocation(script, prefer_bash, &path); // single source of dispatch
     let mut cmd = Command::new(prog);
     cmd.args(&args).env("PATH", &path);
     if let Some(d) = dir {
@@ -146,8 +151,18 @@ pub async fn run_sh(script: &str, path_globs: &[String], dir: Option<&str>) -> R
 
 /// `(program, args)` for running `script` in the platform shell — the single
 /// place the bash↔powershell choice is made (no processor hardcodes a shell).
-pub fn shell_invocation(script: &str) -> (&'static str, Vec<String>) {
-    if cfg!(windows) {
+/// Unix is always `bash -c`. Windows is `powershell …` unless `prefer_bash` is
+/// set AND a `bash` is discoverable in `path`, in which case `bash -c` (for
+/// catalogs whose shell bodies are POSIX, e.g. a Git Bash dependency). `path`
+/// is the same enriched PATH the caller spawns the shell with, so detection
+/// and execution agree — a `bash` installed only into a `path_globs` dir is
+/// still found.
+pub fn shell_invocation(
+    script: &str,
+    prefer_bash: bool,
+    path: &str,
+) -> (&'static str, Vec<String>) {
+    let powershell = || {
         (
             "powershell",
             vec![
@@ -157,8 +172,16 @@ pub fn shell_invocation(script: &str) -> (&'static str, Vec<String>) {
                 script.into(),
             ],
         )
+    };
+    let bash = || ("bash", vec!["-c".into(), script.into()]);
+    if cfg!(windows) {
+        if prefer_bash && resolve_in_path("bash", path).is_some() {
+            bash()
+        } else {
+            powershell()
+        }
     } else {
-        ("bash", vec!["-c".into(), script.into()])
+        bash()
     }
 }
 
@@ -167,10 +190,11 @@ pub fn shell_invocation(script: &str) -> (&'static str, Vec<String>) {
 pub async fn run_capture(
     script: &str,
     path_globs: &[String],
+    prefer_bash: bool,
     dir: Option<&str>,
 ) -> Result<std::process::Output> {
     let path = enriched_path(path_globs);
-    let (prog, args) = shell_invocation(script);
+    let (prog, args) = shell_invocation(script, prefer_bash, &path);
     let mut cmd = Command::new(prog);
     cmd.args(&args).env("PATH", &path);
     if let Some(d) = dir {
@@ -216,7 +240,8 @@ mod tests {
 
     #[test]
     fn shell_invocation_dispatches_per_platform() {
-        let (prog, args) = shell_invocation("echo hi");
+        // prefer_bash = false: unchanged platform default, regardless of PATH.
+        let (prog, args) = shell_invocation("echo hi", false, "");
         if cfg!(windows) {
             assert_eq!(prog, "powershell");
             assert_eq!(args.first().map(String::as_str), Some("-NoProfile"));
@@ -224,6 +249,32 @@ mod tests {
         } else {
             assert_eq!(prog, "bash");
             assert_eq!(args, vec!["-c".to_string(), "echo hi".to_string()]);
+        }
+    }
+
+    #[test]
+    fn shell_invocation_prefers_bash_on_windows_using_given_path() {
+        // Detection runs against the PATH passed in (the enriched spawn PATH),
+        // not the process environment. Put a fake `bash` in a tempdir and feed
+        // that dir as PATH.
+        let dir = tempfile::tempdir().unwrap();
+        let bash_name = if cfg!(windows) { "bash.exe" } else { "bash" };
+        std::fs::write(dir.path().join(bash_name), b"#!/bin/sh\n").unwrap();
+        let path = dir.path().to_string_lossy().into_owned();
+
+        let (prog, _) = shell_invocation("echo hi", true, &path);
+        if cfg!(windows) {
+            assert_eq!(prog, "bash", "bash in the given PATH must be detected");
+        } else {
+            assert_eq!(prog, "bash");
+        }
+
+        // Empty PATH on Windows ⇒ no bash found ⇒ PowerShell.
+        let (prog_empty, _) = shell_invocation("echo hi", true, "");
+        if cfg!(windows) {
+            assert_eq!(prog_empty, "powershell");
+        } else {
+            assert_eq!(prog_empty, "bash");
         }
     }
 
@@ -240,7 +291,7 @@ mod tests {
     }
 
     // The colon-separated PATH scan is POSIX (the engine runs in a Linux
-    // container, verbatim from codetainyrrr). A Windows tempdir path carries a
+    // container, verbatim from the reference installer). A Windows tempdir path carries a
     // `C:` drive colon that would mis-split, so scope this to unix.
     #[cfg(unix)]
     #[test]

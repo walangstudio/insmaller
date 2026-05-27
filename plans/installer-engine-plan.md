@@ -1,32 +1,32 @@
 # insmaller — Config-Driven Installer Engine
 
-Standalone, reusable installer engine extracted in design from codetainyrrr. Replaces
+Standalone, reusable installer engine extracted in design from a reference installer. Replaces
 hardcoded `spec→handler` dispatch with declarative **TOML** step pipelines + pluggable
-processors. Intended to be consumed by codetainyrrr and other MCP/utils projects via an
+processors. Intended to be consumed by host tools and other MCP/utils projects via an
 `EntrySource`/adapter seam.
 
 Status: **B1–B5 built & green — engine MVP complete, 61 tests pass, CLI smoke OK.**
-Standalone engine works end to end. NOT yet integrated into codetainyrrr (that's the
+Standalone engine works end to end. NOT yet integrated into a host tool (that's the
 strangler M-series below, deferred). Design below is authoritative.
 
 Built (`cargo test --offline`, 55 lib + 3 config_file + 3 e2e = 61, 0 fail):
 - B1 core model: Ctx (minijinja, strict-undefined), Step, Processor, ProcessorRegistry,
   Reporter (+Stdout/Null), InputResolver (+Env/Static), EngineError.
 - B2 config: `LoadedConfig` (TOML), recipe/desugar model, 9 `ParseKind` parsers
-  RELOCATED verbatim from codetainyrrr handlers (uv/git/gh/marketplace/merge-json/nvm
+  RELOCATED verbatim from the reference installer's handlers (uv/git/gh/marketplace/merge-json/nvm
   parity tests ported and passing); real `installer.toml` validated.
 - B3 processors: shell, exec, merge_json (native deep-merge verbatim), check_command,
   claude_plugin (native + guard), sentinel_meta. PATH/expand_home helpers ported
   verbatim. gh-release / go scripts embedded as Rust consts in `scripts.rs` (data-file
   write guard rejects `$(`/`${` inline — so script_file refs resolve to embedded consts).
 - B4 orchestrator + `sentinel.rs`: dep resolution, cycle guard, idempotency, `.post`
-  gate, `InstallSummary` (collect-not-abort) — all verbatim codetainyrrr semantics.
-- B5 `json_catalog.rs` (`EntrySource` over codetainyrrr-shaped catalog.json) +
+  gate, `InstallSummary` (collect-not-abort) — all verbatim reference-installer semantics.
+- B5 `json_catalog.rs` (`EntrySource` over host-shaped catalog.json) +
   `insmaller-cli` (`insmaller install <keys> --config --catalog`, EnvResolver, exit
   code). e2e + CLI smoke (dep order, idempotency, unattended-no-block) green.
 
-Resume point: integrate into codetainyrrr via the M-series (M0 Reporter/InputResolver in
-codetainyrrr → … → M4 flip → M5 the crate IS this `insmaller-core`). Differential e2e vs
+Resume point: integrate into the reference installer via the M-series (M0 Reporter/InputResolver in
+the reference installer → … → M4 flip → M5 the crate IS this `insmaller-core`). Differential e2e vs
 legacy handlers is the gate.
 
 > Crate naming: the engine crate is **`insmaller-core`**, NOT `installer-core`. Windows'
@@ -35,7 +35,7 @@ legacy handlers is the gate.
 > Wherever this doc says `installer-core`, read `insmaller-core`. Keep "install" out of
 > all crate/bin names. Workspace: `crates/insmaller-core` (lib) + `crates/insmaller-cli`
 > (bin `insmaller`). Build on this machine needs `cargo … --offline` (network SSL
-> revocation check is blocked; codetainyrrr's cargo cache supplies the deps).
+> revocation check is blocked; the reference installer's cargo cache supplies the deps).
 
 ---
 
@@ -43,7 +43,7 @@ legacy handlers is the gate.
 
 A single TOML engine config defines the installation **flow** (processors, reusable
 recipes, lifecycle, global settings — "the basic stuff"). **Packages** live in a separate
-extensible config (codetainyrrr's `catalog.json` today). Each package's `install`/
+extensible config (the reference installer's `catalog.json` today). Each package's `install`/
 `uninstall` is an ordered list of steps; each step's `type` maps to a generic processor.
 No hardcoded per-package rules. Future: extend via custom scripts/plugins.
 
@@ -90,7 +90,7 @@ drift — ship it as one verbatim shell recipe). Registry enum reserves an `Exte
 
 ## 4. Keystone — InputResolver (highest risk + its mitigation)
 
-`prompt`/`save_input` must **never block the unattended container** (codetainyrrr's
+`prompt`/`save_input` must **never block the unattended container** (the reference installer's
 `entrypoint.rs` has no TTY and `exec`s zsh as PID 1 — a stdin prompt hangs the container
 forever, silently, worse than a crash).
 
@@ -113,12 +113,12 @@ leak at `orchestrator.rs:137` → engine becomes UI-agnostic and library-extract
 
 ## 5. Engine config — `installer.toml`
 
-TOML (chosen: `toml 0.8` already a dep in codetainyrrr; best for hand-authored recipes +
+TOML (chosen: `toml 0.8` already a dep in the reference installer; best for hand-authored recipes +
 multi-line shell; zero new deps). Sections:
 
 ```toml
 [settings]
-sentinel_dir_name = "codetainyrrr"
+sentinel_dir_name = "the reference installer"
 path_globs = [                       # moves enriched_path() hardcoded list out of code
   "~/.local/bin", "~/.cargo/bin", "~/.deno/bin", "~/.bun/bin",
   "~/.dotnet", "~/go/sdk/bin",
@@ -193,8 +193,8 @@ final flip; the engine runs in parallel, differentially validated, before replac
 - **M5** Extract `crates/installer-core` (the reusable crate); the consuming project keeps
   only a `Catalog→steps` adapter (`EntrySource`).
 
-When integrating back into codetainyrrr, recommended interleave with its Phases:
-M0–M2 → (codetainyrrr Phase D) → M3–M4 → (Phase B refine) → (Phase C) → M5.
+When integrating back into the reference installer, recommended interleave with its Phases:
+M0–M2 → (the reference installer Phase D) → M3–M4 → (Phase B refine) → (Phase C) → M5.
 
 ## 7. Ranked risks
 
@@ -212,14 +212,14 @@ M0–M2 → (codetainyrrr Phase D) → M3–M4 → (Phase B refine) → (Phase C
 ## 8. Reusability seam
 
 The engine depends on a `trait EntrySource { fn entry(&self, key) -> Option<EntryRef> }`
-(EntryRef = `{ kind, spec|steps, deps, post_install }`). codetainyrrr implements it over
+(EntryRef = `{ kind, spec|steps, deps, post_install }`). the reference installer implements it over
 `Catalog` (~20 lines, today's `orchestrator::lookup` body). Other MCP/utils projects
 implement their own trivial source. `installer-core` is the publishable artifact (own
 repo / registry) once the API stabilizes post-M4.
 
-## 9. Source references (codetainyrrr, for the eventual implementer)
+## 9. Source references (the reference installer, for the eventual implementer)
 
-`G:\docker\projs\codetainyrrr\crates\codetainyrrr\src\`:
+`G:\docker\projs\the reference installer\crates\the reference installer\src\`:
 `installer/registry.rs` (dispatch flip point), `installer/orchestrator.rs`
 (Reporter/InputResolver injection; dep+sentinel infra stays),
 `installer/handlers/mod.rs` (`enriched_path`/`resolve_in_path`/`run_sh` → settings-driven

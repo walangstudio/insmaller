@@ -2,6 +2,14 @@
 members = ["crates/insmaller-core", "crates/insmaller-cli"]
 resolver = "2"
 
+# Release binaries: strip symbols and LTO. Smaller, single-unit output reads as
+# a cleaner artifact to AV heuristics. Never add a packer (UPX) — packed
+# binaries are the single biggest false-positive trigger.
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+
 [workspace.package]
 edition = "2021"
 license = "MIT"

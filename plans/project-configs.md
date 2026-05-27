@@ -9,7 +9,7 @@ marketplace install is now the generic `marketplace` recipe in installer.toml:
 ships ONLY generic primitives; every tool's behavior is config (recipe/steps).
 
 The only remaining fixed-logic surface is the `ParseKind` desugar enum (9
-terse-spec parsers, codetainyrrr-relocated). It is **optional sugar** — a
+terse-spec parsers, the reference installer-relocated). It is **optional sugar** — a
 catalog entry can always use inline `steps` or a `{recipe, with}` ref and never
 touch a ParseKind. So the generic path has no fixed logic.
 
@@ -36,7 +36,7 @@ python: gh: git: merge-json: marketplace:` + sys-pkg pack
 (apt/apk/dnf/pacman/zypper/brew/winget/scoop/choco) + lang-pkg pack
 (pip/pipx/cargo/gem/dotnet-tool/pnpm/yarn/go-install) + `shell_literal`.
 Plugin transports: external-process, cdylib (feature), wasm (deferred).
-Host integration: `EntrySource` (`json_catalog` adapter mirrors codetainyrrr).
+Host integration: `EntrySource` (`json_catalog` adapter mirrors the reference installer).
 
 ## 3. Per-project simulated configs (catalog entry + recipe), with gaps
 
@@ -144,5 +144,5 @@ nice-to-have.
 
 **Conclusion:** engine is fully generic (no tool-specific native processor),
 the default host adapter supports the fully-generic inline-steps path, and
-every sibling installer + codetainyrrr is expressible & verified.
+every sibling installer + the reference installer is expressible & verified.
 **122 tests green; default + cdylib build clean.**

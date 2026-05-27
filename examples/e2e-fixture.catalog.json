@@ -1,5 +1,5 @@
 {
-  "_comment": "Codetainyrrr-shape e2e fixture: clis[] with requires_input (P1-A), entry condition (P1-B), category alias + name passthrough (catalog-tree compat). Loads with no consumer-specific engine code.",
+  "_comment": "Host-shape e2e fixture: clis[] with requires_input (P1-A), entry condition (P1-B), category alias + name passthrough (catalog-tree compat). Loads with no consumer-specific engine code.",
   "clis": [
     {
       "key": "alpha",

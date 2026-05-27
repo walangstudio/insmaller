@@ -1,4 +1,4 @@
-//! End-to-end (offline, StaticAnswerer): the codetainyrrr fixture catalog
+//! End-to-end (offline, StaticAnswerer): the host fixture catalog
 //! with requires_input + entry condition + setup_output + project intro/outro,
 //! loaded via the field mapping with no consumer-specific engine code.
 //! Mirrors acceptance criterion #4.
@@ -15,14 +15,14 @@ fn base() -> String {
 }
 
 #[tokio::test]
-async fn codetainyrrr_fixture_setup_and_dry_run_install() {
+async fn host_fixture_setup_and_dry_run_install() {
     let b = base();
     let cfg = LoadedConfig::from_path(Path::new(&format!("{b}/examples/e2e-installer.toml")))
         .expect("e2e installer config loads");
     let cat = Catalog::from_json_str(
         &std::fs::read_to_string(format!("{b}/examples/e2e-fixture.catalog.json")).unwrap(),
     )
-    .expect("codetainyrrr-shape catalog loads with no consumer-specific code");
+    .expect("host-shape catalog loads with no consumer-specific code");
     let wiz = WizardDef::from_str(
         &std::fs::read_to_string(format!("{b}/examples/e2e-fixture.wizard.toml")).unwrap(),
     )
@@ -115,7 +115,7 @@ async fn codetainyrrr_fixture_setup_and_dry_run_install() {
 }
 
 #[tokio::test]
-async fn codetainyrrr_tasks_fixture_runs_per_p1d() {
+async fn host_tasks_fixture_runs_per_p1d() {
     // P1-D acceptance #5: needs ordering, per-OS branch, poll, fail-fast,
     // project.extra templating — with zero Docker awareness in engine code.
     if std::env::consts::OS == "windows" {

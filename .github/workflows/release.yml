@@ -102,6 +102,19 @@ jobs:
       - name: Build
         run: cargo build --release --locked -p insmaller-cli --target ${{ matrix.target }}
 
+      # Authenticode signing reduces AV/SmartScreen false-positives the most.
+      # Inert until a certificate is provisioned: set repo variable
+      # SIGN_WINDOWS=true and add the signing secrets, then fill in the step
+      # below (signtool, or azure/trusted-signing-action for Azure Trusted
+      # Signing). Unsigned releases still publish; they just carry no trust.
+      - name: Sign (Windows)
+        if: runner.os == 'Windows' && vars.SIGN_WINDOWS == 'true'
+        shell: pwsh
+        run: |
+          Write-Host "Signing is enabled but not yet configured."
+          Write-Host "Add your signtool / azure-trusted-signing step here."
+          exit 1
+
       - name: Package (unix)
         if: runner.os != 'Windows'
         shell: bash

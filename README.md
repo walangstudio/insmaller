@@ -12,7 +12,7 @@ nothing else to install.
 
 ## Why this exists
 
-This came out of codetainyrrr, which had a Rust function per installable tool.
+This came out of a reference installer that had a Rust function per installable tool.
 Every new tool, every package manager, every "also symlink this" meant editing
 and recompiling the binary. The install logic and the list of things to install
 were the same code.
@@ -74,9 +74,12 @@ entry on a predicate); `requires_input` on an entry plus a `selected.inputs`
 wizard page that collects the union of declared inputs of the selection;
 `[settings.setup_output]` to emit the resolved vars to a single env file
 atomically; named `[task.*]` lifecycle pipelines (`insmaller task <name>`) with
-`needs` ordering and per-OS step overrides; and a `[project]` block of
-presentation strings and opaque pass-through `extra` for task templating. All
-of it is optional and additive — existing catalogs are unaffected.
+`needs` ordering, per-task `parallel`/`when`/`unless`, and per-OS step
+overrides; field validators (`pattern`, `format`, `min`/`max`,
+`min_length`/`max_length`); and a `[project]` block of presentation strings and
+opaque pass-through `extra` for task templating. All of it is optional and
+additive — existing catalogs are unaffected. See
+[`docs/fields.md`](docs/fields.md) for the full field/flag/task reference.
 
 `insmaller status` (alias `query`) lists what the install markers record, as a
 table or `--json`. Marker location is global per-user by default;
@@ -150,6 +153,11 @@ version from the tag, builds the binary for Linux, macOS (Intel and Apple
 silicon), and Windows, and attaches the archives and a SHA256SUMS file to a
 GitHub release. `insmaller --version` reports the same version.
 
+Windows binaries embed version metadata and an `asInvoker` manifest, and are
+never packed. Code signing is not yet wired (the release workflow has an inert,
+opt-in step). See [docs/antivirus.md](docs/antivirus.md) for why an unsigned
+installer can trip AV heuristics and how to reduce it.
+
 ## Status
 
 The engine is built and passing: `cargo test --workspace` is 224 tests, no
@@ -160,10 +168,10 @@ plugin transport is written up but not enabled, because the WASM runtime is not
 in this machine's offline build cache; it is one dependency and one transport
 away when built online.
 
-What is not done is the migration back into codetainyrrr (the M0 to M5 plan):
+What is not done is the migration back into the reference installer (the M0 to M5 plan):
 insmaller currently stands alone and is not yet wired into it.
 
 - [`SECURITY.md`](SECURITY.md) describes the trust model. The config, catalog,
   and recipes are trusted input, equivalent to running `curl ... | bash`.
 - [`plans/`](plans/) has the design and iteration notes, including where each
-  piece was lifted from in codetainyrrr.
+  piece was lifted from in the reference installer.

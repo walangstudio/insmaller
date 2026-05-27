@@ -1,10 +1,10 @@
 //! Verbatim recipe scripts that use shell command substitution. Embedded as
 //! Rust constants (not data files) so they survive the file-write guard and
-//! stay byte-for-byte identical to the codetainyrrr handlers — the parity
+//! stay byte-for-byte identical to the reference-installer handlers — the parity
 //! guarantee. `script_file = "recipes/<x>.sh"` in installer.toml resolves
 //! here first (then falls back to a real file for host-supplied recipes).
 
-/// Verbatim from codetainyrrr github_release.rs install script.
+/// Verbatim from the reference installer's github_release.rs install script.
 /// Params: {{ repo }}, {{ pattern_regex }} are minijinja-rendered before run.
 pub const GH_RELEASE_SH: &str = r####"
 set -uo pipefail
@@ -66,7 +66,7 @@ find "$TMPDIR" -maxdepth 2 -type f \
 rm -rf "$TMPDIR"
 "####;
 
-/// Verbatim equivalent of codetainyrrr go_lang.rs (latest toolchain into
+/// Verbatim equivalent of the reference installer go_lang.rs (latest toolchain into
 /// ~/go/sdk). `arg` is ignored (spec is `go:latest`).
 pub const GO_TOOLCHAIN_SH: &str = r####"
 set -e
@@ -83,7 +83,7 @@ curl -fsSL "https://go.dev/dl/${VER}.linux-${GOARCH}.tar.gz" \
 "$HOME/go/sdk/bin/go" version
 "####;
 
-/// Verbatim from codetainyrrr python.rs `python:tools`: bootstrap uv, install
+/// Verbatim from the reference installer's python.rs `python:tools`: bootstrap uv, install
 /// the standard Python tool set, and symlink python/pip. Uses command
 /// substitution → embedded (the data-file guard blocks `$(` inline).
 pub const PYTHON_TOOLS_SH: &str = r####"
@@ -108,7 +108,7 @@ if ! command -v pip >/dev/null 2>&1 && command -v pip3 >/dev/null 2>&1; then
 fi
 "####;
 
-/// Verbatim from codetainyrrr python.rs uninstall.
+/// Verbatim from the reference installer's python.rs uninstall.
 pub const PYTHON_TOOLS_UNINSTALL_SH: &str = r####"
 export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
 uv tool uninstall poetry 2>/dev/null || true
@@ -150,7 +150,7 @@ mod tests {
 
     #[test]
     fn gh_script_is_verbatim_shape() {
-        // Sentinel lines proving we kept the exact codetainyrrr behavior.
+        // Sentinel lines proving we kept the exact reference-installer behavior.
         let s = GH_RELEASE_SH;
         assert!(s.contains(r#"grep -iE "$PATTERN_RE""#));
         assert!(s.contains(r#"find "$TMPDIR" -maxdepth 2 -type f"#));

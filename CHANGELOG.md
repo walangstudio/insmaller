@@ -10,7 +10,7 @@ All notable changes to this project are documented here. The format follows
 - **exe-sibling config discovery (S1).** `discover_config` gains a tier between
   cwd+ancestors and app-home: an `installer.toml` sitting next to the running
   binary (`dir(current_exe())/installer.toml`). Lets a freshly-extracted bundle
-  run `./bundle/codetainyrrr task install` from any cwd and find its own recipe
+  run `./bundle/the reference installer task install` from any cwd and find its own recipe
   with no `--config` and no `cd`. Precedence: `--config` > cwd+ancestors >
   exe-sibling > app-home > legacy `installer.toml`. Only the legacy name is
   probed next to the binary, so a stray `insmaller.toml` in a shared bin dir
@@ -31,8 +31,8 @@ All notable changes to this project are documented here. The format follows
 ### Added
 - **argv0-derived program name + app-home config discovery (P4).** The CLI
   derives `<name>` from argv0 (`Path::file_stem`, so `.exe` is stripped;
-  falls back to `"insmaller"`). A binary renamed to `codetainyrrr` now prints
-  `usage: codetainyrrr …` and `codetainyrrr 0.3.2`, and `discover_config`
+  falls back to `"insmaller"`). A binary renamed to `the reference installer` now prints
+  `usage: the reference installer …` and `the reference installer 0.3.2`, and `discover_config`
   gains an app-home fallback after the existing cwd+ancestors walk:
   - POSIX: `$XDG_CONFIG_HOME/<name>/installer.toml` (else
     `~/.config/<name>/…`), `~/.<name>/installer.toml`, `/etc/<name>/…`.
@@ -119,7 +119,7 @@ default sentinel location are unaffected.
 ## [0.2.0] - 2026-05-18
 
 Generic, reusable engine primitives so a downstream config-only consumer
-(codetainyrrr) drives everything through `insmaller` + config. All new schema
+drives everything through `insmaller` + config. All new schema
 is optional with serde defaults; existing catalogs and demos are unaffected.
 The single `eval_condition` grammar stays the only expression evaluator.
 
@@ -153,7 +153,7 @@ The single `eval_condition` grammar stays the only expression evaluator.
   optional `name` label passthrough; unknown entry fields still ignored
   (no `deny_unknown_fields`).
 - E2E fixtures under `examples/e2e-*` and integration coverage
-  (`tests/codetainyrrr_e2e.rs`).
+  (`tests/host_fixture_e2e.rs`).
 
 ### Changed
 - Windows `symlink` of a directory now tries a real symlink, then a directory

@@ -1,9 +1,10 @@
-//! Filesystem install markers. Ported from codetainyrrr sentinel.rs. The dir
+//! Filesystem install markers. Ported from the reference installer's sentinel.rs. The dir
 //! name comes from `[settings].sentinel_dir_name` (no global OnceLock — a
 //! `Sentinel` value carries the base, which also makes it test-injectable).
 
 use crate::error::Result;
 use serde::{Deserialize, Serialize};
+use std::fs::{File, TryLockError};
 use std::path::PathBuf;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -16,6 +17,15 @@ pub struct SentinelData {
 #[derive(Debug, Clone)]
 pub struct Sentinel {
     base: PathBuf,
+}
+
+/// RAII handle for [`Sentinel::lock`]; releases the cross-process lock on drop.
+pub struct LockGuard(File);
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 impl Sentinel {
@@ -84,6 +94,31 @@ impl Sentinel {
     /// The resolved base directory (host introspection / `insmaller status`).
     pub fn base(&self) -> &std::path::Path {
         &self.base
+    }
+
+    /// Acquire a cross-process exclusive lock for mutating operations
+    /// (install/uninstall). If another instance holds it, print a one-time
+    /// notice and block until it's free, so concurrent runs serialize instead
+    /// of racing the sentinel/double-running recipes. The returned handle holds
+    /// the lock until dropped. `None` ⇒ locking unavailable; the caller should
+    /// proceed unlocked rather than fail (a missing lock must not block work).
+    pub fn lock(&self) -> Option<LockGuard> {
+        let _ = std::fs::create_dir_all(&self.base);
+        let f = File::options()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(self.base.join(".lock"))
+            .ok()?;
+        match f.try_lock() {
+            Ok(()) => Some(LockGuard(f)),
+            Err(TryLockError::WouldBlock) => {
+                eprintln!("insmaller: another instance is running; waiting…");
+                f.lock().ok()?;
+                Some(LockGuard(f))
+            }
+            Err(TryLockError::Error(_)) => None,
+        }
     }
 
     pub fn is_installed(&self, kind: &str, key: &str) -> bool {
@@ -203,6 +238,28 @@ mod tests {
         assert_eq!(data.spec, "nvm:lts");
         s.remove("tools", "node").unwrap();
         assert!(!s.is_installed("tools", "node"));
+    }
+
+    #[test]
+    fn lock_is_acquired_and_blocks_a_second_holder() {
+        let (_d, s) = sent();
+        let guard = s.lock().expect("first lock should acquire");
+        assert!(s.base().join(".lock").exists());
+        // A second, independent handle to the same lockfile must not be able to
+        // take it while the guard is held.
+        let other = File::options()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(s.base().join(".lock"))
+            .unwrap();
+        assert!(
+            matches!(other.try_lock(), Err(TryLockError::WouldBlock)),
+            "lock should be held exclusively while the guard is alive"
+        );
+        drop(guard);
+        // After release, it can be taken again.
+        assert!(other.try_lock().is_ok(), "lock should free on guard drop");
     }
 
     #[test]

@@ -12,7 +12,7 @@ fn load() -> LoadedConfig {
 #[test]
 fn installer_toml_loads_and_cross_references() {
     let cfg = load();
-    assert_eq!(cfg.settings.sentinel_dir_name, "codetainyrrr");
+    assert_eq!(cfg.settings.sentinel_dir_name, "insmaller");
     assert!(cfg
         .settings
         .path_globs
@@ -40,7 +40,7 @@ fn all_handler_equivalent_recipes_present() {
     ] {
         assert!(cfg.recipe(r).is_some(), "missing recipe {r}");
     }
-    // python:tools uninstall is wired (codetainyrrr parity).
+    // python:tools uninstall is wired (reference parity).
     assert!(!cfg.recipe("python-tools").unwrap().uninstall.is_empty());
 }
 

@@ -11,7 +11,7 @@ use crate::orchestrator::run_step_pipeline;
 use crate::registry::ProcessorRegistry;
 use crate::reporter::Reporter;
 use serde_json::{Map, Value};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 /// Run task `name`: its `needs` first (each once, cycle-guarded), then the
 /// OS-selected step pipeline. `run_vars` (project.extra + env + answers) are
@@ -56,7 +56,47 @@ async fn run_inner(
     }
     stack.pop();
 
-    // Per-OS override (probe = std::env::consts::OS), else the default steps.
+    if task_gated_off(task, run_vars) {
+        rep.log(&format!("[task {name}] skipped (condition)"));
+        done.insert(name.to_string());
+        return Ok(());
+    }
+    run_task_body(name, cfg, reg, rep, inp, run_vars).await?;
+    done.insert(name.to_string());
+    Ok(())
+}
+
+/// A task's `when`/`unless` predicate decides if it runs. Gated-off tasks are
+/// skipped (treated as satisfied so dependents still run). Same grammar as
+/// step `when`/`unless`.
+fn task_gated_off(task: &crate::config::CompiledTask, run_vars: &Map<String, Value>) -> bool {
+    if let Some(w) = &task.when {
+        if !crate::wizard::eval_condition(w, run_vars) {
+            return true;
+        }
+    }
+    if let Some(u) = &task.unless {
+        if crate::wizard::eval_condition(u, run_vars) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Run a single task's own step pipeline (its `needs` are NOT run here — the
+/// caller orders them). Per-OS override probed via `std::env::consts::OS`.
+async fn run_task_body(
+    name: &str,
+    cfg: &LoadedConfig,
+    reg: &ProcessorRegistry,
+    rep: &dyn Reporter,
+    inp: &dyn InputResolver,
+    run_vars: &Map<String, Value>,
+) -> Result<()> {
+    let task = cfg
+        .tasks
+        .get(name)
+        .ok_or_else(|| EngineError::NotFound(format!("task '{name}'")))?;
     let os = std::env::consts::OS;
     let steps = task.os_steps.get(os).unwrap_or(&task.steps);
 
@@ -66,8 +106,98 @@ async fn run_inner(
     }
     ctx.set("task", name);
     rep.log(&format!("[task {name}] {} step(s)", steps.len()));
-    run_step_pipeline(reg, rep, inp, steps, &ctx, name).await?;
-    done.insert(name.to_string());
+    run_step_pipeline(reg, rep, inp, steps, &ctx, name).await
+}
+
+/// Run a batch of tasks honoring `needs` ordering, with per-task concurrency.
+///
+/// A task with `parallel = true` (or any task when `force_parallel`) may run
+/// alongside other parallel tasks whose `needs` are met, throttled by
+/// `max_parallel` (`0` = unbounded). A non-`parallel` task runs **exclusively**
+/// — alone, with nothing else concurrent. `needs` are pulled into the run
+/// automatically and each task runs once. Fail-fast: the first error after a
+/// wave aborts scheduling. The `needs` graph is cycle/unknown-checked at config
+/// load, so the schedule always makes progress.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_tasks(
+    names: &[String],
+    cfg: &LoadedConfig,
+    reg: &ProcessorRegistry,
+    rep: &dyn Reporter,
+    inp: &dyn InputResolver,
+    run_vars: &Map<String, Value>,
+    max_parallel: usize,
+    force_parallel: bool,
+) -> Result<()> {
+    // Transitive closure of requested tasks + their needs (BFS, deterministic).
+    let mut all: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<String> = names.iter().cloned().collect();
+    while let Some(n) = queue.pop_front() {
+        if !seen.insert(n.clone()) {
+            continue;
+        }
+        let task = cfg
+            .tasks
+            .get(&n)
+            .ok_or_else(|| EngineError::NotFound(format!("task '{n}'")))?;
+        for d in &task.needs {
+            queue.push_back(d.clone());
+        }
+        all.push(n);
+    }
+
+    let cap = if max_parallel == 0 { usize::MAX } else { max_parallel.max(1) };
+    let mut done: HashSet<String> = HashSet::new();
+    while done.len() < all.len() {
+        let ready: Vec<&String> = all
+            .iter()
+            .filter(|n| {
+                !done.contains(*n) && cfg.tasks[*n].needs.iter().all(|d| done.contains(d))
+            })
+            .collect();
+        if ready.is_empty() {
+            return Err(EngineError::Cycle(
+                "task scheduler stalled (no runnable task)".into(),
+            ));
+        }
+        // Gated-off ready tasks are skipped (satisfied) so dependents proceed.
+        let gated: Vec<String> = ready
+            .iter()
+            .filter(|n| task_gated_off(&cfg.tasks[**n], run_vars))
+            .map(|n| (*n).clone())
+            .collect();
+        if !gated.is_empty() {
+            for n in gated {
+                rep.log(&format!("[task {n}] skipped (condition)"));
+                done.insert(n);
+            }
+            continue;
+        }
+        // Parallel-eligible ready tasks run together (capped); otherwise a
+        // single exclusive task runs alone this wave.
+        let par: Vec<String> = ready
+            .iter()
+            .filter(|n| force_parallel || cfg.tasks[**n].parallel)
+            .map(|n| (*n).clone())
+            .take(cap)
+            .collect();
+        let batch = if par.is_empty() {
+            vec![ready[0].clone()]
+        } else {
+            par
+        };
+        let results = futures::future::join_all(
+            batch
+                .iter()
+                .map(|n| run_task_body(n, cfg, reg, rep, inp, run_vars)),
+        )
+        .await;
+        for (n, r) in batch.iter().zip(results) {
+            r?;
+            done.insert(n.clone());
+        }
+    }
     Ok(())
 }
 
@@ -245,5 +375,240 @@ mod tests {
         ));
         run("r", &c, &Map::new()).await.unwrap();
         assert_eq!(std::fs::read_to_string(&o).unwrap().trim(), "default");
+    }
+
+    async fn run_batch(
+        names: &[&str],
+        cfg: &LoadedConfig,
+        max_parallel: usize,
+        force_parallel: bool,
+    ) -> Result<()> {
+        let reg = crate::builtins(&cfg.settings);
+        let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        run_tasks(
+            &names,
+            cfg,
+            &reg,
+            &NullReporter,
+            &EnvResolver,
+            &Map::new(),
+            max_parallel,
+            force_parallel,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn run_tasks_runs_all_requested() {
+        if std::env::consts::OS == "windows" {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a").to_string_lossy().replace('\\', "/");
+        let b = dir.path().join("b").to_string_lossy().replace('\\', "/");
+        let c = cfg(&format!(
+            r#"
+            [task.a]
+            parallel = true
+            [[task.a.steps]]
+            type = "shell"
+            script = "echo a > '{a}'"
+            [task.b]
+            parallel = true
+            [[task.b.steps]]
+            type = "shell"
+            script = "echo b > '{b}'"
+            "#
+        ));
+        run_batch(&["a", "b"], &c, 0, false).await.unwrap();
+        assert!(std::path::Path::new(&a).exists());
+        assert!(std::path::Path::new(&b).exists());
+    }
+
+    #[tokio::test]
+    async fn run_tasks_honors_needs_even_when_parallel() {
+        // a needs b; even with concurrency, b must finish before a runs.
+        if std::env::consts::OS == "windows" {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("m").to_string_lossy().replace('\\', "/");
+        let c = cfg(&format!(
+            r#"
+            [task.b]
+            parallel = true
+            [[task.b.steps]]
+            type = "shell"
+            script = "echo b > '{marker}'"
+            [task.a]
+            needs = ["b"]
+            parallel = true
+            [[task.a.steps]]
+            type = "shell"
+            script = "test -f '{marker}'"
+            "#
+        ));
+        // request only `a`; `b` is pulled in as a need and ordered first
+        run_batch(&["a"], &c, 4, false).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn run_tasks_actually_overlaps_in_wall_time() {
+        let sleep_cmd = if std::env::consts::OS == "windows" {
+            "Start-Sleep -Seconds 2"
+        } else {
+            "sleep 2"
+        };
+        let c = cfg(&format!(
+            r#"
+            [task.a]
+            parallel = true
+            [[task.a.steps]]
+            type = "shell"
+            script = "{sleep_cmd}"
+            [task.b]
+            parallel = true
+            [[task.b.steps]]
+            type = "shell"
+            script = "{sleep_cmd}"
+            "#
+        ));
+        let t = std::time::Instant::now();
+        run_batch(&["a", "b"], &c, 0, false).await.unwrap();
+        let elapsed = t.elapsed();
+        // Two 2s sleeps run concurrently must finish well under 4s.
+        assert!(
+            elapsed < std::time::Duration::from_millis(3000),
+            "expected overlap, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tasks_single_task() {
+        if std::env::consts::OS == "windows" {
+            return;
+        }
+        let c = cfg(&format!(
+            "[task.go]\n[[task.go.steps]]\n{}",
+            echo_ok(std::env::consts::OS)
+        ));
+        run_batch(&["go"], &c, 0, false).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unflagged_tasks_run_exclusively_no_overlap() {
+        // Same two 2s-sleep tasks but WITHOUT parallel=true → they must run
+        // one at a time (exclusive), so wall time is ~4s, not ~2s.
+        let sleep_cmd = if std::env::consts::OS == "windows" {
+            "Start-Sleep -Seconds 2"
+        } else {
+            "sleep 2"
+        };
+        let c = cfg(&format!(
+            r#"
+            [task.a]
+            [[task.a.steps]]
+            type = "shell"
+            script = "{sleep_cmd}"
+            [task.b]
+            [[task.b.steps]]
+            type = "shell"
+            script = "{sleep_cmd}"
+            "#
+        ));
+        let t = std::time::Instant::now();
+        run_batch(&["a", "b"], &c, 0, false).await.unwrap();
+        assert!(
+            t.elapsed() >= std::time::Duration::from_millis(3000),
+            "exclusive tasks must not overlap"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn force_parallel_overrides_unflagged_tasks() {
+        // No parallel flags, but force_parallel=true → they overlap (~2s).
+        let sleep_cmd = if std::env::consts::OS == "windows" {
+            "Start-Sleep -Seconds 2"
+        } else {
+            "sleep 2"
+        };
+        let c = cfg(&format!(
+            r#"
+            [task.a]
+            [[task.a.steps]]
+            type = "shell"
+            script = "{sleep_cmd}"
+            [task.b]
+            [[task.b.steps]]
+            type = "shell"
+            script = "{sleep_cmd}"
+            "#
+        ));
+        let t = std::time::Instant::now();
+        run_batch(&["a", "b"], &c, 0, true).await.unwrap();
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(3000),
+            "force_parallel should overlap unflagged tasks"
+        );
+    }
+
+    async fn run_batch_vars(
+        names: &[&str],
+        cfg: &LoadedConfig,
+        v: &Map<String, Value>,
+    ) -> Result<()> {
+        let reg = crate::builtins(&cfg.settings);
+        let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        run_tasks(&names, cfg, &reg, &NullReporter, &EnvResolver, v, 0, false).await
+    }
+
+    #[tokio::test]
+    async fn task_when_gates_execution() {
+        if std::env::consts::OS == "windows" {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let m = dir.path().join("ran").to_string_lossy().replace('\\', "/");
+        let c = cfg(&format!(
+            r#"
+            [task.t]
+            when = "${{ON}} == '1'"
+            [[task.t.steps]]
+            type = "shell"
+            script = "echo x > '{m}'"
+            "#
+        ));
+        // condition false → skipped, no marker
+        run_batch_vars(&["t"], &c, &vars(&[("ON", "0")])).await.unwrap();
+        assert!(!std::path::Path::new(&m).exists(), "gated-off task must not run");
+        // condition true → runs
+        run_batch_vars(&["t"], &c, &vars(&[("ON", "1")])).await.unwrap();
+        assert!(std::path::Path::new(&m).exists(), "gated-on task must run");
+    }
+
+    #[tokio::test]
+    async fn dependent_runs_even_when_its_need_is_gated_off() {
+        if std::env::consts::OS == "windows" {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let m = dir.path().join("a-ran").to_string_lossy().replace('\\', "/");
+        let c = cfg(&format!(
+            r#"
+            [task.b]
+            when = "${{NEVER}} == '1'"   # NEVER is unset → gated off
+            [[task.b.steps]]
+            type = "shell"
+            script = "exit 1"
+            [task.a]
+            needs = ["b"]
+            [[task.a.steps]]
+            type = "shell"
+            script = "echo x > '{m}'"
+            "#
+        ));
+        // b is skipped (treated satisfied); a still runs.
+        run_batch_vars(&["a"], &c, &Map::new()).await.unwrap();
+        assert!(std::path::Path::new(&m).exists(), "dependent must run when need is gated off");
     }
 }

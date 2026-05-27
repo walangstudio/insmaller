@@ -1,5 +1,5 @@
 /// UI-agnostic progress/log sink. Replaces the direct `cliclack::log` leak
-/// that coupled the codetainyrrr orchestrator to a TUI. The container
+/// that coupled the reference installer's orchestrator to a TUI. The container
 /// injects a stdout reporter; an interactive host can inject a cliclack one.
 pub trait Reporter: Send + Sync {
     fn step_start(&self, key: &str, step_type: &str);
@@ -22,7 +22,7 @@ impl Reporter for StdoutReporter {
 }
 
 /// Structured reporter: one JSON object per event to stdout. Feeds CI / the
-/// codetainyrrr catalog-smoke status table.
+/// the reference installer catalog-smoke status table.
 pub struct JsonReporter;
 
 impl JsonReporter {

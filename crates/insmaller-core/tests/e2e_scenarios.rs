@@ -272,7 +272,7 @@ async fn real_sibling_catalog_loads_and_resolves() {
     let reg = builtins(&insmaller_core::Settings::default());
     let sd = tempfile::tempdir().unwrap();
     let sent = Sentinel::with_base(sd.path().into());
-    // Deps (uv/node/cargo) are codetainyrrr recipes in installer.toml; under
+    // Deps (uv/node/cargo) are the reference installer recipes in installer.toml; under
     // dry-run nothing spawns and the whole graph resolves.
     let keys: Vec<String> = ["mememo", "chatgipite", "gd-skills", "borch", "pair-pressure"]
         .iter()
