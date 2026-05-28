@@ -165,11 +165,12 @@ fn read_masked_line() -> std::io::Result<InteractiveLine> {
                 // corrupt the captured secret with control bytes the user
                 // can't see.
                 KeyCode::Char(_) if modifiers.contains(KeyModifiers::CONTROL) => {}
-                KeyCode::Backspace => {
-                    if buf.pop().is_some() {
-                        write!(out, "\x08 \x08")?;
-                        out.flush()?;
-                    }
+                // Match-guard form so the empty-buf case falls through
+                // silently (clippy::collapsible_match — pop() mutates either
+                // way, but on empty buf there's nothing to un-render).
+                KeyCode::Backspace if buf.pop().is_some() => {
+                    write!(out, "\x08 \x08")?;
+                    out.flush()?;
                 }
                 KeyCode::Char(c) => {
                     buf.push(c);
