@@ -26,6 +26,14 @@ pub trait InputResolver: Send + Sync {
     fn resolve(&self, key: &str, spec: &PromptSpec) -> ResolvedInput;
 }
 
+/// Read `key` from the process environment, treating an empty value as
+/// absent. The single definition of "env value present" — `EnvResolver` and
+/// the CLI's interactive resolver both go through this so the empty-is-absent
+/// rule can't drift between the interactive and non-interactive paths.
+pub fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.is_empty())
+}
+
 /// Container / non-interactive resolver: reads the environment only. A
 /// missing required value fails fast into the install summary; it can
 /// never block. This is the contract that keeps `entrypoint` safe.
@@ -33,13 +41,13 @@ pub struct EnvResolver;
 
 impl InputResolver for EnvResolver {
     fn resolve(&self, _key: &str, spec: &PromptSpec) -> ResolvedInput {
-        match std::env::var(&spec.env_key) {
-            Ok(v) if !v.is_empty() => ResolvedInput::Value(v),
-            _ if spec.required => ResolvedInput::Fail(format!(
+        match env_nonempty(&spec.env_key) {
+            Some(v) => ResolvedInput::Value(v),
+            None if spec.required => ResolvedInput::Fail(format!(
                 "input '{}' required but not set in environment (non-interactive context)",
                 spec.env_key
             )),
-            _ => ResolvedInput::Skip,
+            None => ResolvedInput::Skip,
         }
     }
 }

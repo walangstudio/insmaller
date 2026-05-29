@@ -409,12 +409,13 @@ async fn run_op(
     rep: &dyn Reporter,
     run_vars: Option<&Map<String, Value>>,
     cfg_p: &str,
+    purpose: ResolverPurpose,
 ) -> (InstallSummary, &'static str) {
     let mut reg = builtins(&cfg.settings);
     insmaller_core::register_external(&mut reg, &cfg.plugins);
     let sent = sentinel_for(cfg, cfg_p);
     let opts = insmaller_core::RunOpts { dry_run, force };
-    let resolver = make_resolver(&cfg.settings, ResolverPurpose::Operation);
+    let resolver = make_resolver(&cfg.settings, purpose);
     match op {
         Op::Install => (
             insmaller_core::install_many_with(
@@ -487,6 +488,7 @@ async fn cmd_op(a: &[String], op: Op, name: &str) -> ExitCode {
                 rep.as_ref(),
                 None,
                 &cfg_p,
+                ResolverPurpose::Operation,
             )
             .await;
             summarize(&s, verb)
@@ -631,7 +633,22 @@ async fn cmd_setup(a: &[String], name: &str) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let dry_run = has(a, "--dry-run");
-    if !tui_used {
+    // An interactively-run setup (the wizard TUI was used) is a TTY context
+    // where a `prompt` step in an install recipe should actually prompt —
+    // unless the user opted out with `interactive_tasks = false`. So the
+    // install phase gets ResolverPurpose::Task there, not the env-only
+    // Operation default that bare `insmaller install` uses.
+    let interactive_setup = tui_used && cfg.settings.interactive_tasks != Some(false);
+    let purpose = if interactive_setup {
+        ResolverPurpose::Task
+    } else {
+        ResolverPurpose::Operation
+    };
+    // The indicatif spinner (120 ms repaint) and a masked prompt fight over
+    // the same stdout, so the spinner is used ONLY when we won't prompt:
+    // the opted-out interactive case. The unattended path and any
+    // prompt-capable interactive path use the plain reporter.
+    if !tui_used || interactive_setup {
         let (s, verb) = run_op(
             &cfg,
             &cat,
@@ -642,35 +659,16 @@ async fn cmd_setup(a: &[String], name: &str) -> ExitCode {
             &StdoutReporter,
             Some(&outcome.vars),
             &cfg_p,
+            purpose,
         )
         .await;
         let code = summarize(&s, verb);
         render_outro();
         return code;
     }
-    // Interactive: indicatif spinner for the install phase. The bar must be
-    // cleared before the summary prints, hence run_op → finish → summarize.
-    // BUT: when the user explicitly opted into TTY prompts for operations
-    // (`interactive_tasks = true`), a `prompt` step in an install recipe
-    // would race the spinner's 120 ms repaint against the masked-input
-    // echo — fall back to plain stdout to keep the prompt readable.
-    if cfg.settings.interactive_tasks == Some(true) {
-        let (s, verb) = run_op(
-            &cfg,
-            &cat,
-            &outcome.selected_keys,
-            Op::Install,
-            dry_run,
-            false,
-            &StdoutReporter,
-            Some(&outcome.vars),
-            &cfg_p,
-        )
-        .await;
-        let code = summarize(&s, verb);
-        render_outro();
-        return code;
-    }
+    // tui_used + interactive_tasks == Some(false): env-only, so no prompt can
+    // fire — the spinner is safe. The bar must be cleared before the summary
+    // prints, hence run_op → finish → summarize.
     let bar = tui::BarReporter::new(palette);
     let (s, verb) = run_op(
         &cfg,
@@ -682,6 +680,7 @@ async fn cmd_setup(a: &[String], name: &str) -> ExitCode {
         &bar,
         Some(&outcome.vars),
         &cfg_p,
+        ResolverPurpose::Operation,
     )
     .await;
     bar.finish();

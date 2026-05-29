@@ -56,14 +56,31 @@ impl InteractiveIo for RealIo {
         std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
     }
     fn env(&self, key: &str) -> Option<String> {
-        std::env::var(key).ok().filter(|v| !v.is_empty())
+        // Shared with EnvResolver so the empty-is-absent rule has one source.
+        insmaller_core::env_nonempty(key)
     }
     fn read_line(&self, message: &str, secret: bool) -> std::io::Result<InteractiveLine> {
         if !self.is_tty() {
             return Ok(InteractiveLine::NoTty);
         }
-        // Serialize parallel interactive reads (see INTERACTIVE_LOCK).
-        // Poison is recoverable: we don't care about prior holder's state.
+        // The lock-wait and the human-speed read both block. `resolve()` is a
+        // sync trait method called from inside an async step on a tokio worker
+        // thread (PromptProcessor::run), so a naked blocking read parks a
+        // worker — starving step-timeout timers and any parallel task in the
+        // same wave. Run the whole critical section under `block_in_place` so
+        // tokio can move other tasks off this worker while we wait on the lock
+        // and on the user. (block_in_place panics on a current-thread runtime
+        // or off-runtime, hence the guard; tests drive FakeIo, not RealIo.)
+        maybe_block_in_place(|| self.read_line_blocking(message, secret))
+    }
+}
+
+impl RealIo {
+    /// The actual blocking read, factored out so `read_line` can wrap it in
+    /// `block_in_place`. Holds `INTERACTIVE_LOCK` for the full duration so two
+    /// concurrent prompts on the one shared terminal serialize.
+    fn read_line_blocking(&self, message: &str, secret: bool) -> std::io::Result<InteractiveLine> {
+        // Poison is recoverable: we don't care about a prior holder's state.
         let _guard = INTERACTIVE_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -81,6 +98,20 @@ impl InteractiveIo for RealIo {
             let trimmed = s.trim_end_matches(['\r', '\n']).to_string();
             Ok(InteractiveLine::Line(trimmed))
         }
+    }
+}
+
+/// Run `f` under `tokio::task::block_in_place` when on a multi-thread runtime
+/// (lets the scheduler relocate other tasks while this worker blocks); run it
+/// directly otherwise. `block_in_place` panics off-runtime and on a
+/// current-thread runtime, so both are checked first.
+fn maybe_block_in_place<T>(f: impl FnOnce() -> T) -> T {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
     }
 }
 
@@ -131,7 +162,13 @@ impl Drop for BracketedPasteGuard {
 /// double-count keystrokes.
 fn read_masked_line() -> std::io::Result<InteractiveLine> {
     let _raw = RawModeGuard::enable()?;
-    let _paste = BracketedPasteGuard::enable().ok();
+    // LOAD-BEARING: `_paste_guard` must live until the end of this function.
+    // Its Drop emits DisableBracketedPaste; dropping it early (e.g. rewriting
+    // to `let _ = …` or deleting the "unused" binding) turns paste mode off
+    // before the read loop and reintroduces the multi-line-paste leak. The
+    // `.ok()` is deliberate: a terminal without bracketed-paste support just
+    // falls back to per-key events, which the loop still handles correctly.
+    let _paste_guard = BracketedPasteGuard::enable().ok();
     let mut buf = String::new();
     let mut out = std::io::stdout();
     loop {
@@ -180,12 +217,12 @@ fn read_masked_line() -> std::io::Result<InteractiveLine> {
                 _ => {}
             },
             Event::Paste(s) => {
-                // A multi-line paste is collapsed onto the first line: drop
-                // newlines/control chars rather than terminating the read.
-                // (Pasting a single-line secret is the common case and works
-                // atomically; a multi-line paste is almost always operator
-                // error, and silently splitting it across prompts was worse.)
-                for c in s.chars().filter(|c| !c.is_control()) {
+                // Collapse a multi-line paste onto one line by dropping ONLY
+                // newlines/carriage-returns — keep every other char (incl.
+                // tabs and other control bytes) verbatim so a pasted secret
+                // isn't silently mutated. Masking hides corruption, so the
+                // captured value must equal the source minus line breaks.
+                for c in s.chars().filter(|&c| c != '\n' && c != '\r') {
                     buf.push(c);
                     write!(out, "*")?;
                 }
