@@ -39,7 +39,9 @@ pub use config::{
 pub use ctx::Ctx;
 pub use desugar::{desugar, Desugared};
 pub use error::{EngineError, Result};
-pub use input::{EnvResolver, InputResolver, PromptSpec, ResolvedInput, StaticResolver};
+pub use input::{
+    env_nonempty, EnvResolver, InputResolver, PromptSpec, ResolvedInput, StaticResolver,
+};
 pub use json_catalog::{Catalog, CatalogOption};
 pub use wizard::{
     choices_for_vars, collect_outcome, eval_condition, run_wizard, Answerer, Choice, Field,

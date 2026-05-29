@@ -4,6 +4,96 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.1] - 2026-05-29
+
+### Fixed
+- **Interactive prompts no longer block a tokio worker thread.** The blocking
+  stdin/crossterm read (and the `INTERACTIVE_LOCK` wait) now run under
+  `block_in_place` on the multi-thread runtime, so a `prompt`/`input` step
+  doesn't starve step-timeout timers or other parallel tasks in the same wave.
+- **Pasted secrets are no longer silently mutated.** A bracketed paste into a
+  `secret = true` prompt now strips only newlines/carriage-returns (to collapse
+  a multi-line paste); tabs and other bytes are kept verbatim so the captured
+  value matches the source.
+- **Setup-wizard install phase now prompts at the TTY.** Running `insmaller
+  setup` interactively gives install-recipe `prompt` steps a TTY resolver
+  (unless `interactive_tasks = false`), instead of failing fast env-only. The
+  spinner is suppressed on that path so a masked prompt isn't garbled by
+  repaints.
+- **Registry alias resolution follows chains and never advertises a dead
+  alias.** `get` walks alias→alias→canonical (cycle-bounded); `known` only
+  lists aliases that resolve to a registered processor, so the advertised set
+  equals the resolvable set.
+
+### Internal
+- `env_nonempty` helper in `insmaller-core` is the single definition of
+  "env value present" (empty = absent), shared by `EnvResolver` and the CLI's
+  interactive resolver.
+- Hardened the bracketed-paste guard against accidental early-drop and
+  collapsed a duplicated setup-install dispatch branch.
+
+## [0.5.0] - 2026-05-28
+
+### Added
+- **Interactive `prompt`/`input` task steps.** A `prompt`/`input` step in a
+  task may now read a value from the user on a TTY, including a masked secret
+  (`secret = true`). A new `confirm = "X"` param gates the step on exact match
+  (renders through ctx, so `confirm = "{{ project_name }}"` works; empty or
+  missing means no gate). The new `input` kind is a forwarded alias for the
+  existing `prompt` processor — a plugin that overrides `prompt` automatically
+  takes effect for `input` too. Cancelling an optional prompt (Esc / Ctrl+C /
+  Ctrl+D) returns Skip rather than aborting the task; required prompts still
+  Fail. Other Ctrl+letter chords (Ctrl+U, Ctrl+W, …) are silently dropped from
+  the secret buffer instead of pushed as literal control bytes. Bracketed
+  paste is enabled during a `secret` read so a pasted multi-line payload is
+  consumed as one value rather than leaked across prompts.
+- **`[settings] interactive_tasks`** (tri-state) controls when prompts read
+  stdin: `Some(true)` → on for every command (install/uninstall/setup/task);
+  `Some(false)` → off everywhere; `None` (default) → on for `task`, off for
+  install/uninstall/setup so the historical fail-fast contract for install
+  recipes is preserved unless explicitly opted in. Non-TTY runs always fall
+  back to env-only.
+- **`[settings] default_args`** prepended to the user's argv when
+  `default_command` fires. Together with the new dispatch logic this means
+  `insmaller`, `insmaller --dry-run`, and `insmaller foo` all route through
+  the configured default (with `default_args` ++ user args) instead of the
+  install catch-all; an explicit subcommand (`insmaller install x`) still
+  bypasses defaults. `--config` is honored at this dispatch layer too, so
+  default-command lookup respects the user's explicit config flag.
+
+### Changed
+- Dispatch no longer treats an unknown first token as install when
+  `default_command` is set — it goes through the configured default instead.
+  Behavior with no `default_command` is unchanged (bare → usage+fail; unknown
+  → install).
+- A malformed `installer.toml` encountered during default-command lookup
+  prints a stderr warning instead of being silently treated as 'no default'.
+
+### Fixed
+- **Windows legacy console double-keystroke** in the masked secret reader:
+  `crossterm::KeyEvent.kind` is now filtered to `Press`/`Repeat`, so a
+  Windows console that emits both Press and Release events no longer
+  records every typed character twice.
+- **Raw mode is now panic-safe**: the masked-input reader uses a Drop-based
+  `RawModeGuard` instead of inline cleanup, mirroring `tui.rs::TermGuard`.
+  A panic mid-read no longer leaves the terminal wedged in raw mode.
+- **Parallel-task race**: a process-global mutex serializes interactive
+  reads so two `[task].parallel = true` tasks each calling a `prompt` step
+  no longer race `enable_raw_mode` / `event::read` / `disable_raw_mode`
+  against each other.
+- **Stdout-redirected prompts**: `is_tty()` now requires both stdin AND
+  stdout to be terminals. `insmaller task t > log.txt` now defers to the
+  env fallback instead of writing the prompt invisibly to the log file
+  while the user types blind.
+- **`confirm` template error on absent optional step**: `ctx.render` for
+  `confirm` now happens inside the `Value(v)` arm, so a `confirm =
+  "{{ x }}"` with `x` undefined no longer errors an optional prompt that
+  would have skipped anyway.
+- **BarReporter race with prompts**: when `interactive_tasks = true` is
+  set, `cmd_setup`'s install phase uses the plain `StdoutReporter` instead
+  of the indicatif spinner so prompt output isn't overwritten by spinner
+  repaints.
+
 ## [0.4.0] - 2026-05-26
 
 ### Added

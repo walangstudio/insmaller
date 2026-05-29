@@ -15,7 +15,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub fn register(r: &mut ProcessorRegistry, settings: &crate::config::Settings) {
+    // `input` is an alias for `prompt` — the latter is the historical kind
+    // name, the former reads more naturally in task pipelines that collect a
+    // value from the user mid-run. Forwarding by name (not by Arc) so any
+    // later `register_external` override of `prompt` also rebinds `input`.
     r.register(Arc::new(PromptProcessor));
+    r.register_alias("input", "prompt");
     r.register(Arc::new(SaveInputProcessor));
     r.register(Arc::new(DownloadProcessor {
         allowed_origins: Arc::new(settings.auth_bearer_allowed_origins.clone()),
@@ -478,12 +483,30 @@ impl Processor for PromptProcessor {
         let (name, spec) = prompt_spec(step, ctx)?;
         match inp.resolve(&name, &spec) {
             ResolvedInput::Value(v) => {
+                // `confirm = "X"` (rendered through ctx so
+                // `{{ project_name }}`-style values work) aborts on mismatch.
+                // Missing OR empty-string ⇒ no confirmation gate (empty
+                // expected value would otherwise be unreachable: resolvers
+                // only emit Value(non-empty)).
+                let expect = step.param_str("confirm").filter(|s| !s.is_empty());
+                if let Some(raw) = expect {
+                    let exp = ctx.render(raw)?;
+                    if v != exp {
+                        bail!(
+                            "confirm: '{}' did not match expected value (aborting)",
+                            name
+                        );
+                    }
+                }
                 let mut out = StepOutput::value(v.clone());
                 out.register.insert(name, serde_json::Value::String(v));
                 Ok(out)
             }
             // Optional + not provided: register nothing; dependents must
             // declare `requires` so they skip rather than strict-undefined.
+            // A `confirm` on an optional + absent step is a no-op — by
+            // not rendering `expect` here, an undefined template var in
+            // confirm doesn't error a step that wouldn't have run anyway.
             ResolvedInput::Skip => Ok(StepOutput::skipped()),
             // Required + not provided in a non-interactive context: fail fast,
             // never block (the EnvResolver contract).
@@ -914,6 +937,109 @@ mod tests {
             &r,
         ));
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn prompt_confirm_match_succeeds() {
+        let mut m = HashMap::new();
+        m.insert("CONFIRM".to_string(), "RESET".to_string());
+        let r = StaticResolver(m);
+        let out = rt()
+            .block_on(PromptProcessor.run(
+                &step(
+                    "type=\"prompt\"\nname=\"CONFIRM\"\nrequired=true\nconfirm=\"RESET\"",
+                ),
+                &ctx(),
+                &NullReporter,
+                &r,
+            ))
+            .unwrap();
+        assert_eq!(out.register.get("CONFIRM").unwrap().as_str(), Some("RESET"));
+    }
+
+    #[test]
+    fn prompt_confirm_mismatch_aborts() {
+        let mut m = HashMap::new();
+        m.insert("CONFIRM".to_string(), "no".to_string());
+        let r = StaticResolver(m);
+        let res = rt().block_on(PromptProcessor.run(
+            &step(
+                "type=\"prompt\"\nname=\"CONFIRM\"\nrequired=true\nconfirm=\"RESET\"",
+            ),
+            &ctx(),
+            &NullReporter,
+            &r,
+        ));
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("confirm"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn prompt_confirm_renders_through_ctx() {
+        // expected value uses `{{ key }}` from ctx → "demo"
+        let mut m = HashMap::new();
+        m.insert("X".to_string(), "demo".to_string());
+        let r = StaticResolver(m);
+        let out = rt()
+            .block_on(PromptProcessor.run(
+                &step(
+                    "type=\"prompt\"\nname=\"X\"\nrequired=true\nconfirm=\"{{ key }}\"",
+                ),
+                &ctx(),
+                &NullReporter,
+                &r,
+            ))
+            .unwrap();
+        assert_eq!(out.register.get("X").unwrap().as_str(), Some("demo"));
+    }
+
+    #[test]
+    fn input_alias_reaches_prompt_processor() {
+        // `register()` binds prompt under "prompt" and forwards "input" → "prompt";
+        // a recipe written `type = "input"` resolves to the same processor.
+        let mut reg = ProcessorRegistry::new();
+        register(&mut reg, &crate::config::Settings::default());
+        let prompt = reg.get("prompt").expect("prompt missing");
+        let input = reg.get("input").expect("input alias missing");
+        assert!(Arc::ptr_eq(&prompt, &input));
+    }
+
+    #[test]
+    fn prompt_confirm_empty_string_is_no_gate() {
+        // `confirm = ""` (after this change) means no confirmation, matching
+        // the doc-comment promise. Pre-fix this aborted the step because the
+        // empty expected value could never match the (non-empty) resolved
+        // value.
+        let mut m = HashMap::new();
+        m.insert("X".to_string(), "anything".to_string());
+        let r = StaticResolver(m);
+        let out = rt()
+            .block_on(PromptProcessor.run(
+                &step("type=\"prompt\"\nname=\"X\"\nrequired=true\nconfirm=\"\""),
+                &ctx(),
+                &NullReporter,
+                &r,
+            ))
+            .unwrap();
+        assert_eq!(out.register.get("X").unwrap().as_str(), Some("anything"));
+    }
+
+    #[test]
+    fn prompt_optional_absent_does_not_render_confirm() {
+        // Optional + absent: resolver returns Skip BEFORE we render `confirm`,
+        // so an undefined template var in `confirm` must NOT error the step.
+        let r = StaticResolver(HashMap::new());
+        let out = rt()
+            .block_on(PromptProcessor.run(
+                &step(
+                    "type=\"prompt\"\nname=\"OPT\"\nrequired=false\nconfirm=\"{{ definitely_not_in_ctx }}\"",
+                ),
+                &ctx(),
+                &NullReporter,
+                &r,
+            ))
+            .unwrap();
+        assert!(out.skipped);
     }
 
     #[test]

@@ -13,13 +13,14 @@
 //! env so prompt/save_input/EnvResolver pick them up). `--answers` makes
 //! `setup` fully unattended (non-blocking).
 
+mod interactive;
 mod theme;
 mod tui;
 
 use insmaller_core::{
-    builtins, run_wizard, Catalog, Ctx, EnvResolver, InstallSummary, LoadedConfig, Reporter,
-    Sentinel, SentinelData, StaticAnswerer, StdoutReporter, WizardDef, WizardOutcome,
-    WizardSession,
+    builtins, run_wizard, Catalog, Ctx, EnvResolver, InputResolver, InstallSummary, LoadedConfig,
+    Reporter, Sentinel, SentinelData, Settings, StaticAnswerer, StdoutReporter, WizardDef,
+    WizardOutcome, WizardSession,
 };
 use serde_json::{Map, Value};
 use std::io::IsTerminal;
@@ -256,44 +257,80 @@ fn usage_text(name: &str) -> String {
 async fn main() -> ExitCode {
     let name = program_name();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
-        Some("install") => cmd_op(&args[1..], Op::Install, &name).await,
-        Some("uninstall") | Some("remove") => cmd_op(&args[1..], Op::Uninstall, &name).await,
-        Some("setup") => cmd_setup(&args[1..], &name).await,
-        Some("task") | Some("run") => cmd_task(&args[1..], &name).await,
-        Some("status") | Some("query") => cmd_status(&args[1..], &name).await,
-        Some("-V") | Some("--version") | Some("version") => {
-            println!("{name} {}", env!("CARGO_PKG_VERSION"));
-            ExitCode::SUCCESS
+    if let Some(first) = args.first().map(String::as_str) {
+        match first {
+            "install" => return cmd_op(&args[1..], Op::Install, &name).await,
+            "uninstall" | "remove" => return cmd_op(&args[1..], Op::Uninstall, &name).await,
+            "setup" => return cmd_setup(&args[1..], &name).await,
+            "task" | "run" => return cmd_task(&args[1..], &name).await,
+            "status" | "query" => return cmd_status(&args[1..], &name).await,
+            "-V" | "--version" | "version" => {
+                println!("{name} {}", env!("CARGO_PKG_VERSION"));
+                return ExitCode::SUCCESS;
+            }
+            "-h" | "--help" | "help" => {
+                println!("{}", usage_text(&name));
+                return ExitCode::SUCCESS;
+            }
+            _ => {}
         }
-        Some("-h") | Some("--help") | Some("help") => {
-            println!("{}", usage_text(&name));
-            ExitCode::SUCCESS
-        }
-        // No args: run `[settings] default_command` if configured, else usage.
-        None => run_default_command(&name).await,
-        // insmaller is an installer: anything else is treated as install keys.
-        _ => cmd_op(&args, Op::Install, &name).await,
     }
+    // No recognized subcommand. If `[settings] default_command` is set,
+    // route through it (with `default_args` prepended) so a configured
+    // default absorbs both the bare-invocation and the unknown-arg cases —
+    // `insmaller`, `insmaller --dry-run`, and `insmaller foo` all reach the
+    // same place. Falls back to the historical behavior (bare = usage+fail,
+    // unknown = install catch-all) when no default is configured.
+    //
+    // `--config` must be honored at THIS layer too — otherwise a user
+    // pointing the binary at a custom config gets dispatch driven by an
+    // unrelated sibling/parent `installer.toml`.
+    let cfg_p = discover_config(opt_opt(&args, "--config"), &name);
+    let (default_cmd, default_args) = match LoadedConfig::from_path(Path::new(&cfg_p)) {
+        Ok(c) => (c.settings.default_command, c.settings.default_args),
+        Err(e) => {
+            // Silently treating a malformed config as 'no default' makes a
+            // syntax error invisible at this layer — warn so the user sees
+            // it (the inner cmd_* would surface the same parse error when
+            // it tries to load, but only if it gets that far; e.g. -h
+            // doesn't). Only warn when the path actually exists, so a clean
+            // `insmaller -h` in a config-less directory stays quiet.
+            if Path::new(&cfg_p).exists() {
+                eprintln!("config load warning ({cfg_p}): {e}");
+            }
+            (None, vec![])
+        }
+    };
+    if let Some(cmd) = default_cmd {
+        // Skip the chain+collect allocation when there's nothing to prepend.
+        let effective: Vec<String> = if default_args.is_empty() {
+            args
+        } else {
+            default_args.into_iter().chain(args).collect()
+        };
+        return dispatch_named(&cmd, &effective, &name).await;
+    }
+    if args.is_empty() {
+        eprintln!("{}", usage_text(&name));
+        return ExitCode::FAILURE;
+    }
+    cmd_op(&args, Op::Install, &name).await
 }
 
-/// No-arg behavior: dispatch to `[settings] default_command` if the discovered
-/// config sets one; otherwise print usage and fail (the historical behavior).
-async fn run_default_command(name: &str) -> ExitCode {
-    let cfg_p = discover_config(None, name);
-    let default = LoadedConfig::from_path(Path::new(&cfg_p))
-        .ok()
-        .and_then(|c| c.settings.default_command.clone());
-    match default.as_deref() {
-        Some("setup") => cmd_setup(&[], name).await,
-        Some("install") => cmd_op(&[], Op::Install, name).await,
-        Some("status") | Some("query") => cmd_status(&[], name).await,
-        Some(other) => {
+/// Shared dispatch from a command name string to the matching cmd_* function.
+/// Used by both the default-command path and any future caller (e.g. recipes
+/// that want to invoke a sibling command). Unknown names are a config error
+/// (the validation point is here, not at parse time, so a missing config
+/// still gets a sensible error).
+async fn dispatch_named(cmd: &str, args: &[String], name: &str) -> ExitCode {
+    match cmd {
+        "setup" => cmd_setup(args, name).await,
+        "install" => cmd_op(args, Op::Install, name).await,
+        "uninstall" | "remove" => cmd_op(args, Op::Uninstall, name).await,
+        "task" | "run" => cmd_task(args, name).await,
+        "status" | "query" => cmd_status(args, name).await,
+        other => {
             eprintln!("config error: unknown default_command '{other}'");
-            eprintln!("{}", usage_text(name));
-            ExitCode::FAILURE
-        }
-        None => {
             eprintln!("{}", usage_text(name));
             ExitCode::FAILURE
         }
@@ -326,6 +363,41 @@ fn sentinel_for(cfg: &LoadedConfig, cfg_p: &str) -> Sentinel {
     Sentinel::resolve(&cfg.settings, Path::new(cfg_p).parent())
 }
 
+/// Whether this resolver belongs to an interactive task pipeline (where
+/// auto-on prompting is the documented default) or an install/uninstall
+/// operation (where the pre-0.5 contract was env-only and any TTY prompting
+/// has to be opt-in to avoid surprising existing CI scripts that ran
+/// `insmaller install` with stdin attached).
+#[derive(Clone, Copy)]
+enum ResolverPurpose {
+    Task,
+    Operation,
+}
+
+/// `prompt`/`input` resolver chosen from `[settings] interactive_tasks` and
+/// the resolver's purpose. `Some(false)` ⇒ env-only everywhere (the
+/// opt-out). `Some(true)` ⇒ interactive everywhere (force-on). `None`
+/// (default) ⇒ interactive only for tasks; install/uninstall stay env-only
+/// so a `prompt` step in an install recipe still fails fast on missing env,
+/// preserving the historical fail-fast contract. The wrapped fallback is
+/// always `EnvResolver`, so the structurally-non-blocking guarantee holds
+/// whichever branch is taken.
+fn make_resolver(settings: &Settings, purpose: ResolverPurpose) -> Box<dyn InputResolver> {
+    let want_interactive = match settings.interactive_tasks {
+        Some(true) => true,
+        Some(false) => false,
+        None => matches!(purpose, ResolverPurpose::Task),
+    };
+    if want_interactive {
+        Box::new(interactive::InteractiveResolver::new(
+            interactive::RealIo,
+            EnvResolver,
+        ))
+    } else {
+        Box::new(EnvResolver)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_op(
     cfg: &LoadedConfig,
@@ -337,22 +409,24 @@ async fn run_op(
     rep: &dyn Reporter,
     run_vars: Option<&Map<String, Value>>,
     cfg_p: &str,
+    purpose: ResolverPurpose,
 ) -> (InstallSummary, &'static str) {
     let mut reg = builtins(&cfg.settings);
     insmaller_core::register_external(&mut reg, &cfg.plugins);
     let sent = sentinel_for(cfg, cfg_p);
     let opts = insmaller_core::RunOpts { dry_run, force };
+    let resolver = make_resolver(&cfg.settings, purpose);
     match op {
         Op::Install => (
             insmaller_core::install_many_with(
-                cat, cfg, &reg, rep, &EnvResolver, &sent, keys, opts, run_vars,
+                cat, cfg, &reg, rep, resolver.as_ref(), &sent, keys, opts, run_vars,
             )
             .await,
             "ok",
         ),
         Op::Uninstall => (
             insmaller_core::uninstall_many_with(
-                cat, cfg, &reg, rep, &EnvResolver, &sent, keys, opts,
+                cat, cfg, &reg, rep, resolver.as_ref(), &sent, keys, opts,
             )
             .await,
             "uninstalled",
@@ -414,6 +488,7 @@ async fn cmd_op(a: &[String], op: Op, name: &str) -> ExitCode {
                 rep.as_ref(),
                 None,
                 &cfg_p,
+                ResolverPurpose::Operation,
             )
             .await;
             summarize(&s, verb)
@@ -558,7 +633,22 @@ async fn cmd_setup(a: &[String], name: &str) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let dry_run = has(a, "--dry-run");
-    if !tui_used {
+    // An interactively-run setup (the wizard TUI was used) is a TTY context
+    // where a `prompt` step in an install recipe should actually prompt —
+    // unless the user opted out with `interactive_tasks = false`. So the
+    // install phase gets ResolverPurpose::Task there, not the env-only
+    // Operation default that bare `insmaller install` uses.
+    let interactive_setup = tui_used && cfg.settings.interactive_tasks != Some(false);
+    let purpose = if interactive_setup {
+        ResolverPurpose::Task
+    } else {
+        ResolverPurpose::Operation
+    };
+    // The indicatif spinner (120 ms repaint) and a masked prompt fight over
+    // the same stdout, so the spinner is used ONLY when we won't prompt:
+    // the opted-out interactive case. The unattended path and any
+    // prompt-capable interactive path use the plain reporter.
+    if !tui_used || interactive_setup {
         let (s, verb) = run_op(
             &cfg,
             &cat,
@@ -569,14 +659,16 @@ async fn cmd_setup(a: &[String], name: &str) -> ExitCode {
             &StdoutReporter,
             Some(&outcome.vars),
             &cfg_p,
+            purpose,
         )
         .await;
         let code = summarize(&s, verb);
         render_outro();
         return code;
     }
-    // Interactive: indicatif spinner for the install phase. The bar must be
-    // cleared before the summary prints, hence run_op → finish → summarize.
+    // tui_used + interactive_tasks == Some(false): env-only, so no prompt can
+    // fire — the spinner is safe. The bar must be cleared before the summary
+    // prints, hence run_op → finish → summarize.
     let bar = tui::BarReporter::new(palette);
     let (s, verb) = run_op(
         &cfg,
@@ -588,6 +680,7 @@ async fn cmd_setup(a: &[String], name: &str) -> ExitCode {
         &bar,
         Some(&outcome.vars),
         &cfg_p,
+        ResolverPurpose::Operation,
     )
     .await;
     bar.finish();
@@ -664,12 +757,13 @@ async fn cmd_task(a: &[String], name: &str) -> ExitCode {
         None => cfg.settings.max_parallel_tasks,
     };
 
+    let resolver = make_resolver(&cfg.settings, ResolverPurpose::Task);
     match insmaller_core::run_tasks(
         &names,
         &cfg,
         &reg,
         &StdoutReporter,
-        &EnvResolver,
+        resolver.as_ref(),
         &run_vars,
         max_parallel,
         force_parallel,

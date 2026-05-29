@@ -104,6 +104,160 @@ fn no_args_runs_default_command() {
 }
 
 #[test]
+fn default_command_with_args_routes_to_default() {
+    // `default_command = "status"` + `--json` → the flag must reach cmd_status
+    // (proving the unknown-arg path went through the configured default, not
+    // the install catch-all).
+    let bin = env!("CARGO_BIN_EXE_insmaller");
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("installer.toml"),
+        "[settings]\ndefault_command = \"status\"\n",
+    )
+    .unwrap();
+    let out = Command::new(bin)
+        .args(["--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("run");
+    assert!(
+        out.status.success(),
+        "default_command should absorb --json\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // cmd_status --json emits a JSON array (possibly empty).
+    assert!(
+        stdout.trim_start().starts_with('['),
+        "expected JSON array from status --json, got: {stdout}",
+    );
+}
+
+#[test]
+fn default_args_are_prepended_to_user_args() {
+    // `default_command = "task"` + `default_args = ["help-task"]`:
+    // bare invocation must run the named task (proves prepended args reach
+    // cmd_task), and a user-supplied `--jobs 1` must still parse (proves the
+    // splice keeps user flags too).
+    let bin = env!("CARGO_BIN_EXE_insmaller");
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("ran").display().to_string().replace('\\', "/");
+    let marker2 = dir
+        .path()
+        .join("ran2")
+        .display()
+        .to_string()
+        .replace('\\', "/");
+    let script1 = if cfg!(windows) {
+        format!("cmd /C echo ok > {marker}")
+    } else {
+        format!("echo ok > {marker}")
+    };
+    let script2 = if cfg!(windows) {
+        format!("cmd /C echo ok > {marker2}")
+    } else {
+        format!("echo ok > {marker2}")
+    };
+    fs::write(
+        dir.path().join("installer.toml"),
+        format!(
+            r#"[settings]
+default_command = "task"
+default_args = ["help-task"]
+
+[task.help-task]
+[[task.help-task.steps]]
+type = "shell"
+script = "{script1}"
+"#
+        ),
+    )
+    .unwrap();
+    let out = Command::new(bin)
+        .current_dir(dir.path())
+        .output()
+        .expect("run");
+    assert!(
+        out.status.success(),
+        "bare invocation should run the configured task\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(std::path::Path::new(&marker).exists(), "task did not run");
+
+    // Second run: user adds `--jobs 1`; default_args is still prepended, the
+    // user flag is appended, and the task picks up the same step.
+    fs::remove_file(&marker).unwrap();
+    fs::write(
+        dir.path().join("installer.toml"),
+        format!(
+            r#"[settings]
+default_command = "task"
+default_args = ["help-task"]
+
+[task.help-task]
+[[task.help-task.steps]]
+type = "shell"
+script = "{script2}"
+"#
+        ),
+    )
+    .unwrap();
+    let out2 = Command::new(bin)
+        .args(["--jobs", "1"])
+        .current_dir(dir.path())
+        .output()
+        .expect("run");
+    assert!(
+        out2.status.success(),
+        "default + user --jobs 1 should succeed\nstderr: {}",
+        String::from_utf8_lossy(&out2.stderr),
+    );
+    assert!(
+        std::path::Path::new(&marker2).exists(),
+        "task did not run with --jobs 1",
+    );
+}
+
+#[test]
+fn explicit_subcommand_ignores_default_args() {
+    // When the user passes a recognized subcommand, default_args MUST NOT be
+    // spliced in — explicit always wins. Use `status` (always succeeds, no
+    // side effects); `default_args` pointing at something garbage proves it
+    // wasn't appended (status would otherwise treat it as a filter and emit
+    // "nothing installed" rather than failing — so we check stderr, not exit).
+    let bin = env!("CARGO_BIN_EXE_insmaller");
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("installer.toml"),
+        r#"[settings]
+default_command = "install"
+default_args = ["should-not-appear"]
+"#,
+    )
+    .unwrap();
+    // `status` runs cleanly without any reference to the default_args entry.
+    let out = Command::new(bin)
+        .args(["status"])
+        .current_dir(dir.path())
+        .output()
+        .expect("run");
+    assert!(
+        out.status.success(),
+        "explicit `status` must succeed regardless of default_args\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        !combined.contains("should-not-appear"),
+        "explicit subcommand must not see default_args; got: {combined}",
+    );
+}
+
+#[test]
 fn parallel_runs_all_named_tasks() {
     let bin = env!("CARGO_BIN_EXE_insmaller");
     let dir = tempfile::tempdir().unwrap();
