@@ -4,6 +4,34 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.1] - 2026-05-29
+
+### Fixed
+- **Interactive prompts no longer block a tokio worker thread.** The blocking
+  stdin/crossterm read (and the `INTERACTIVE_LOCK` wait) now run under
+  `block_in_place` on the multi-thread runtime, so a `prompt`/`input` step
+  doesn't starve step-timeout timers or other parallel tasks in the same wave.
+- **Pasted secrets are no longer silently mutated.** A bracketed paste into a
+  `secret = true` prompt now strips only newlines/carriage-returns (to collapse
+  a multi-line paste); tabs and other bytes are kept verbatim so the captured
+  value matches the source.
+- **Setup-wizard install phase now prompts at the TTY.** Running `insmaller
+  setup` interactively gives install-recipe `prompt` steps a TTY resolver
+  (unless `interactive_tasks = false`), instead of failing fast env-only. The
+  spinner is suppressed on that path so a masked prompt isn't garbled by
+  repaints.
+- **Registry alias resolution follows chains and never advertises a dead
+  alias.** `get` walks alias→alias→canonical (cycle-bounded); `known` only
+  lists aliases that resolve to a registered processor, so the advertised set
+  equals the resolvable set.
+
+### Internal
+- `env_nonempty` helper in `insmaller-core` is the single definition of
+  "env value present" (empty = absent), shared by `EnvResolver` and the CLI's
+  interactive resolver.
+- Hardened the bracketed-paste guard against accidental early-drop and
+  collapsed a duplicated setup-install dispatch branch.
+
 ## [0.5.0] - 2026-05-28
 
 ### Added

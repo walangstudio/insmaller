@@ -22,3 +22,30 @@ name = "hello"
 [[recipe.install]]
 type = "shell"
 script = "echo hello-from-recipe {{ arg }}"
+
+# ── 0.5.0 demos ──────────────────────────────────────────────────────────────
+# Try:  insmaller --config examples/demo.installer.toml task reset
+#       insmaller --config examples/demo.installer.toml task token
+# (non-Windows: the script bodies below also work; cmd /C is Windows-only)
+
+# Interactive confirm gate: prompts, aborts unless you type RESET exactly.
+[task.reset]
+[[task.reset.steps]]
+type = "input"
+name = "CONFIRM"
+required = true
+confirm = "RESET"
+[[task.reset.steps]]
+type = "shell"
+script = "echo confirmed-reset"
+
+# Masked secret: characters echo as `*`; the value never prints in plaintext.
+[task.token]
+[[task.token.steps]]
+type = "prompt"
+name = "API_TOKEN"
+required = true
+secret = true
+[[task.token.steps]]
+type = "shell"
+script = "echo got a token of length {{ API_TOKEN | length }}"

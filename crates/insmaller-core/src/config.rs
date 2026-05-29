@@ -196,6 +196,14 @@ pub struct Settings {
     /// element = one argv slot; no shell parsing. Lets a config bake in
     /// baseline flags (`["--answers", "/etc/answers.toml"]`) that the user
     /// can still extend on the command line.
+    ///
+    /// Precedence note: this config is the one that selects `default_command`
+    /// and supplies `default_args`. If `default_args` itself carries a
+    /// `--config OTHER`, the dispatched subcommand re-resolves to `OTHER` —
+    /// so the routing decision is made from THIS config while the command
+    /// then runs against `OTHER`. That two-config "bootstrap → real config"
+    /// split is intentional; keep `--config` out of `default_args` unless you
+    /// want it.
     #[serde(default)]
     pub default_args: Vec<String>,
     /// Whether task-level `prompt`/`input` steps may read stdin on a TTY.
