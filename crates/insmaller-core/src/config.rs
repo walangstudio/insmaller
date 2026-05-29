@@ -186,9 +186,32 @@ pub struct Settings {
     #[serde(default)]
     pub expanded_groups: Vec<String>,
     /// Command run when the binary is invoked with no arguments, e.g.
-    /// `"setup"`. Absent ⇒ print usage (the historical behavior).
+    /// `"setup"`. Absent ⇒ print usage (the historical behavior). When set,
+    /// it also captures the "unknown first token" path so `insmaller
+    /// --dry-run` and `insmaller foo` route through this command instead of
+    /// the install catch-all.
     #[serde(default)]
     pub default_command: Option<String>,
+    /// Args prepended to the user's argv when `default_command` fires. One
+    /// element = one argv slot; no shell parsing. Lets a config bake in
+    /// baseline flags (`["--answers", "/etc/answers.toml"]`) that the user
+    /// can still extend on the command line.
+    ///
+    /// Precedence note: this config is the one that selects `default_command`
+    /// and supplies `default_args`. If `default_args` itself carries a
+    /// `--config OTHER`, the dispatched subcommand re-resolves to `OTHER` —
+    /// so the routing decision is made from THIS config while the command
+    /// then runs against `OTHER`. That two-config "bootstrap → real config"
+    /// split is intentional; keep `--config` out of `default_args` unless you
+    /// want it.
+    #[serde(default)]
+    pub default_args: Vec<String>,
+    /// Whether task-level `prompt`/`input` steps may read stdin on a TTY.
+    /// `None` (default) = auto: on when stdin is a TTY, else env-only. `Some(true)`
+    /// = force on (still no-ops without a TTY). `Some(false)` = force off
+    /// (env-only everywhere, preserves the pre-0.5 contract).
+    #[serde(default)]
+    pub interactive_tasks: Option<bool>,
     /// Throttle on how many `parallel = true` tasks run at once. `0` (default)
     /// = unbounded; `n` = at most n concurrently. Concurrency is opt-in per
     /// task (see `[task].parallel`); this only caps it. `needs` ordering is
@@ -272,6 +295,8 @@ impl Default for Settings {
             collapsed_groups: vec![],
             expanded_groups: vec![],
             default_command: None,
+            default_args: vec![],
+            interactive_tasks: None,
             max_parallel_tasks: 0,
         }
     }
@@ -728,6 +753,37 @@ mod tests {
         let cfg =
             LoadedConfig::from_str("[settings]\nprefer_bash_on_windows = true\n").unwrap();
         assert!(cfg.settings.prefer_bash_on_windows);
+    }
+
+    #[test]
+    fn default_args_round_trip_and_defaults_empty() {
+        let def = LoadedConfig::from_str("").unwrap();
+        assert!(def.settings.default_args.is_empty());
+        let cfg = LoadedConfig::from_str(
+            r#"
+            [settings]
+            default_command = "setup"
+            default_args = ["--answers", "/etc/answers.toml"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.settings.default_command.as_deref(), Some("setup"));
+        assert_eq!(
+            cfg.settings.default_args,
+            vec!["--answers".to_string(), "/etc/answers.toml".to_string()]
+        );
+    }
+
+    #[test]
+    fn interactive_tasks_round_trip_tri_state() {
+        let def = LoadedConfig::from_str("").unwrap();
+        assert!(def.settings.interactive_tasks.is_none());
+        let on =
+            LoadedConfig::from_str("[settings]\ninteractive_tasks = true\n").unwrap();
+        assert_eq!(on.settings.interactive_tasks, Some(true));
+        let off =
+            LoadedConfig::from_str("[settings]\ninteractive_tasks = false\n").unwrap();
+        assert_eq!(off.settings.interactive_tasks, Some(false));
     }
 
     #[test]
