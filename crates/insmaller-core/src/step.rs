@@ -34,13 +34,14 @@ pub struct Step {
     pub requires: Vec<String>,
     /// Bind the processor's `value` output under this name for later steps.
     pub register_as: Option<String>,
-    /// Generic value gate: after the step runs and produces a value, abort the
+    /// Value gate: after the step runs and produces a scalar value, abort the
     /// pipeline unless that value equals this (rendered through `Ctx`, so
-    /// `confirm = "{{ project_name }}"` works). Empty/absent = no gate. A
-    /// skipped step (optional input not provided) produces no value, so the
-    /// gate is a no-op there. Applies to any value-producing step (`prompt`,
-    /// `input`, `save_input`, an `exec` bound with `register_as`, …) — the
-    /// orchestrator enforces it, not the processor.
+    /// `confirm = "{{ project_name }}"` works). Empty/absent = no gate. A step
+    /// that produces no scalar value — a skipped optional input, or any
+    /// processor that returns no value (`shell`/`exec`/`copy`/… all do) — is a
+    /// no-op, NOT an abort. So `confirm` is only meaningful on value-producing
+    /// steps: `prompt`, `input`, and `save_input`. The orchestrator enforces
+    /// it (not the processor) so every such step gets it uniformly.
     pub confirm: Option<String>,
     pub continue_on_error: bool,
     /// Per-step wall-clock timeout in seconds (engine-applied, all processors).
@@ -208,6 +209,20 @@ mod tests {
     fn missing_type_is_config_error() {
         let err = Step::from_table(table(r#"script = "echo hi""#)).unwrap_err();
         assert!(matches!(err, EngineError::Config(_)));
+    }
+
+    #[test]
+    fn confirm_parses_and_empty_is_no_gate() {
+        let s = Step::from_table(table("type=\"prompt\"\nconfirm=\"RESET\"")).unwrap();
+        assert_eq!(s.confirm.as_deref(), Some("RESET"));
+        // Empty string ⇒ no gate (filtered to None), and it's lifted out of
+        // params so a processor can't re-read it.
+        let e = Step::from_table(table("type=\"prompt\"\nconfirm=\"\"")).unwrap();
+        assert_eq!(e.confirm, None);
+        assert!(e.params.get("confirm").is_none());
+        // Absent ⇒ None.
+        let n = Step::from_table(table("type=\"prompt\"")).unwrap();
+        assert_eq!(n.confirm, None);
     }
 
     #[test]

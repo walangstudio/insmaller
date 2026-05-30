@@ -4,6 +4,29 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.3] - 2026-05-29
+
+### Fixed
+- **`confirm` no longer aborts value-less steps.** The gate now only applies
+  to steps that produce a scalar value (`prompt`/`input`/`save_input`); on a
+  step with no value (`shell`/`exec`/`copy`/…) it's a no-op instead of an
+  unconditional abort. Comparison uses the engine's `scalar_str`, so a
+  Bool/Number value compares as `true`/`42` (not its JSON form), matching how
+  `write_env`/registers stringify the same value. The mismatch error now names
+  the step (kind + `register_as`) for diagnosability — never the value.
+- **No-subcommand dispatch reads settings with a typed parse.** `default_command`/
+  `default_args` are now deserialized (type-checked, rename-tracking) instead
+  of hand-walked from raw TOML — a non-string `default_args` element or a
+  non-string `default_command` is now an error (warned + ignored) rather than
+  silently dropped, matching the authoritative config load.
+- **Masked secret prompt cancels on uppercase Ctrl+C/Ctrl+D too** (CapsLock /
+  Ctrl+Shift), not just lowercase.
+
+### Internal
+- `scalar_str` is shared between the env writer and the `confirm` gate (one
+  value→string rule). The `confirm` doc clarifies it's only meaningful on
+  value-producing steps and that a mismatch is not retried.
+
 ## [0.5.2] - 2026-05-29
 
 ### Changed

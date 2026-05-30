@@ -302,6 +302,32 @@ impl Default for Settings {
     }
 }
 
+/// Read ONLY `[settings] default_command`/`default_args` from a config TOML
+/// string, type-checked, without building a full `EngineConfig` (no recipes,
+/// plugins, or cross-ref). Used by the CLI's no-subcommand dispatch so routing
+/// is decided by a typed parse — which tracks any serde rename of these fields
+/// and rejects a wrong-typed value exactly as the authoritative load would —
+/// rather than a hand-walk of raw TOML that silently drops/ignores them. Other
+/// top-level keys and other `[settings]` fields are ignored; a TOML syntax
+/// error or a wrong type on these two fields is an error.
+pub fn peek_dispatch_settings(toml_str: &str) -> Result<(Option<String>, Vec<String>)> {
+    #[derive(Deserialize, Default)]
+    struct DispatchSettings {
+        #[serde(default)]
+        default_command: Option<String>,
+        #[serde(default)]
+        default_args: Vec<String>,
+    }
+    #[derive(Deserialize, Default)]
+    struct DispatchPeek {
+        #[serde(default)]
+        settings: DispatchSettings,
+    }
+    let peek: DispatchPeek =
+        toml::from_str(toml_str).map_err(|e| EngineError::Config(e.to_string()))?;
+    Ok((peek.settings.default_command, peek.settings.default_args))
+}
+
 fn default_sentinel_dir() -> String {
     "insmaller".to_string()
 }
@@ -772,6 +798,24 @@ mod tests {
             cfg.settings.default_args,
             vec!["--answers".to_string(), "/etc/answers.toml".to_string()]
         );
+    }
+
+    #[test]
+    fn peek_dispatch_settings_typed_and_strict() {
+        // Reads the two fields, ignoring recipes/other settings.
+        let (cmd, args) = peek_dispatch_settings(
+            "[settings]\ndefault_command = \"setup\"\ndefault_args = [\"--answers\", \"a.toml\"]\n[[recipe]]\nname=\"x\"\n",
+        )
+        .unwrap();
+        assert_eq!(cmd.as_deref(), Some("setup"));
+        assert_eq!(args, vec!["--answers".to_string(), "a.toml".to_string()]);
+        // Absent ⇒ (None, []).
+        assert_eq!(peek_dispatch_settings("").unwrap(), (None, vec![]));
+        // Strict: a non-string default_args element is a type error (the
+        // hand-walked toml::Value peek silently dropped it).
+        assert!(peek_dispatch_settings("[settings]\ndefault_args = [123]\n").is_err());
+        // Strict: a non-string default_command is a type error.
+        assert!(peek_dispatch_settings("[settings]\ndefault_command = 42\n").is_err());
     }
 
     #[test]
