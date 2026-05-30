@@ -50,6 +50,31 @@ fn when_truthy(expr: &str, ctx: &Ctx) -> Result<bool> {
     Ok(!(t.is_empty() || t == "false" || t == "0"))
 }
 
+/// Enforce a step's `confirm` gate against the value it produced. Renders the
+/// expected value through `ctx` and compares it (as a string) to the step's
+/// output value. No `confirm` ⇒ pass. Returns an `anyhow` error on mismatch so
+/// it flows through the same step-failure path (and honors `continue_on_error`)
+/// as any other step error.
+fn confirm_gate(
+    step: &Step,
+    ctx: &Ctx,
+    out: &crate::processor::StepOutput,
+) -> anyhow::Result<()> {
+    let Some(raw) = &step.confirm else {
+        return Ok(());
+    };
+    let expected = ctx.render(raw)?;
+    let actual = match &out.value {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(v) => v.to_string(),
+        None => String::new(),
+    };
+    if actual != expected {
+        anyhow::bail!("confirm: value did not match expected (aborting)");
+    }
+    Ok(())
+}
+
 fn build_ctx(
     key: &str,
     params: &serde_json::Map<String, serde_json::Value>,
@@ -165,6 +190,17 @@ async fn run_steps(
                 "[{key}] {} failed, retry {attempt}/{}",
                 step.kind, step.retries
             ));
+        };
+        // Generic `confirm` gate: a value-producing step aborts the pipeline
+        // unless its value equals the rendered expected. Checked here (not in
+        // any one processor) so it applies to every value-producing step. A
+        // skip produces no value, so the gate is a no-op there.
+        let result = match result {
+            Ok(out) if !out.skipped => match confirm_gate(step, &ctx, &out) {
+                Ok(()) => Ok(out),
+                Err(e) => Err(e),
+            },
+            other => other,
         };
         match result {
             Ok(out) => {
@@ -844,6 +880,43 @@ mod tests {
         let s = run_one(&reg, e).await;
         assert!(s.failed.is_empty(), "{:?}", s.failed);
         assert_eq!(*log.lock().unwrap(), vec!["hello-x"]);
+    }
+
+    #[tokio::test]
+    async fn confirm_gate_passes_on_match_generic_step() {
+        // The gate is generic: `emit` (not a prompt) produces a value, and a
+        // matching `confirm` lets the pipeline proceed to the next step.
+        let (reg, log) = rig2();
+        let e = steps_entry(vec![
+            step("type=\"emit\"\nemit=\"go\"\nconfirm=\"go\""),
+            step("type=\"rec\"\ntag=\"after\""),
+        ]);
+        let s = run_one(&reg, e).await;
+        assert!(s.failed.is_empty(), "{:?}", s.failed);
+        assert_eq!(*log.lock().unwrap(), vec!["after"]);
+    }
+
+    #[tokio::test]
+    async fn confirm_gate_aborts_on_mismatch_and_skips_rest() {
+        // Mismatch → step fails → fail-fast, the following step never runs.
+        let (reg, log) = rig2();
+        let e = steps_entry(vec![
+            step("type=\"emit\"\nemit=\"no\"\nconfirm=\"RESET\""),
+            step("type=\"rec\"\ntag=\"after\""),
+        ]);
+        let s = run_one(&reg, e).await;
+        assert_eq!(s.failed.len(), 1, "confirm mismatch must fail the key");
+        assert!(s.failed[0].1.contains("confirm"), "{:?}", s.failed);
+        assert!(log.lock().unwrap().is_empty(), "second step must not run");
+    }
+
+    #[tokio::test]
+    async fn confirm_gate_renders_expected_through_ctx() {
+        // `confirm = "{{ key }}"` → "x"; emit "x" matches.
+        let (reg, _log) = rig2();
+        let e = steps_entry(vec![step("type=\"emit\"\nemit=\"{{ key }}\"\nconfirm=\"{{ key }}\"")]);
+        let s = run_one(&reg, e).await;
+        assert!(s.failed.is_empty(), "{:?}", s.failed);
     }
 
     #[tokio::test]
