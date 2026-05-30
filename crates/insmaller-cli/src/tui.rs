@@ -326,6 +326,14 @@ impl Picker {
         }
     }
 
+    /// Jump straight to the Windows drive selector from anywhere (`d`
+    /// shortcut). No-op on Unix, where there's a single `/` root.
+    fn goto_drives(&mut self) {
+        if cfg!(windows) && !self.cwd.as_os_str().is_empty() {
+            self.set_dir(PathBuf::new());
+        }
+    }
+
     /// Enter/→ on the cursor: descend into a directory (or `..`) and return
     /// `None`; on a file, return its full path (caller closes the picker).
     fn activate(&mut self) -> Option<String> {
@@ -720,8 +728,9 @@ pub fn run_wizard_tui(
                     } else {
                         p.cwd.display().to_string()
                     };
+                    let drives_hint = if cfg!(windows) { " · d drives" } else { "" };
                     let title = format!(
-                        " {loc}{state}  (↑↓ move · ↵ open/select · ← up · Esc cancel) "
+                        " {loc}{state}  (↑↓ move · ↵ open/select · ← up{drives_hint} · Esc cancel) "
                     );
                     let list = List::new(rows_p)
                         .block(panel(title, true, &pal))
@@ -820,6 +829,7 @@ pub fn run_wizard_tui(
                             *buf = p.select_cwd();
                             *picker = None;
                         }
+                        KeyCode::Char('d') => p.goto_drives(),
                         KeyCode::Esc => *picker = None,
                         _ => {}
                     }
@@ -1163,6 +1173,20 @@ mod tests {
         assert!(!p.cwd.as_os_str().is_empty());
         let s = p.cwd.to_string_lossy();
         assert!(s.ends_with('\\'), "drive root keeps a trailing separator: {s}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d_shortcut_jumps_to_selector_from_any_depth() {
+        // From a normal directory, `d` jumps straight to the drive selector
+        // without walking parents; on the selector it's a no-op.
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = Picker::open(&dir.path().to_string_lossy());
+        assert!(!p.cwd.as_os_str().is_empty());
+        p.goto_drives();
+        assert!(p.cwd.as_os_str().is_empty(), "d jumps to the drive selector");
+        p.goto_drives();
+        assert!(p.cwd.as_os_str().is_empty(), "no-op once already there");
     }
 
     #[test]
