@@ -16,14 +16,15 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph},
     Terminal,
 };
-use crate::theme::Palette;
+use crate::theme::{gradient, Palette};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
-use std::io::{self, Stdout};
+use std::io::{self, IsTerminal, Stdout};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Restores the terminal even on panic/early-return.
 struct TermGuard;
@@ -215,16 +216,45 @@ struct Picker {
     cursor: usize,
 }
 
+/// Available drive roots on Windows (`C:`, `D:`, …) from the `GetLogicalDrives`
+/// bitmask — dependency-free and, crucially, it never touches the filesystem.
+/// Stat-probing each letter (the obvious approach) would block for seconds on a
+/// disconnected network-mapped drive; the bitmask just reports which letters
+/// are in use. Only the drive-selector pseudo-level calls this.
+#[cfg(windows)]
+fn windows_drives() -> Vec<Entry> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetLogicalDrives() -> u32;
+    }
+    let mask = unsafe { GetLogicalDrives() };
+    ('A'..='Z')
+        .enumerate()
+        .filter(|(i, _)| mask & (1 << i) != 0)
+        .map(|(_, d)| Entry { name: format!("{d}:"), is_dir: true })
+        .collect()
+}
+
 /// Directory listing for the browser: `.` (pick this folder) first, then `..`
 /// (parent, unless at a root), then directories before files, each group
 /// case-insensitively sorted. Returns `(entries, readable)` — `readable` is
 /// false when the dir can't be opened, so callers can distinguish "empty" from
-/// "denied". Pure given the filesystem — unit-testable against a tempdir.
+/// "denied". On Windows the empty path is the drive selector (lists drive
+/// roots), and a drive root still offers `..` (up to that selector). Pure given
+/// the filesystem — unit-testable against a tempdir.
 fn list_dir(p: &Path) -> (Vec<Entry>, bool) {
+    // Windows drive selector: empty path ⇒ list the drive roots, nothing else.
+    #[cfg(windows)]
+    if p.as_os_str().is_empty() {
+        return (windows_drives(), true);
+    }
     let mut entries: Vec<Entry> = Vec::new();
     // `.` always selects the current directory as the value.
     entries.push(Entry { name: ".".into(), is_dir: true });
-    if p.parent().is_some() {
+    // `..` ascends to the parent — or, at a Windows drive root (no parent), up
+    // to the drive selector. On Unix the single `/` root has no `..`.
+    let has_parent = p.parent().is_some();
+    if has_parent || cfg!(windows) {
         entries.push(Entry { name: "..".into(), is_dir: true });
     }
     match std::fs::read_dir(p) {
@@ -296,9 +326,28 @@ impl Picker {
         }
     }
 
+    /// At the Windows drive selector (the empty-path pseudo-level). On Unix the
+    /// cwd is never empty, so this is always false there. One predicate owns the
+    /// sentinel so it can't be re-spelled (or leak) inconsistently.
+    fn at_drive_selector(&self) -> bool {
+        self.cwd.as_os_str().is_empty()
+    }
+
     fn ascend(&mut self) {
         if let Some(parent) = self.cwd.parent().map(Path::to_path_buf) {
             self.set_dir(parent);
+        } else {
+            // No parent: a Windows drive root goes up to the drive selector;
+            // the Unix `/` root (and the selector itself) stay put.
+            self.goto_drives();
+        }
+    }
+
+    /// Jump straight to the Windows drive selector from anywhere (`d`
+    /// shortcut). No-op on Unix, and when already at the selector.
+    fn goto_drives(&mut self) {
+        if cfg!(windows) && !self.at_drive_selector() {
+            self.set_dir(PathBuf::new());
         }
     }
 
@@ -307,13 +356,19 @@ impl Picker {
     fn activate(&mut self) -> Option<String> {
         let entry = self.entries.get(self.cursor)?;
         if entry.name == "." {
-            return Some(self.select_cwd());
+            return self.select_cwd();
         }
         if entry.name == ".." {
             self.ascend();
             return None;
         }
-        let target = self.cwd.join(&entry.name);
+        // From the drive selector (empty cwd) a `C:` entry must become `C:\`,
+        // not the relative `C:`; elsewhere a plain join is the child path.
+        let target = if self.at_drive_selector() {
+            PathBuf::from(format!("{}\\", entry.name))
+        } else {
+            self.cwd.join(&entry.name)
+        };
         if entry.is_dir {
             self.set_dir(target);
             None
@@ -322,9 +377,15 @@ impl Picker {
         }
     }
 
-    /// The current directory itself, as the selected value.
-    fn select_cwd(&self) -> String {
-        self.cwd.to_string_lossy().into_owned()
+    /// The current directory itself, as the selected value — `None` at the
+    /// drive selector, which has no folder to pick (guards `s`/`.` from
+    /// silently returning the empty sentinel path).
+    fn select_cwd(&self) -> Option<String> {
+        if self.at_drive_selector() {
+            None
+        } else {
+            Some(self.cwd.to_string_lossy().into_owned())
+        }
     }
 }
 
@@ -478,6 +539,21 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(v[1])[1]
 }
 
+/// A titled panel. Under a colored theme it gets rounded corners and a border
+/// tinted by focus (bright `border_focus` when active, dim `border` idle —
+/// the focus glow). Under mono/`NO_COLOR` it stays the plain square box, so
+/// nothing changes there.
+fn panel<'a>(title: impl Into<Line<'a>>, focused: bool, pal: &Palette) -> Block<'a> {
+    let mut b = Block::default().borders(Borders::ALL).title(title);
+    if pal.colored() {
+        let bc = if focused { pal.border_focus } else { pal.border };
+        b = b
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(bc));
+    }
+    b
+}
+
 /// Run the wizard interactively. Returns true if completed, false if quit.
 pub fn run_wizard_tui(
     session: &mut WizardSession,
@@ -493,6 +569,15 @@ pub fn run_wizard_tui(
     // Group collapse state, keyed by field id + group, persisted across page
     // re-entries (the per-page widgets are rebuilt each time).
     let mut collapse: HashMap<String, bool> = HashMap::new();
+
+    // Animate only on a colored interactive terminal: under NO_COLOR/mono or
+    // when piped/redirected we keep the blocking, zero-wakeup event loop.
+    let animate = pal.colored() && io::stdout().is_terminal();
+    let mut frame: u64 = 0;
+    // Header gradient cached by width: accent→accent2 is invariant for the
+    // session, only the animation `phase` rotates, so we rebuild the Vec only
+    // on a resize, not every frame.
+    let mut grad_cache: (usize, Vec<ratatui::style::Color>) = (0, Vec::new());
 
     while !session.is_done() {
         let fields: Vec<Field> = session.fields();
@@ -519,14 +604,45 @@ pub fn run_wizard_tui(
                     ])
                     .split(fr.area());
 
-                let g = Gauge::default()
-                    .block(Block::default().borders(Borders::ALL).title(format!(
-                        " insmaller setup — {title}  (step {step}/{total}) "
-                    )))
-                    .gauge_style(Style::default().fg(pal.accent))
-                    .ratio((step as f64 / total as f64).clamp(0.0, 1.0))
-                    .label(desc.clone());
-                fr.render_widget(g, rows[0]);
+                let ratio = (step as f64 / total as f64).clamp(0.0, 1.0);
+                let htitle = format!(" insmaller setup — {title}  (step {step}/{total}) ");
+                if pal.colored() {
+                    // Custom gradient progress bar: accent→accent2 flowing left
+                    // to right, with the filled portion lit and the remainder
+                    // dimmed. `frame` rotates the gradient for a subtle sheen.
+                    let block = panel(htitle, false, &pal);
+                    let inner = block.inner(rows[0]);
+                    fr.render_widget(block, rows[0]);
+                    let w = inner.width.max(1) as usize;
+                    let filled = (ratio * w as f64).round() as usize;
+                    if grad_cache.0 != w {
+                        grad_cache = (w, gradient(pal.accent, pal.accent2, w));
+                    }
+                    let cols = &grad_cache.1;
+                    let phase = (frame as usize) % w;
+                    let bar: Vec<Span> = (0..w)
+                        .map(|i| {
+                            let col = cols[(i + phase) % w];
+                            if i < filled {
+                                Span::styled("▰", Style::default().fg(col))
+                            } else {
+                                Span::styled("▱", Style::default().fg(pal.border))
+                            }
+                        })
+                        .collect();
+                    let lines = vec![
+                        Line::from(bar),
+                        Line::from(Span::styled(desc.clone(), Style::default().fg(pal.muted))),
+                    ];
+                    fr.render_widget(Paragraph::new(lines), inner);
+                } else {
+                    let g = Gauge::default()
+                        .block(Block::default().borders(Borders::ALL).title(htitle))
+                        .gauge_style(Style::default().fg(pal.accent))
+                        .ratio(ratio)
+                        .label(desc.clone());
+                    fr.render_widget(g, rows[0]);
+                }
 
                 let mut items: Vec<ListItem> = Vec::new();
                 for (i, f) in fields.iter().enumerate() {
@@ -617,8 +733,7 @@ pub fn run_wizard_tui(
                         }
                     }
                 }
-                let body = List::new(items)
-                    .block(Block::default().borders(Borders::ALL).title(" fields "));
+                let body = List::new(items).block(panel(" fields ", focus < n, &pal));
                 fr.render_widget(body, rows[1]);
 
                 // Path browser overlay (captures all keys while open).
@@ -638,17 +753,43 @@ pub fn run_wizard_tui(
                         })
                         .collect();
                     let state = if p.readable { "" } else { "  [unreadable]" };
+                    let loc = if p.at_drive_selector() {
+                        "Drives".to_string()
+                    } else {
+                        p.cwd.display().to_string()
+                    };
+                    let drives_hint = if cfg!(windows) { " · d drives" } else { "" };
                     let title = format!(
-                        " {}{}  (↑↓ move · ↵ open/select · ← up · Esc cancel) ",
-                        p.cwd.display(),
-                        state
+                        " {loc}{state}  (↑↓ move · ↵ open/select · ← up{drives_hint} · Esc cancel) "
                     );
                     let list = List::new(rows_p)
-                        .block(Block::default().borders(Borders::ALL).title(title))
-                        .highlight_style(Style::default().fg(pal.accent_fg).bg(pal.accent))
+                        .block(panel(title, true, &pal))
+                        .highlight_style(
+                            Style::default()
+                                .fg(pal.accent_fg)
+                                .bg(pal.accent)
+                                .add_modifier(Modifier::BOLD),
+                        )
                         .highlight_symbol("> ");
                     let mut st = ListState::default();
                     st.select(Some(p.cursor));
+                    // Drop shadow: a dark rect offset +1/+1, drawn before Clear
+                    // so the L-shaped sliver outside `area` stays shadowed.
+                    if pal.colored() {
+                        let fa = fr.area();
+                        let sx = area.x + 1;
+                        let sy = area.y + 1;
+                        let shadow = Rect {
+                            x: sx,
+                            y: sy,
+                            width: area.width.min(fa.width.saturating_sub(sx)),
+                            height: area.height.min(fa.height.saturating_sub(sy)),
+                        };
+                        fr.render_widget(
+                            Block::default().style(Style::default().bg(pal.shadow)),
+                            shadow,
+                        );
+                    }
                     fr.render_widget(Clear, area);
                     fr.render_stateful_widget(list, area, &mut st);
                 }
@@ -657,7 +798,10 @@ pub fn run_wizard_tui(
                     let st = if !enabled {
                         Style::default().fg(pal.muted)
                     } else if focus == idx {
-                        Style::default().fg(pal.accent_fg).bg(pal.accent)
+                        Style::default()
+                            .fg(pal.accent_fg)
+                            .bg(pal.accent)
+                            .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(pal.accent)
                     };
@@ -676,11 +820,17 @@ pub fn run_wizard_tui(
                     ),
                 ]);
                 fr.render_widget(
-                    Paragraph::new(foot).block(Block::default().borders(Borders::ALL)),
+                    Paragraph::new(foot).block(panel("", focus >= n, &pal)),
                     rows[2],
                 );
             })?;
 
+            // Animated themes poll on a tick so the gradient sheen advances
+            // while idle; otherwise block (no idle wakeups under CI/piped/mono).
+            if animate && !event::poll(Duration::from_millis(80))? {
+                frame = frame.wrapping_add(1);
+                continue;
+            }
             let Event::Key(k) = event::read()? else { continue };
             if k.kind != KeyEventKind::Press {
                 continue;
@@ -706,9 +856,13 @@ pub fn run_wizard_tui(
                             }
                         }
                         KeyCode::Char('s') => {
-                            *buf = p.select_cwd();
-                            *picker = None;
+                            // No-op at the drive selector (no folder to take).
+                            if let Some(path) = p.select_cwd() {
+                                *buf = path;
+                                *picker = None;
+                            }
                         }
+                        KeyCode::Char('d') => p.goto_drives(),
                         KeyCode::Esc => *picker = None,
                         _ => {}
                     }
@@ -1017,6 +1171,65 @@ mod tests {
         assert_eq!(q.entries[q.cursor].name, "..");
         assert_eq!(q.activate(), None);
         assert_eq!(q.cwd, dir.path());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_root_offers_dotdot_to_selector() {
+        // At a drive root, `..` is present and ascending lands on the empty
+        // drive-selector path (it can't escape past it).
+        let (entries, readable) = list_dir(std::path::Path::new("C:\\"));
+        assert!(readable);
+        assert!(entries.iter().any(|e| e.name == ".."));
+
+        let mut p = Picker::open("C:\\");
+        assert_eq!(p.cwd, std::path::PathBuf::from("C:\\"));
+        p.ascend();
+        assert!(p.cwd.as_os_str().is_empty(), "ascends to the drive selector");
+        // Already at the selector: a further ascend is a no-op.
+        p.ascend();
+        assert!(p.cwd.as_os_str().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn selector_lists_drives_and_activate_descends() {
+        let (drives, readable) = list_dir(&std::path::PathBuf::new());
+        assert!(readable);
+        assert!(!drives.is_empty(), "at least the system drive is present");
+        assert!(drives.iter().all(|e| e.is_dir));
+
+        let mut p = Picker::open("C:\\");
+        p.set_dir(std::path::PathBuf::new()); // jump to the selector
+        // Activate the first drive → cwd becomes its root with a trailing sep.
+        assert_eq!(p.activate(), None);
+        assert!(!p.cwd.as_os_str().is_empty());
+        let s = p.cwd.to_string_lossy();
+        assert!(s.ends_with('\\'), "drive root keeps a trailing separator: {s}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d_shortcut_jumps_to_selector_from_any_depth() {
+        // From a normal directory, `d` jumps straight to the drive selector
+        // without walking parents; on the selector it's a no-op.
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = Picker::open(&dir.path().to_string_lossy());
+        assert!(!p.cwd.as_os_str().is_empty());
+        p.goto_drives();
+        assert!(p.cwd.as_os_str().is_empty(), "d jumps to the drive selector");
+        p.goto_drives();
+        assert!(p.cwd.as_os_str().is_empty(), "no-op once already there");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn select_at_drive_selector_yields_no_value() {
+        // 's' / '.' must not return the empty sentinel as a chosen path.
+        let mut p = Picker::open("C:\\");
+        p.goto_drives();
+        assert!(p.at_drive_selector());
+        assert_eq!(p.select_cwd(), None, "no folder to take at the drive list");
     }
 
     #[test]

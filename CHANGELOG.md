@@ -4,6 +4,44 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.1] - 2026-05-31
+
+### Fixed
+- **Drive selector no longer yields an empty path.** Pressing `s` (or selecting
+  `.`) while on the Windows drive list returned the empty sentinel path as the
+  field value; `select_cwd` now returns `None` there and `s` is a no-op (a
+  single `at_drive_selector()` predicate owns the sentinel so it can't leak).
+- **Drive enumeration can't hang on dead network mappings.** `windows_drives`
+  now reads the `GetLogicalDrives` bitmask instead of stat-probing `A:`..`Z:`
+  with `is_dir()`, which could block for seconds on a disconnected mapped drive.
+- Docs (README, examples) list `modern` as the default theme; the old preset
+  list omitted it.
+
+### Internal
+- Header gradient is cached by width (rebuilt only on resize, not every frame).
+- `ascend` at a root now delegates to `goto_drives` (removes duplicated branch).
+
+## [0.6.0] - 2026-05-30
+
+### Added
+- **Cross-drive file browser (Windows).** The `Ctrl+B` path browser can now
+  leave the current drive: at a drive root (`C:\`) pressing `←` ascends to a
+  drive selector that lists every available drive (`C:`/`D:`/…); selecting one
+  descends into it. The `..`/ascend mechanism was generalized rather than
+  special-cased — Unix (single `/` root) is unchanged.
+- **Modern default theme (`modern`).** A midnight indigo→violet truecolor
+  palette is now the default look: rounded panel borders, a focus-glow border
+  on the active panel, a gradient progress header that animates a subtle sheen
+  on interactive terminals, and a drop shadow behind the file-browser modal.
+  Animation auto-disables under `NO_COLOR`/`mono`/non-TTY (no idle wakeups).
+- **More theme roles.** `[settings.colors]` accepts `accent2`, `border`,
+  `border_focus`, `shadow`, and `success` hex overrides in addition to the
+  existing roles.
+
+### Changed
+- The legacy flat-cyan look is still available via `theme = "default"` (or
+  `INSMALLER_THEME=default`); `high-contrast` and `mono` are unchanged.
+
 ## [0.5.3] - 2026-05-29
 
 ### Fixed

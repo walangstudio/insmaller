@@ -98,7 +98,7 @@ Put the binary on PATH. In your project, write an `insmaller.toml`:
 [settings]
 catalog = "catalog.json"
 wizard  = "wizard.toml"   # optional
-theme   = "default"       # default, mono, or high-contrast
+theme   = "modern"        # modern (default), default, high-contrast, or mono
 ```
 
 Then, from anywhere in that project tree:
