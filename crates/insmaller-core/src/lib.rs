@@ -33,8 +33,8 @@ pub mod tasks;
 pub mod wizard;
 
 pub use config::{
-    CompiledTask, EngineConfig, LoadedConfig, OutputFormat, ParseKind, ProjectMeta, Recipe,
-    SentinelScope, Settings, SetupOutput, TaskDef, ThemeColors,
+    peek_dispatch_settings, CompiledTask, EngineConfig, LoadedConfig, OutputFormat, ParseKind,
+    ProjectMeta, Recipe, SentinelScope, Settings, SetupOutput, TaskDef, ThemeColors,
 };
 pub use ctx::Ctx;
 pub use desugar::{desugar, Desugared};

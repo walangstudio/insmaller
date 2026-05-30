@@ -234,8 +234,11 @@ fn masked_key(buf: &mut String, code: KeyCode, ctrl: bool) -> KeyEffect {
         KeyCode::Esc => KeyEffect::Cancel,
         // Ctrl+C and Ctrl+D both cancel (Ctrl+D matches POSIX `read` EOF so a
         // user reaching for the standard shortcut doesn't type 'd' into a
-        // password).
-        KeyCode::Char('c' | 'd') if ctrl => KeyEffect::Cancel,
+        // password). Case-insensitive: with CapsLock on (or Ctrl+Shift+C) the
+        // terminal may deliver Char('C')/Char('D').
+        KeyCode::Char(c) if ctrl && matches!(c.to_ascii_lowercase(), 'c' | 'd') => {
+            KeyEffect::Cancel
+        }
         // Any other Ctrl+letter chord is dropped, never pushed as a literal —
         // otherwise Ctrl+U / Ctrl+W / Ctrl+L would silently corrupt the
         // captured secret with control bytes the user can't see.
@@ -503,6 +506,9 @@ mod tests {
         let mut buf = String::new();
         assert!(matches!(masked_key(&mut buf, ch('c'), true), KeyEffect::Cancel));
         assert!(matches!(masked_key(&mut buf, ch('d'), true), KeyEffect::Cancel));
+        // Case-insensitive: CapsLock / Ctrl+Shift delivers uppercase.
+        assert!(matches!(masked_key(&mut buf, ch('C'), true), KeyEffect::Cancel));
+        assert!(matches!(masked_key(&mut buf, ch('D'), true), KeyEffect::Cancel));
     }
 
     #[test]

@@ -315,25 +315,14 @@ fn peek_default_dispatch(cfg_p: &str) -> (Option<String>, Vec<String>) {
     }
     let parsed = std::fs::read_to_string(cfg_p)
         .map_err(|e| e.to_string())
-        .and_then(|s| s.parse::<toml::Value>().map_err(|e| e.to_string()));
-    let doc = match parsed {
-        Ok(v) => v,
+        .and_then(|s| insmaller_core::peek_dispatch_settings(&s).map_err(|e| e.to_string()));
+    match parsed {
+        Ok(pair) => pair,
         Err(e) => {
             eprintln!("config load warning ({cfg_p}): {e}");
-            return (None, vec![]);
+            (None, vec![])
         }
-    };
-    let settings = doc.get("settings");
-    let cmd = settings
-        .and_then(|s| s.get("default_command"))
-        .and_then(|x| x.as_str())
-        .map(String::from);
-    let args = settings
-        .and_then(|s| s.get("default_args"))
-        .and_then(|x| x.as_array())
-        .map(|a| a.iter().filter_map(|e| e.as_str().map(String::from)).collect())
-        .unwrap_or_default();
-    (cmd, args)
+    }
 }
 
 /// Shared dispatch from a command name string to the matching cmd_* function.
