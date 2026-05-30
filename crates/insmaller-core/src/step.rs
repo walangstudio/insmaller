@@ -34,6 +34,14 @@ pub struct Step {
     pub requires: Vec<String>,
     /// Bind the processor's `value` output under this name for later steps.
     pub register_as: Option<String>,
+    /// Generic value gate: after the step runs and produces a value, abort the
+    /// pipeline unless that value equals this (rendered through `Ctx`, so
+    /// `confirm = "{{ project_name }}"` works). Empty/absent = no gate. A
+    /// skipped step (optional input not provided) produces no value, so the
+    /// gate is a no-op there. Applies to any value-producing step (`prompt`,
+    /// `input`, `save_input`, an `exec` bound with `register_as`, …) — the
+    /// orchestrator enforces it, not the processor.
+    pub confirm: Option<String>,
     pub continue_on_error: bool,
     /// Per-step wall-clock timeout in seconds (engine-applied, all processors).
     pub timeout: Option<u64>,
@@ -67,6 +75,9 @@ impl Step {
         let when = take_str(&mut m, "when")?;
         let unless = take_str(&mut m, "unless")?;
         let register_as = take_str(&mut m, "register_as")?;
+        // Empty string ⇒ no gate (a literal empty expected value is
+        // unreachable anyway: value-producing steps emit non-empty values).
+        let confirm = take_str(&mut m, "confirm")?.filter(|s| !s.is_empty());
         let requires = match m.remove("requires") {
             Some(Value::Array(a)) => a
                 .into_iter()
@@ -129,6 +140,7 @@ impl Step {
             unless,
             requires,
             register_as,
+            confirm,
             continue_on_error,
             timeout,
             retries,

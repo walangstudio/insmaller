@@ -286,21 +286,7 @@ async fn main() -> ExitCode {
     // pointing the binary at a custom config gets dispatch driven by an
     // unrelated sibling/parent `installer.toml`.
     let cfg_p = discover_config(opt_opt(&args, "--config"), &name);
-    let (default_cmd, default_args) = match LoadedConfig::from_path(Path::new(&cfg_p)) {
-        Ok(c) => (c.settings.default_command, c.settings.default_args),
-        Err(e) => {
-            // Silently treating a malformed config as 'no default' makes a
-            // syntax error invisible at this layer — warn so the user sees
-            // it (the inner cmd_* would surface the same parse error when
-            // it tries to load, but only if it gets that far; e.g. -h
-            // doesn't). Only warn when the path actually exists, so a clean
-            // `insmaller -h` in a config-less directory stays quiet.
-            if Path::new(&cfg_p).exists() {
-                eprintln!("config load warning ({cfg_p}): {e}");
-            }
-            (None, vec![])
-        }
-    };
+    let (default_cmd, default_args) = peek_default_dispatch(&cfg_p);
     if let Some(cmd) = default_cmd {
         // Skip the chain+collect allocation when there's nothing to prepend.
         let effective: Vec<String> = if default_args.is_empty() {
@@ -315,6 +301,39 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     cmd_op(&args, Op::Install, &name).await
+}
+
+/// Read ONLY the dispatch-relevant settings (`default_command`/`default_args`)
+/// from the discovered config, avoiding a full `LoadedConfig` build (recipe
+/// indexing, plugin merge, sibling-path resolution, cross-ref) at the dispatch
+/// layer — the chosen `cmd_*` does the one authoritative load. A malformed or
+/// unreadable existing config warns (so a syntax error isn't invisible here),
+/// then falls back to "no default". An absent config is silent.
+fn peek_default_dispatch(cfg_p: &str) -> (Option<String>, Vec<String>) {
+    if !Path::new(cfg_p).exists() {
+        return (None, vec![]);
+    }
+    let parsed = std::fs::read_to_string(cfg_p)
+        .map_err(|e| e.to_string())
+        .and_then(|s| s.parse::<toml::Value>().map_err(|e| e.to_string()));
+    let doc = match parsed {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("config load warning ({cfg_p}): {e}");
+            return (None, vec![]);
+        }
+    };
+    let settings = doc.get("settings");
+    let cmd = settings
+        .and_then(|s| s.get("default_command"))
+        .and_then(|x| x.as_str())
+        .map(String::from);
+    let args = settings
+        .and_then(|s| s.get("default_args"))
+        .and_then(|x| x.as_array())
+        .map(|a| a.iter().filter_map(|e| e.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    (cmd, args)
 }
 
 /// Shared dispatch from a command name string to the matching cmd_* function.

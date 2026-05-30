@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.2] - 2026-05-29
+
+### Changed
+- **`confirm` is now a generic step gate.** It moved out of the `prompt`
+  processor into the orchestrator, so any value-producing step (`prompt`,
+  `input`, `save_input`, an `exec` bound with `register_as`, …) can gate on
+  its produced value: `confirm = "RESET"` aborts the step unless the value
+  matches (rendered through ctx; empty/absent = no gate; a skipped optional
+  step is a no-op). Behavior for existing `prompt`/`input` steps is unchanged.
+- The masked-secret line editor's per-key rules (Ctrl-chord dropping,
+  Ctrl+D-as-cancel, backspace-on-empty) and the paste line-break filter are
+  extracted into pure functions with unit tests — closing the "hand-rolled
+  reader has no coverage" gap without swapping to a crate that would drop the
+  `*` echo and the bracketed-paste multi-line protection.
+
+### Performance
+- The no-subcommand dispatch path (`default_command`) reads only the two
+  settings it needs via a lightweight TOML peek instead of building a full
+  `LoadedConfig` (recipe indexing, plugin merge, cross-ref) that the chosen
+  `cmd_*` then rebuilds — one authoritative config load instead of two.
+
 ## [0.5.1] - 2026-05-29
 
 ### Fixed

@@ -481,32 +481,18 @@ impl Processor for PromptProcessor {
         inp: &dyn InputResolver,
     ) -> Result<StepOutput> {
         let (name, spec) = prompt_spec(step, ctx)?;
+        // NOTE: the `confirm` gate is enforced generically by the orchestrator
+        // against this step's output value (see `confirm_gate`), not here, so
+        // every value-producing step gets it — not just `prompt`/`input`.
         match inp.resolve(&name, &spec) {
             ResolvedInput::Value(v) => {
-                // `confirm = "X"` (rendered through ctx so
-                // `{{ project_name }}`-style values work) aborts on mismatch.
-                // Missing OR empty-string ⇒ no confirmation gate (empty
-                // expected value would otherwise be unreachable: resolvers
-                // only emit Value(non-empty)).
-                let expect = step.param_str("confirm").filter(|s| !s.is_empty());
-                if let Some(raw) = expect {
-                    let exp = ctx.render(raw)?;
-                    if v != exp {
-                        bail!(
-                            "confirm: '{}' did not match expected value (aborting)",
-                            name
-                        );
-                    }
-                }
                 let mut out = StepOutput::value(v.clone());
                 out.register.insert(name, serde_json::Value::String(v));
                 Ok(out)
             }
             // Optional + not provided: register nothing; dependents must
             // declare `requires` so they skip rather than strict-undefined.
-            // A `confirm` on an optional + absent step is a no-op — by
-            // not rendering `expect` here, an undefined template var in
-            // confirm doesn't error a step that wouldn't have run anyway.
+            // A skip produces no value, so the `confirm` gate is a no-op.
             ResolvedInput::Skip => Ok(StepOutput::skipped()),
             // Required + not provided in a non-interactive context: fail fast,
             // never block (the EnvResolver contract).
@@ -940,57 +926,22 @@ mod tests {
     }
 
     #[test]
-    fn prompt_confirm_match_succeeds() {
+    fn prompt_value_path_returns_resolved_value() {
+        // `confirm` is now enforced by the orchestrator (see orchestrator
+        // tests); PromptProcessor itself just resolves + registers the value.
         let mut m = HashMap::new();
         m.insert("CONFIRM".to_string(), "RESET".to_string());
         let r = StaticResolver(m);
         let out = rt()
             .block_on(PromptProcessor.run(
-                &step(
-                    "type=\"prompt\"\nname=\"CONFIRM\"\nrequired=true\nconfirm=\"RESET\"",
-                ),
+                &step("type=\"prompt\"\nname=\"CONFIRM\"\nrequired=true\nconfirm=\"RESET\""),
                 &ctx(),
                 &NullReporter,
                 &r,
             ))
             .unwrap();
         assert_eq!(out.register.get("CONFIRM").unwrap().as_str(), Some("RESET"));
-    }
-
-    #[test]
-    fn prompt_confirm_mismatch_aborts() {
-        let mut m = HashMap::new();
-        m.insert("CONFIRM".to_string(), "no".to_string());
-        let r = StaticResolver(m);
-        let res = rt().block_on(PromptProcessor.run(
-            &step(
-                "type=\"prompt\"\nname=\"CONFIRM\"\nrequired=true\nconfirm=\"RESET\"",
-            ),
-            &ctx(),
-            &NullReporter,
-            &r,
-        ));
-        let err = res.unwrap_err().to_string();
-        assert!(err.contains("confirm"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn prompt_confirm_renders_through_ctx() {
-        // expected value uses `{{ key }}` from ctx → "demo"
-        let mut m = HashMap::new();
-        m.insert("X".to_string(), "demo".to_string());
-        let r = StaticResolver(m);
-        let out = rt()
-            .block_on(PromptProcessor.run(
-                &step(
-                    "type=\"prompt\"\nname=\"X\"\nrequired=true\nconfirm=\"{{ key }}\"",
-                ),
-                &ctx(),
-                &NullReporter,
-                &r,
-            ))
-            .unwrap();
-        assert_eq!(out.register.get("X").unwrap().as_str(), Some("demo"));
+        assert_eq!(out.value.unwrap().as_str(), Some("RESET"));
     }
 
     #[test]
@@ -1005,29 +956,9 @@ mod tests {
     }
 
     #[test]
-    fn prompt_confirm_empty_string_is_no_gate() {
-        // `confirm = ""` (after this change) means no confirmation, matching
-        // the doc-comment promise. Pre-fix this aborted the step because the
-        // empty expected value could never match the (non-empty) resolved
-        // value.
-        let mut m = HashMap::new();
-        m.insert("X".to_string(), "anything".to_string());
-        let r = StaticResolver(m);
-        let out = rt()
-            .block_on(PromptProcessor.run(
-                &step("type=\"prompt\"\nname=\"X\"\nrequired=true\nconfirm=\"\""),
-                &ctx(),
-                &NullReporter,
-                &r,
-            ))
-            .unwrap();
-        assert_eq!(out.register.get("X").unwrap().as_str(), Some("anything"));
-    }
-
-    #[test]
-    fn prompt_optional_absent_does_not_render_confirm() {
-        // Optional + absent: resolver returns Skip BEFORE we render `confirm`,
-        // so an undefined template var in `confirm` must NOT error the step.
+    fn prompt_optional_absent_skips() {
+        // Optional + absent → Skip (no value), so the orchestrator's `confirm`
+        // gate is a no-op even if `confirm` referenced an undefined var.
         let r = StaticResolver(HashMap::new());
         let out = rt()
             .block_on(PromptProcessor.run(
