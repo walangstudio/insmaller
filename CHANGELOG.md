@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] - 2026-05-30
+
+### Added
+- **Cross-drive file browser (Windows).** The `Ctrl+B` path browser can now
+  leave the current drive: at a drive root (`C:\`) pressing `←` ascends to a
+  drive selector that lists every available drive (`C:`/`D:`/…); selecting one
+  descends into it. The `..`/ascend mechanism was generalized rather than
+  special-cased — Unix (single `/` root) is unchanged.
+- **Modern default theme (`modern`).** A midnight indigo→violet truecolor
+  palette is now the default look: rounded panel borders, a focus-glow border
+  on the active panel, a gradient progress header that animates a subtle sheen
+  on interactive terminals, and a drop shadow behind the file-browser modal.
+  Animation auto-disables under `NO_COLOR`/`mono`/non-TTY (no idle wakeups).
+- **More theme roles.** `[settings.colors]` accepts `accent2`, `border`,
+  `border_focus`, `shadow`, and `success` hex overrides in addition to the
+  existing roles.
+
+### Changed
+- The legacy flat-cyan look is still available via `theme = "default"` (or
+  `INSMALLER_THEME=default`); `high-contrast` and `mono` are unchanged.
+
 ## [0.5.3] - 2026-05-29
 
 ### Fixed
