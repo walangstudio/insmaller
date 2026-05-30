@@ -262,12 +262,26 @@ pub struct SetupOutput {
 pub struct ThemeColors {
     #[serde(default)]
     pub accent: Option<String>,
+    /// Gradient endpoint paired with `accent`.
+    #[serde(default)]
+    pub accent2: Option<String>,
     #[serde(default)]
     pub accent_fg: Option<String>,
     #[serde(default)]
     pub muted: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
+    /// Idle panel border.
+    #[serde(default)]
+    pub border: Option<String>,
+    /// Focused panel border (focus glow).
+    #[serde(default)]
+    pub border_focus: Option<String>,
+    /// Drop-shadow fill behind modals.
+    #[serde(default)]
+    pub shadow: Option<String>,
+    #[serde(default)]
+    pub success: Option<String>,
 }
 
 fn default_true() -> bool {
