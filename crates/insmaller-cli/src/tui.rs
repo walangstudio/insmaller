@@ -216,13 +216,22 @@ struct Picker {
     cursor: usize,
 }
 
-/// Available drive roots on Windows (`C:`, `D:`, …), probed dependency-free by
-/// stat-ing each letter's root. Only the drive-selector pseudo-level uses this.
+/// Available drive roots on Windows (`C:`, `D:`, …) from the `GetLogicalDrives`
+/// bitmask — dependency-free and, crucially, it never touches the filesystem.
+/// Stat-probing each letter (the obvious approach) would block for seconds on a
+/// disconnected network-mapped drive; the bitmask just reports which letters
+/// are in use. Only the drive-selector pseudo-level calls this.
 #[cfg(windows)]
 fn windows_drives() -> Vec<Entry> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetLogicalDrives() -> u32;
+    }
+    let mask = unsafe { GetLogicalDrives() };
     ('A'..='Z')
-        .filter(|d| Path::new(&format!("{d}:\\")).is_dir())
-        .map(|d| Entry { name: format!("{d}:"), is_dir: true })
+        .enumerate()
+        .filter(|(i, _)| mask & (1 << i) != 0)
+        .map(|(_, d)| Entry { name: format!("{d}:"), is_dir: true })
         .collect()
 }
 
@@ -317,19 +326,27 @@ impl Picker {
         }
     }
 
+    /// At the Windows drive selector (the empty-path pseudo-level). On Unix the
+    /// cwd is never empty, so this is always false there. One predicate owns the
+    /// sentinel so it can't be re-spelled (or leak) inconsistently.
+    fn at_drive_selector(&self) -> bool {
+        self.cwd.as_os_str().is_empty()
+    }
+
     fn ascend(&mut self) {
         if let Some(parent) = self.cwd.parent().map(Path::to_path_buf) {
             self.set_dir(parent);
-        } else if cfg!(windows) && !self.cwd.as_os_str().is_empty() {
-            // At a drive root: ascend to the drive selector (empty path).
-            self.set_dir(PathBuf::new());
+        } else {
+            // No parent: a Windows drive root goes up to the drive selector;
+            // the Unix `/` root (and the selector itself) stay put.
+            self.goto_drives();
         }
     }
 
     /// Jump straight to the Windows drive selector from anywhere (`d`
-    /// shortcut). No-op on Unix, where there's a single `/` root.
+    /// shortcut). No-op on Unix, and when already at the selector.
     fn goto_drives(&mut self) {
-        if cfg!(windows) && !self.cwd.as_os_str().is_empty() {
+        if cfg!(windows) && !self.at_drive_selector() {
             self.set_dir(PathBuf::new());
         }
     }
@@ -339,7 +356,7 @@ impl Picker {
     fn activate(&mut self) -> Option<String> {
         let entry = self.entries.get(self.cursor)?;
         if entry.name == "." {
-            return Some(self.select_cwd());
+            return self.select_cwd();
         }
         if entry.name == ".." {
             self.ascend();
@@ -347,7 +364,7 @@ impl Picker {
         }
         // From the drive selector (empty cwd) a `C:` entry must become `C:\`,
         // not the relative `C:`; elsewhere a plain join is the child path.
-        let target = if self.cwd.as_os_str().is_empty() {
+        let target = if self.at_drive_selector() {
             PathBuf::from(format!("{}\\", entry.name))
         } else {
             self.cwd.join(&entry.name)
@@ -360,9 +377,15 @@ impl Picker {
         }
     }
 
-    /// The current directory itself, as the selected value.
-    fn select_cwd(&self) -> String {
-        self.cwd.to_string_lossy().into_owned()
+    /// The current directory itself, as the selected value — `None` at the
+    /// drive selector, which has no folder to pick (guards `s`/`.` from
+    /// silently returning the empty sentinel path).
+    fn select_cwd(&self) -> Option<String> {
+        if self.at_drive_selector() {
+            None
+        } else {
+            Some(self.cwd.to_string_lossy().into_owned())
+        }
     }
 }
 
@@ -551,6 +574,10 @@ pub fn run_wizard_tui(
     // when piped/redirected we keep the blocking, zero-wakeup event loop.
     let animate = pal.colored() && io::stdout().is_terminal();
     let mut frame: u64 = 0;
+    // Header gradient cached by width: accent→accent2 is invariant for the
+    // session, only the animation `phase` rotates, so we rebuild the Vec only
+    // on a resize, not every frame.
+    let mut grad_cache: (usize, Vec<ratatui::style::Color>) = (0, Vec::new());
 
     while !session.is_done() {
         let fields: Vec<Field> = session.fields();
@@ -588,7 +615,10 @@ pub fn run_wizard_tui(
                     fr.render_widget(block, rows[0]);
                     let w = inner.width.max(1) as usize;
                     let filled = (ratio * w as f64).round() as usize;
-                    let cols = gradient(pal.accent, pal.accent2, w);
+                    if grad_cache.0 != w {
+                        grad_cache = (w, gradient(pal.accent, pal.accent2, w));
+                    }
+                    let cols = &grad_cache.1;
                     let phase = (frame as usize) % w;
                     let bar: Vec<Span> = (0..w)
                         .map(|i| {
@@ -723,7 +753,7 @@ pub fn run_wizard_tui(
                         })
                         .collect();
                     let state = if p.readable { "" } else { "  [unreadable]" };
-                    let loc = if p.cwd.as_os_str().is_empty() {
+                    let loc = if p.at_drive_selector() {
                         "Drives".to_string()
                     } else {
                         p.cwd.display().to_string()
@@ -826,8 +856,11 @@ pub fn run_wizard_tui(
                             }
                         }
                         KeyCode::Char('s') => {
-                            *buf = p.select_cwd();
-                            *picker = None;
+                            // No-op at the drive selector (no folder to take).
+                            if let Some(path) = p.select_cwd() {
+                                *buf = path;
+                                *picker = None;
+                            }
                         }
                         KeyCode::Char('d') => p.goto_drives(),
                         KeyCode::Esc => *picker = None,
@@ -1187,6 +1220,16 @@ mod tests {
         assert!(p.cwd.as_os_str().is_empty(), "d jumps to the drive selector");
         p.goto_drives();
         assert!(p.cwd.as_os_str().is_empty(), "no-op once already there");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn select_at_drive_selector_yields_no_value() {
+        // 's' / '.' must not return the empty sentinel as a chosen path.
+        let mut p = Picker::open("C:\\");
+        p.goto_drives();
+        assert!(p.at_drive_selector());
+        assert_eq!(p.select_cwd(), None, "no folder to take at the drive list");
     }
 
     #[test]

@@ -60,7 +60,8 @@ CI it falls back to the non-blocking unattended path and draws nothing.
 ### Theming
 
 `demo.installer.toml` sets `[settings] theme = "high-contrast"`. Presets:
-`default` | `mono` | `high-contrast`. Override per run without editing config:
+`modern` (the default) | `default` | `high-contrast` | `mono`. Override per run
+without editing config:
 
 ```
 set INSMALLER_THEME=mono

@@ -13,7 +13,7 @@
 param(
   [string]$Exe     = "$PSScriptRoot\..\target\release\insmaller.exe",
   [string]$DemoIn  = "$PSScriptRoot",
-  [string]$Theme   = "",        # "" = use demo.installer.toml; or default|mono|high-contrast
+  [string]$Theme   = "",        # "" = use demo.installer.toml; or modern|default|high-contrast|mono
   [switch]$NoColor
 )
 
