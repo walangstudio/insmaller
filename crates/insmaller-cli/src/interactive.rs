@@ -178,59 +178,89 @@ fn read_masked_line() -> std::io::Result<InteractiveLine> {
                 modifiers,
                 kind: KeyEventKind::Press | KeyEventKind::Repeat,
                 ..
-            }) => match code {
-                KeyCode::Enter => {
-                    writeln!(out)?;
-                    out.flush()?;
-                    return Ok(InteractiveLine::Line(buf));
+            }) => {
+                let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+                match masked_key(&mut buf, code, ctrl) {
+                    KeyEffect::Submit => {
+                        writeln!(out)?;
+                        out.flush()?;
+                        return Ok(InteractiveLine::Line(buf));
+                    }
+                    KeyEffect::Cancel => {
+                        writeln!(out)?;
+                        out.flush()?;
+                        return Ok(InteractiveLine::Cancel);
+                    }
+                    KeyEffect::Echo(s) => {
+                        write!(out, "{s}")?;
+                        out.flush()?;
+                    }
+                    KeyEffect::Ignore => {}
                 }
-                KeyCode::Esc => {
-                    writeln!(out)?;
-                    out.flush()?;
-                    return Ok(InteractiveLine::Cancel);
-                }
-                // Ctrl+C and Ctrl+D both cancel (Ctrl+D matches POSIX `read`
-                // EOF semantics so users don't accidentally type 'd' into a
-                // password when reaching for the standard EOF shortcut).
-                KeyCode::Char('c' | 'd') if modifiers.contains(KeyModifiers::CONTROL) => {
-                    writeln!(out)?;
-                    out.flush()?;
-                    return Ok(InteractiveLine::Cancel);
-                }
-                // Any other Ctrl+letter chord is dropped, never pushed as a
-                // literal — otherwise Ctrl+U / Ctrl+W / Ctrl+L would silently
-                // corrupt the captured secret with control bytes the user
-                // can't see.
-                KeyCode::Char(_) if modifiers.contains(KeyModifiers::CONTROL) => {}
-                // Match-guard form so the empty-buf case falls through
-                // silently (clippy::collapsible_match — pop() mutates either
-                // way, but on empty buf there's nothing to un-render).
-                KeyCode::Backspace if buf.pop().is_some() => {
-                    write!(out, "\x08 \x08")?;
-                    out.flush()?;
-                }
-                KeyCode::Char(c) => {
-                    buf.push(c);
-                    write!(out, "*")?;
-                    out.flush()?;
-                }
-                _ => {}
-            },
+            }
             Event::Paste(s) => {
-                // Collapse a multi-line paste onto one line by dropping ONLY
-                // newlines/carriage-returns — keep every other char (incl.
-                // tabs and other control bytes) verbatim so a pasted secret
-                // isn't silently mutated. Masking hides corruption, so the
-                // captured value must equal the source minus line breaks.
-                for c in s.chars().filter(|&c| c != '\n' && c != '\r') {
-                    buf.push(c);
+                let kept = paste_filter(&s);
+                for _ in kept.chars() {
                     write!(out, "*")?;
                 }
+                buf.push_str(&kept);
                 out.flush()?;
             }
             _ => {}
         }
     }
+}
+
+/// What one key press does in the masked reader.
+enum KeyEffect {
+    /// Echo this string (`*`, a backspace erase, or nothing) and keep reading.
+    Echo(&'static str),
+    /// Line complete (Enter).
+    Submit,
+    /// User cancelled (Esc / Ctrl+C / Ctrl+D).
+    Cancel,
+    /// No echo, keep reading.
+    Ignore,
+}
+
+/// Pure per-key state transition for the masked reader — mutates `buf` for
+/// character/backspace keys and returns the echo + control-flow decision.
+/// Extracted from the event loop so the line-editing rules (Ctrl-chord
+/// dropping, Ctrl+D-as-cancel, backspace-on-empty) are unit-testable without
+/// a real terminal. `ctrl` = the CONTROL modifier was held.
+fn masked_key(buf: &mut String, code: KeyCode, ctrl: bool) -> KeyEffect {
+    match code {
+        KeyCode::Enter => KeyEffect::Submit,
+        KeyCode::Esc => KeyEffect::Cancel,
+        // Ctrl+C and Ctrl+D both cancel (Ctrl+D matches POSIX `read` EOF so a
+        // user reaching for the standard shortcut doesn't type 'd' into a
+        // password).
+        KeyCode::Char('c' | 'd') if ctrl => KeyEffect::Cancel,
+        // Any other Ctrl+letter chord is dropped, never pushed as a literal —
+        // otherwise Ctrl+U / Ctrl+W / Ctrl+L would silently corrupt the
+        // captured secret with control bytes the user can't see.
+        KeyCode::Char(_) if ctrl => KeyEffect::Ignore,
+        KeyCode::Backspace => {
+            if buf.pop().is_some() {
+                KeyEffect::Echo("\x08 \x08")
+            } else {
+                KeyEffect::Ignore
+            }
+        }
+        KeyCode::Char(c) => {
+            buf.push(c);
+            KeyEffect::Echo("*")
+        }
+        _ => KeyEffect::Ignore,
+    }
+}
+
+/// Collapse a multi-line paste onto one line by dropping ONLY newlines /
+/// carriage-returns — every other char (incl. tabs and other control bytes)
+/// is kept verbatim so a pasted secret isn't silently mutated (masking would
+/// hide the corruption). Pure, so the filter rule is unit-testable.
+fn paste_filter(s: &str) -> String {
+    s.chars().filter(|&c| c != '\n' && c != '\r').collect()
 }
 
 /// Layers `InteractiveIo` over a fallback resolver. Order: env hit → fallback
@@ -424,5 +454,68 @@ mod tests {
         let r = InteractiveResolver::new(io, EnvResolver);
         let out = r.resolve("X", &spec("X", false, false));
         assert_eq!(out, ResolvedInput::Skip);
+    }
+
+    // ── masked-reader line-editor rules (pure, no terminal needed) ──────────
+
+    fn ch(c: char) -> KeyCode {
+        KeyCode::Char(c)
+    }
+
+    #[test]
+    fn masked_key_types_and_masks() {
+        let mut buf = String::new();
+        for c in "hunter2".chars() {
+            assert!(matches!(masked_key(&mut buf, ch(c), false), KeyEffect::Echo("*")));
+        }
+        assert_eq!(buf, "hunter2");
+    }
+
+    #[test]
+    fn masked_key_backspace_pops_and_erases_then_noops_on_empty() {
+        let mut buf = "ab".to_string();
+        assert!(matches!(
+            masked_key(&mut buf, KeyCode::Backspace, false),
+            KeyEffect::Echo("\x08 \x08")
+        ));
+        assert_eq!(buf, "a");
+        masked_key(&mut buf, KeyCode::Backspace, false);
+        assert_eq!(buf, "");
+        // empty buffer → nothing to erase, no echo
+        assert!(matches!(
+            masked_key(&mut buf, KeyCode::Backspace, false),
+            KeyEffect::Ignore
+        ));
+    }
+
+    #[test]
+    fn masked_key_ctrl_chords_drop_not_pushed() {
+        let mut buf = "x".to_string();
+        // Ctrl+U / Ctrl+W / Ctrl+L are ignored, never appended.
+        for c in ['u', 'w', 'l', 'a'] {
+            assert!(matches!(masked_key(&mut buf, ch(c), true), KeyEffect::Ignore));
+        }
+        assert_eq!(buf, "x", "no ctrl chord may corrupt the secret buffer");
+    }
+
+    #[test]
+    fn masked_key_ctrl_c_and_d_cancel() {
+        let mut buf = String::new();
+        assert!(matches!(masked_key(&mut buf, ch('c'), true), KeyEffect::Cancel));
+        assert!(matches!(masked_key(&mut buf, ch('d'), true), KeyEffect::Cancel));
+    }
+
+    #[test]
+    fn masked_key_enter_submits_esc_cancels() {
+        let mut buf = String::new();
+        assert!(matches!(masked_key(&mut buf, KeyCode::Enter, false), KeyEffect::Submit));
+        assert!(matches!(masked_key(&mut buf, KeyCode::Esc, false), KeyEffect::Cancel));
+    }
+
+    #[test]
+    fn paste_filter_drops_only_line_breaks() {
+        // tabs and other content survive; only \n and \r are stripped.
+        assert_eq!(paste_filter("a\tb\r\nc\nd"), "a\tbcd");
+        assert_eq!(paste_filter("no-breaks"), "no-breaks");
     }
 }
