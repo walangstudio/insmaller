@@ -74,8 +74,9 @@ pub(crate) fn atomic_write(path: &Path, content: &[u8], mode: Option<u32>) -> Re
 }
 
 /// One scalar (String/Bool/Number) as its env string; `None` for anything
-/// else (Object/Array/Null) — used to flatten array elements.
-fn scalar_str(v: &serde_json::Value) -> Option<String> {
+/// else (Object/Array/Null) — used to flatten array elements and by the
+/// orchestrator's `confirm` gate so both stringify a value identically.
+pub(crate) fn scalar_str(v: &serde_json::Value) -> Option<String> {
     match v {
         serde_json::Value::String(s) => Some(s.clone()),
         serde_json::Value::Bool(b) => Some(b.to_string()),

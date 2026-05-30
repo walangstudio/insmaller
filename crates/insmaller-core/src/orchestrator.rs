@@ -50,11 +50,21 @@ fn when_truthy(expr: &str, ctx: &Ctx) -> Result<bool> {
     Ok(!(t.is_empty() || t == "false" || t == "0"))
 }
 
-/// Enforce a step's `confirm` gate against the value it produced. Renders the
-/// expected value through `ctx` and compares it (as a string) to the step's
-/// output value. No `confirm` ⇒ pass. Returns an `anyhow` error on mismatch so
-/// it flows through the same step-failure path (and honors `continue_on_error`)
-/// as any other step error.
+/// Enforce a step's `confirm` gate against the scalar value it produced.
+/// Renders the expected value through `ctx` and compares it (via the same
+/// `scalar_str` stringification the rest of the engine uses, so Bool/Number
+/// compare as `true`/`42`, not their JSON form) to the step's output value.
+///
+/// No `confirm` ⇒ pass. A step that produced no scalar value (the common
+/// `StepOutput::ok()` case for shell/exec/etc.) ⇒ pass: `confirm` can only
+/// gate a value, and silently aborting every value-less step it's attached to
+/// is a worse footgun than ignoring it. So `confirm` is meaningful only on
+/// value-producing steps (`prompt`/`input`/`save_input`).
+///
+/// Returns an `anyhow` error on mismatch so it flows through the same
+/// step-failure path as any other step error (and honors `continue_on_error`).
+/// NOTE: this runs after the retry loop, so a confirm mismatch is NOT retried
+/// — it's a deterministic gate, not a transient failure.
 fn confirm_gate(
     step: &Step,
     ctx: &Ctx,
@@ -63,14 +73,20 @@ fn confirm_gate(
     let Some(raw) = &step.confirm else {
         return Ok(());
     };
-    let expected = ctx.render(raw)?;
-    let actual = match &out.value {
-        Some(serde_json::Value::String(s)) => s.clone(),
-        Some(v) => v.to_string(),
-        None => String::new(),
+    // No scalar value to gate (value-less step, or Object/Array/Null) ⇒ no-op.
+    let Some(actual) = out.value.as_ref().and_then(crate::processors_io::scalar_str) else {
+        return Ok(());
     };
+    let expected = ctx.render(raw)?;
     if actual != expected {
-        anyhow::bail!("confirm: value did not match expected (aborting)");
+        // Name the step (kind + register_as) for diagnosability — never the
+        // value, which may be a secret.
+        let what = step
+            .register_as
+            .as_deref()
+            .map(|r| format!("{} (register_as={r})", step.kind))
+            .unwrap_or_else(|| step.kind.clone());
+        anyhow::bail!("confirm: '{what}' value did not match expected (aborting)");
     }
     Ok(())
 }
@@ -195,13 +211,13 @@ async fn run_steps(
         // unless its value equals the rendered expected. Checked here (not in
         // any one processor) so it applies to every value-producing step. A
         // skip produces no value, so the gate is a no-op there.
-        let result = match result {
-            Ok(out) if !out.skipped => match confirm_gate(step, &ctx, &out) {
-                Ok(()) => Ok(out),
-                Err(e) => Err(e),
-            },
-            other => other,
-        };
+        let result = result.and_then(|out| {
+            if out.skipped {
+                Ok(out)
+            } else {
+                confirm_gate(step, &ctx, &out).map(|()| out)
+            }
+        });
         match result {
             Ok(out) => {
                 // A deliberate skip is success, not failure — report ok and
@@ -917,6 +933,21 @@ mod tests {
         let e = steps_entry(vec![step("type=\"emit\"\nemit=\"{{ key }}\"\nconfirm=\"{{ key }}\"")]);
         let s = run_one(&reg, e).await;
         assert!(s.failed.is_empty(), "{:?}", s.failed);
+    }
+
+    #[tokio::test]
+    async fn confirm_on_valueless_step_is_noop_not_abort() {
+        // `rec` returns StepOutput::ok() (no value). A `confirm` on it must be
+        // a no-op (pass), NOT an unconditional abort — confirm only gates a
+        // produced scalar value.
+        let (reg, log) = rig2();
+        let e = steps_entry(vec![
+            step("type=\"rec\"\ntag=\"ran\"\nconfirm=\"whatever\""),
+            step("type=\"rec\"\ntag=\"after\""),
+        ]);
+        let s = run_one(&reg, e).await;
+        assert!(s.failed.is_empty(), "value-less confirm must not abort: {:?}", s.failed);
+        assert_eq!(*log.lock().unwrap(), vec!["ran", "after"]);
     }
 
     #[tokio::test]
