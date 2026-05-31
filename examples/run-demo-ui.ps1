@@ -21,7 +21,7 @@ $ErrorActionPreference = "Stop"
 
 if (-not (Test-Path $Exe)) {
   Write-Host "binary not found: $Exe" -ForegroundColor Red
-  Write-Host "build it first:  cargo build --offline --release -p insmaller-cli"
+  Write-Host "build it first:  cargo build --offline --release -p insmaller"
   exit 1
 }
 

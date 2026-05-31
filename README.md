@@ -84,7 +84,7 @@ instead, and `sentinel_path` sets it explicitly.
 ## Getting started
 
 ```sh
-cargo build --release -p insmaller-cli
+cargo install insmaller        # or: cargo build --release -p insmaller
 ```
 
 Put the binary on PATH. In your project, write an `insmaller.toml`:
@@ -122,8 +122,8 @@ Two crates, one binary, no runtime dependencies and no DLLs:
 
 - `insmaller-core` is the engine. It does not know about a terminal or a
   specific filesystem layout; a host drives it through the `EntrySource` trait.
-- `insmaller-cli` is the `insmaller` binary: argument parsing, config
-  discovery, the ratatui wizard, and the progress output.
+- `insmaller` is the binary crate: argument parsing, config discovery, the
+  ratatui wizard, and the progress output.
 
 The release binary is a single file of roughly 7 MB. HTTPS uses rustls, the
 archive codecs are compiled in, so there is no OpenSSL or zlib to install

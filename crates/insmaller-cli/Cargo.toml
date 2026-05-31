@@ -1,17 +1,20 @@
 [package]
-name = "insmaller-cli"
+name = "insmaller"
 version = "0.6.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Standalone harness to exercise the insmaller-core engine"
+homepage.workspace = true
+description = "Config-driven installer: describe install steps in TOML and run them from one binary"
+keywords = ["installer", "setup", "cli", "tui", "toml"]
+categories = ["command-line-utilities"]
 
 [[bin]]
 name = "insmaller"
 path = "src/main.rs"
 
 [dependencies]
-insmaller-core = { path = "../insmaller-core" }
+insmaller-core = { path = "../insmaller-core", version = "0.6.1" }
 anyhow.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
