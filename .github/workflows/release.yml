@@ -100,7 +100,7 @@ jobs:
           PY
 
       - name: Build
-        run: cargo build --release --locked -p insmaller-cli --target ${{ matrix.target }}
+        run: cargo build --release --locked -p insmaller --target ${{ matrix.target }}
 
       # Authenticode signing reduces AV/SmartScreen false-positives the most.
       # Inert until a certificate is provisioned: set repo variable

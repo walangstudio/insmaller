@@ -16,7 +16,7 @@ builds; the e2e writes only to a temp dir.
 ## Run the e2e (in a temp folder, outside the project)
 
 ```
-cargo build --offline --release -p insmaller-cli
+cargo build --offline --release -p insmaller
 pwsh -File examples\run-demo.ps1
 ```
 
