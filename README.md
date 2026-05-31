@@ -2,26 +2,21 @@
 
 ![version](https://img.shields.io/github/v/release/walangstudio/insmaller?sort=semver&color=blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
-![rust](https://img.shields.io/badge/rust-1.78%2B-orange)
-![tests](https://img.shields.io/badge/tests-283%20passing-brightgreen)
+![rust](https://img.shields.io/badge/rust-1.95-orange)
+![tests](https://img.shields.io/badge/tests-327%20passing-brightgreen)
+
+<sub>*(it's "insmaller" — "inshorter" just didn't sound right.)*</sub>
 
 insmaller installs things by reading a config file instead of running
 hand-written install code. You describe each tool as a list of steps in TOML,
 point insmaller at the config, and it runs them. It ships as one binary with
 nothing else to install.
 
-## Why this exists
-
-This came out of a reference installer that had a Rust function per installable tool.
-Every new tool, every package manager, every "also symlink this" meant editing
-and recompiling the binary. The install logic and the list of things to install
-were the same code.
-
-insmaller separates them. The engine knows how to run a handful of step types
-(run a shell snippet, download a file, extract an archive, copy, prompt for
-input, and so on). What to install lives in a config file and a catalog. Adding
-a tool is editing TOML, not writing Rust, and the same engine can be reused by
-other projects through one trait.
+The engine knows how to run a handful of step types (run a shell snippet,
+download a file, extract an archive, copy, prompt for input, and so on). What to
+install lives in a config file and a catalog. Adding a tool is editing TOML, not
+writing Rust, and the same engine can be reused by other projects through one
+trait.
 
 One rule shaped a lot of the design: an unattended run, in CI or a container,
 must never stop and wait for someone to type an answer. Inputs come from the
