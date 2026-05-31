@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.2] - 2026-05-31
+
+### Added
+- Per-crate `README.md` for `insmaller` and `insmaller-core` so the crates.io
+  pages document installation and usage. (No code changes; version bumped only
+  because crates.io renders the README from the published version.)
+
 ## [0.6.1] - 2026-05-31
 
 ### Fixed
