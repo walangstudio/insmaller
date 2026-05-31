@@ -894,7 +894,7 @@ dependencies = [
 
 [[package]]
 name = "insmaller"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -911,7 +911,7 @@ dependencies = [
 
 [[package]]
 name = "insmaller-core"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "async-trait",

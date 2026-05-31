@@ -1,10 +1,11 @@
 [package]
 name = "insmaller-core"
-version = "0.6.1"
+version = "0.6.2"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme = "README.md"
 description = "Config-driven installer engine: declarative step pipelines + pluggable processors"
 keywords = ["installer", "engine", "toml", "pipeline"]
 categories = ["development-tools"]
