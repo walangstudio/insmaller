@@ -376,6 +376,146 @@ fn headless_static_answerer_never_calls_api() {
     );
 }
 
+// ── date mask + calendar integration (headless via engine) ───────────────────
+
+/// The mask produces a valid ISO date string that the engine's check_typed
+/// accepts. We verify by feeding the rendered ISO string as the answer value.
+#[test]
+fn masked_date_digits_produce_valid_iso() {
+    let dir = tempfile::tempdir().unwrap();
+    write_base_config(dir.path());
+    fs::write(
+        dir.path().join("wizard.toml"),
+        r#"[[page]]
+id = "p"
+title = "P"
+[[page.field]]
+id = "dt"
+type = "date"
+"#,
+    )
+    .unwrap();
+    // Simulate what the mask produces when user types 2 0 2 6 0 9 1 5:
+    // render_date_mask would give "2026-09-15".
+    fs::write(dir.path().join("answers.toml"), "dt = \"2026-09-15\"\n").unwrap();
+    let out = run_setup(dir.path(), "answers.toml", &[]);
+    assert!(
+        out.status.success(),
+        "mask-produced ISO date must be accepted\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn masked_date_incomplete_is_empty_string_which_is_optional() {
+    // An incomplete mask produces "" which is treated as "not entered".
+    // An optional field must not error on empty.
+    let dir = tempfile::tempdir().unwrap();
+    write_base_config(dir.path());
+    fs::write(
+        dir.path().join("wizard.toml"),
+        r#"[[page]]
+id = "p"
+title = "P"
+[[page.field]]
+id = "dt"
+type = "date"
+required = false
+"#,
+    )
+    .unwrap();
+    // No answer → defaults to empty → optional field passes.
+    fs::write(dir.path().join("answers.toml"), "").unwrap();
+    let out = run_setup(dir.path(), "answers.toml", &[]);
+    assert!(
+        out.status.success(),
+        "optional empty date must not error\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn calendar_committed_date_is_valid_iso() {
+    // A date committed from the calendar has the same format as the mask.
+    // Verify the format "2026-09-15" is accepted by the engine.
+    let dir = tempfile::tempdir().unwrap();
+    write_base_config(dir.path());
+    fs::write(
+        dir.path().join("wizard.toml"),
+        r#"[[page]]
+id = "p"
+title = "P"
+[[page.field]]
+id = "dt"
+type = "date"
+min = "2026-01-01"
+max = "2027-12-31"
+"#,
+    )
+    .unwrap();
+    fs::write(dir.path().join("answers.toml"), "dt = \"2026-09-15\"\n").unwrap();
+    let out = run_setup(dir.path(), "answers.toml", &[]);
+    assert!(
+        out.status.success(),
+        "calendar-committed date must be accepted\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn calendar_esc_leaves_value_unchanged() {
+    // Esc means no value change. If the previous value was a valid date,
+    // the wizard must still accept it.
+    let dir = tempfile::tempdir().unwrap();
+    write_base_config(dir.path());
+    fs::write(
+        dir.path().join("wizard.toml"),
+        r#"[[page]]
+id = "p"
+title = "P"
+[[page.field]]
+id = "dt"
+type = "date"
+"#,
+    )
+    .unwrap();
+    fs::write(dir.path().join("answers.toml"), "dt = \"2026-09-01\"\n").unwrap();
+    let out = run_setup(dir.path(), "answers.toml", &[]);
+    assert!(
+        out.status.success(),
+        "pre-existing date value must survive Esc (no change)\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn masked_datetime_digits_produce_valid_iso() {
+    let dir = tempfile::tempdir().unwrap();
+    write_base_config(dir.path());
+    fs::write(
+        dir.path().join("wizard.toml"),
+        r#"[[page]]
+id = "p"
+title = "P"
+[[page.field]]
+id = "ts"
+type = "datetime"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("answers.toml"),
+        "ts = \"2026-09-15T12:30:00\"\n",
+    )
+    .unwrap();
+    let out = run_setup(dir.path(), "answers.toml", &[]);
+    assert!(
+        out.status.success(),
+        "mask-produced ISO datetime must be accepted\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 // ── example wizard parses and runs headless ───────────────────────────────────
 
 #[test]

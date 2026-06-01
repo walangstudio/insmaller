@@ -1043,9 +1043,8 @@ pub fn run_wizard(
                         WizValue::Bool(b) => Value::Bool(b),
                     };
                     if let Value::String(s) = &stored {
-                        synthetic
-                            .validate
-                            .check_typed(synthetic.field_type, &synthetic.id, s)?;
+                        let label = synthetic.prompt.as_deref().unwrap_or(&synthetic.id);
+                        synthetic.validate.check_typed(synthetic.field_type, label, s)?;
                     }
                     out.vars.insert(synthetic.id.clone(), stored);
                 }
@@ -1071,7 +1070,8 @@ pub fn run_wizard(
                 WizValue::Bool(b) => Value::Bool(b),
             };
             if let Value::String(s) = &stored {
-                field.validate.check_typed(field.field_type, &field.id, s)?;
+                let label = field.prompt.as_deref().unwrap_or(&field.id);
+                field.validate.check_typed(field.field_type, label, s)?;
             }
             out.vars.insert(field.id.clone(), stored);
         }
@@ -1244,7 +1244,8 @@ impl<'a> WizardSession<'a> {
                         || matches!(v, Value::Array(a) if a.is_empty())) =>
                 {
                     if let Value::String(s) = v {
-                        f.validate.check_typed(f.field_type, &f.id, s)?;
+                        let label = f.prompt.as_deref().unwrap_or(&f.id);
+                        f.validate.check_typed(f.field_type, label, s)?;
                     }
                     self.vars.insert(f.id.clone(), v.clone());
                 }

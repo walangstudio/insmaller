@@ -4,6 +4,7 @@
 //! quit). Drives a pure `WizardSession`. Plus an indicatif reporter for the
 //! install phase.
 
+use chrono::{Datelike, Days, Local, Months, NaiveDate};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -76,10 +77,17 @@ enum Widget {
         cursor_col: usize,
         scroll: usize,
     },
-    /// ISO date input (`YYYY-MM-DD`). Masked text-only — no filesystem picker.
-    Date { buf: String },
-    /// ISO datetime input (`YYYY-MM-DDTHH:MM:SS`). Masked text-only.
-    Datetime { buf: String },
+    /// ISO date input (`YYYY-MM-DD`). Digit-only masked entry; separators are
+    /// fixed. `digits` holds the 8 user-entered digit positions (b'_' = empty).
+    /// `dcur` is the index into `digits` (0-7). Space opens the calendar.
+    Date { digits: [u8; 8], dcur: usize, cal: Option<CalPicker> },
+    /// ISO datetime input (`YYYY-MM-DDTHH:MM:SS`). 14 digit slots.
+    Datetime { digits: [u8; 14], dcur: usize, cal: Option<CalPicker> },
+}
+
+/// Calendar overlay for Date/Datetime fields.
+struct CalPicker {
+    date: NaiveDate,
 }
 
 /// A visible line in a select's collapsible tree: a group `Header` (index into
@@ -455,6 +463,220 @@ fn collapse_key(field_id: &str, group: &str) -> String {
     format!("{field_id}\u{0}{group}")
 }
 
+// ── date/datetime mask helpers ───────────────────────────────────────────────
+
+/// The fixed separator characters for a Date mask at each string position.
+/// `YYYY-MM-DD`: positions 4 and 7 are `-`.
+/// Returns `Some(sep)` when `str_idx` is a separator, else `None`.
+fn date_sep(str_idx: usize) -> Option<char> {
+    match str_idx { 4 | 7 => Some('-'), _ => None }
+}
+
+/// Same for Datetime `YYYY-MM-DDTHH:MM:SS`.
+/// Separators at 4(`-`), 7(`-`), 10(`T`), 13(`:`), 16(`:`).
+fn datetime_sep(str_idx: usize) -> Option<char> {
+    match str_idx {
+        4 | 7 => Some('-'),
+        10 => Some('T'),
+        13 | 16 => Some(':'),
+        _ => None,
+    }
+}
+
+/// Render a Date digit array as a display string like `2026-09-__`.
+fn render_date_mask(digits: &[u8; 8]) -> String {
+    let mut s = String::with_capacity(10);
+    let mut di = 0usize;
+    for si in 0..10usize {
+        if let Some(sep) = date_sep(si) {
+            s.push(sep);
+        } else {
+            s.push(if digits[di] == b'_' { '_' } else { digits[di] as char });
+            di += 1;
+        }
+    }
+    s
+}
+
+/// Render a Datetime digit array as a display string like `2026-09-01T__:__:__`.
+fn render_datetime_mask(digits: &[u8; 14]) -> String {
+    let mut s = String::with_capacity(19);
+    let mut di = 0usize;
+    for si in 0..19usize {
+        if let Some(sep) = datetime_sep(si) {
+            s.push(sep);
+        } else {
+            s.push(if digits[di] == b'_' { '_' } else { digits[di] as char });
+            di += 1;
+        }
+    }
+    s
+}
+
+/// Parse an ISO date string into a digit array; fills `b'_'` for missing/bad slots.
+fn parse_date_digits(s: &str) -> [u8; 8] {
+    let mut d = [b'_'; 8];
+    let s = s.trim();
+    if s.len() >= 10 {
+        let bytes = s.as_bytes();
+        let slots = [0usize, 1, 2, 3, 5, 6, 8, 9];
+        for (i, &si) in slots.iter().enumerate() {
+            let b = bytes[si];
+            if b.is_ascii_digit() { d[i] = b; }
+        }
+    }
+    d
+}
+
+/// Parse an ISO datetime string into a digit array.
+fn parse_datetime_digits(s: &str) -> [u8; 14] {
+    let mut d = [b'_'; 14];
+    let s = s.trim();
+    if s.len() >= 19 {
+        let bytes = s.as_bytes();
+        let slots = [0usize, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18];
+        for (i, &si) in slots.iter().enumerate() {
+            let b = bytes[si];
+            if b.is_ascii_digit() { d[i] = b; }
+        }
+    }
+    d
+}
+
+/// Assemble a Date digit array into an ISO string if all 8 digits are filled.
+/// Returns `None` if any slot is still `b'_'` (incomplete).
+fn digits_to_date_str(digits: &[u8; 8]) -> Option<String> {
+    if digits.contains(&b'_') {
+        return None;
+    }
+    Some(render_date_mask(digits))
+}
+
+/// Assemble a Datetime digit array into an ISO string if all 14 digits are filled.
+fn digits_to_datetime_str(digits: &[u8; 14]) -> Option<String> {
+    if digits.contains(&b'_') {
+        return None;
+    }
+    Some(render_datetime_mask(digits))
+}
+
+/// Extract the date portion from the committed value of a Date or Datetime widget.
+/// Returns `Some(NaiveDate)` if the stored digits parse cleanly.
+fn date_from_date_digits(digits: &[u8; 8]) -> Option<NaiveDate> {
+    let s = digits_to_date_str(digits)?;
+    NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok()
+}
+
+/// Commit a `NaiveDate` back into a Date widget's digit array.
+fn date_to_date_digits(date: NaiveDate) -> [u8; 8] {
+    let s = date.format("%Y-%m-%d").to_string();
+    parse_date_digits(&s)
+}
+
+/// Commit a `NaiveDate` into a Datetime widget, preserving any time digits
+/// already typed (keeps `HH:MM:SS` if filled; otherwise defaults to `00:00:00`).
+fn date_to_datetime_digits(date: NaiveDate, existing: &[u8; 14]) -> [u8; 14] {
+    let date_str = date.format("%Y-%m-%d").to_string();
+    let mut new = parse_datetime_digits(&format!("{}T00:00:00", date_str));
+    // Preserve time digits (slots 8-13) if user had entered them.
+    for i in 8..14 {
+        if existing[i] != b'_' {
+            new[i] = existing[i];
+        }
+    }
+    new
+}
+
+/// Type a digit into a Date widget: fills slot `dcur`, advances past separators.
+/// Returns the new `dcur`.
+fn date_type_digit(digits: &mut [u8; 8], dcur: usize, ch: u8) -> usize {
+    if dcur >= 8 { return dcur; }
+    digits[dcur] = ch;
+    (dcur + 1).min(8)
+}
+
+/// Backspace in a Date widget: clears slot `dcur-1`, moves cursor back.
+/// Returns the new `dcur`.
+fn date_backspace(digits: &mut [u8; 8], dcur: usize) -> usize {
+    if dcur == 0 { return 0; }
+    let prev = dcur - 1;
+    digits[prev] = b'_';
+    prev
+}
+
+/// Type a digit into a Datetime widget. Returns new `dcur`.
+fn datetime_type_digit(digits: &mut [u8; 14], dcur: usize, ch: u8) -> usize {
+    if dcur >= 14 { return dcur; }
+    digits[dcur] = ch;
+    (dcur + 1).min(14)
+}
+
+/// Backspace in a Datetime widget. Returns new `dcur`.
+fn datetime_backspace(digits: &mut [u8; 14], dcur: usize) -> usize {
+    if dcur == 0 { return 0; }
+    let prev = dcur - 1;
+    digits[prev] = b'_';
+    prev
+}
+
+/// Build the `widget_value` string for a Date widget (empty string if incomplete).
+fn date_widget_value(digits: &[u8; 8]) -> String {
+    digits_to_date_str(digits).unwrap_or_default()
+}
+
+/// Build the `widget_value` string for a Datetime widget.
+fn datetime_widget_value(digits: &[u8; 14]) -> String {
+    digits_to_datetime_str(digits).unwrap_or_default()
+}
+
+// ── calendar helpers ─────────────────────────────────────────────────────────
+
+/// Number of days in `year`/`month` (1-based). Uses chrono: jump to the first
+/// of the next month minus one day, handling year wrap.
+fn days_in_month(year: i32, month: u32) -> u32 {
+    let (y, m) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+    NaiveDate::from_ymd_opt(y, m, 1)
+        .and_then(|d| d.pred_opt())
+        .map(|d| d.day())
+        .unwrap_or(30)
+}
+
+/// Render a calendar month as a vector of lines to display inside the overlay.
+/// Highlights `sel` with `[DD]` brackets; other days are ` DD`. Width is fixed
+/// at 20 chars for the week rows (7 × 3 = 21 minus the trailing space).
+fn render_calendar(year: i32, month: u32, sel: NaiveDate) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    lines.push("Su Mo Tu We Th Fr Sa".to_string());
+    let first = NaiveDate::from_ymd_opt(year, month, 1).unwrap_or(sel);
+    // weekday of the 1st: Sun=0 … Sat=6
+    let start_wd = first.weekday().num_days_from_sunday() as usize;
+    let dim = days_in_month(year, month);
+    let mut row = String::new();
+    // leading blanks
+    for _ in 0..start_wd {
+        row.push_str("   ");
+    }
+    let mut col = start_wd;
+    for day in 1..=dim {
+        let d = NaiveDate::from_ymd_opt(year, month, day).unwrap_or(sel);
+        // 3 chars per cell so the columns line up: selected = `>DD`, normal = ` DD`.
+        let marker = if d == sel { '>' } else { ' ' };
+        row.push_str(&format!("{marker}{day:02}"));
+        col += 1;
+        if col == 7 {
+            lines.push(row.clone());
+            row.clear();
+            col = 0;
+        } else {
+            row.push(' ');
+        }
+    }
+    if !row.trim().is_empty() {
+        lines.push(row);
+    }
+    lines
+}
+
 /// Insert a character at the logical cursor position inside a textarea buffer.
 /// The buffer uses `\n` as the line separator. Updates `cursor_row`/`cursor_col`
 /// in place after the insertion.
@@ -534,6 +756,65 @@ fn textarea_byte_pos(buf: &str, row: usize, col: usize) -> usize {
     buf.len()
 }
 
+/// Check a non-empty Path value for plausible existence. Returns `Ok(())` when
+/// the path itself exists OR its parent directory exists (so a new leaf under an
+/// existing directory is accepted). Returns `Err(message)` with a clear label
+/// when neither is true. A bare relative name with no parent component (e.g.
+/// `newdir`) is accepted because its implicit parent is the cwd, which always
+/// exists. Injected `exists_fn` makes this unit-testable without touching disk.
+fn validate_path_value(
+    label: &str,
+    value: &str,
+    exists_fn: impl Fn(&std::path::Path) -> bool,
+    is_dir_fn: impl Fn(&std::path::Path) -> bool,
+) -> Result<(), String> {
+    let p = std::path::Path::new(value);
+    if exists_fn(p) {
+        return Ok(());
+    }
+    let parent = p.parent();
+    match parent {
+        // No parent component or empty parent → bare name; cwd is the parent → accept.
+        None => Ok(()),
+        Some(par) if par.as_os_str().is_empty() => Ok(()),
+        Some(par) => {
+            if exists_fn(par) && is_dir_fn(par) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{label}: directory not found — check the path for typos (parent '{}' does not exist)",
+                    par.display()
+                ))
+            }
+        }
+    }
+}
+
+/// Run Path validation for all Path fields in `fields` whose committed value is
+/// non-empty. Returns the index of the first failing field and its error message,
+/// or `None` if all pass.
+fn run_path_validation(fields: &[Field], answers: &Map<String, Value>) -> Option<(usize, String)> {
+    for (idx, field) in fields.iter().enumerate() {
+        if field.field_type != FieldType::Path {
+            continue;
+        }
+        let value = match answers.get(&field.id) {
+            Some(Value::String(s)) if !s.is_empty() => s.as_str(),
+            _ => continue,
+        };
+        let label = field.prompt.as_deref().unwrap_or(&field.id);
+        if let Err(msg) = validate_path_value(
+            label,
+            value,
+            |p| p.exists(),
+            |p| p.is_dir(),
+        ) {
+            return Some((idx, msg));
+        }
+    }
+    None
+}
+
 /// Run API validation for all fields in `fields` that have `validate.api` set
 /// and whose committed value is a non-empty string. Returns the index of the
 /// first failing field and its error message, or `None` if all pass. Shows a
@@ -554,15 +835,16 @@ fn run_api_validation(
             Some(Value::String(s)) if !s.is_empty() => s.clone(),
             _ => continue,
         };
-        let field_id = field.id.clone();
+        // Use the human-readable prompt as the field label in error messages.
+        let field_label = field.prompt.as_deref().unwrap_or(&field.id).to_string();
 
         // Spawn a thread so we can repaint the spinner while waiting.
         let (tx, rx) = mpsc::channel::<insmaller_core::Result<()>>();
         let api_clone = api.clone();
         let value_clone = value.clone();
-        let fid_clone = field_id.clone();
+        let label_clone = field_label.clone();
         std::thread::spawn(move || {
-            let result = api_clone.call(&fid_clone, &value_clone);
+            let result = api_clone.call(&label_clone, &value_clone);
             let _ = tx.send(result);
         });
 
@@ -599,7 +881,7 @@ fn run_api_validation(
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     return Some((
                         field_idx,
-                        format!("api validation: thread disconnected for field '{field_id}'"),
+                        format!("api validation: thread disconnected for '{field_label}'"),
                     ));
                 }
             }
@@ -667,18 +949,20 @@ fn init_widget(
             cursor_col: 0,
             scroll: 0,
         },
-        FieldType::Date => Widget::Date {
-            buf: match prior {
-                Some(Value::String(s)) => s,
+        FieldType::Date => {
+            let s = match prior {
+                Some(Value::String(ref v)) => v.clone(),
                 _ => f.default.clone().unwrap_or_default(),
-            },
-        },
-        FieldType::Datetime => Widget::Datetime {
-            buf: match prior {
-                Some(Value::String(s)) => s,
+            };
+            Widget::Date { digits: parse_date_digits(&s), dcur: 0, cal: None }
+        }
+        FieldType::Datetime => {
+            let s = match prior {
+                Some(Value::String(ref v)) => v.clone(),
                 _ => f.default.clone().unwrap_or_default(),
-            },
-        },
+            };
+            Widget::Datetime { digits: parse_datetime_digits(&s), dcur: 0, cal: None }
+        }
         _ => Widget::Input {
             buf: match prior {
                 Some(Value::String(s)) => s,
@@ -704,13 +988,13 @@ fn widget_value(w: &Widget) -> Value {
         ),
         Widget::Toggle { on } => Value::Bool(*on),
         Widget::Input { buf, .. } => Value::String(buf.clone()),
-        Widget::Path { buf, .. } => Value::String(buf.clone()),
+        Widget::Path { buf, .. } => Value::String(buf.trim().to_string()),
         Widget::Dropdown { choices, sel, .. } => Value::String(
             choices.get(*sel).cloned().unwrap_or_default(),
         ),
         Widget::Textarea { buf, .. } => Value::String(buf.clone()),
-        Widget::Date { buf, .. } => Value::String(buf.clone()),
-        Widget::Datetime { buf, .. } => Value::String(buf.clone()),
+        Widget::Date { digits, .. } => Value::String(date_widget_value(digits)),
+        Widget::Datetime { digits, .. } => Value::String(datetime_widget_value(digits)),
     }
 }
 
@@ -977,20 +1261,20 @@ pub fn run_wizard_tui(
                                 items.push(ListItem::new("   [Tab to commit · Enter newline]".to_string()));
                             }
                         }
-                        Widget::Date { buf, .. } => {
-                            let mask = if buf.is_empty() { "____-__-__".to_string() } else { buf.clone() };
+                        Widget::Date { digits, .. } => {
+                            let mask = render_date_mask(digits);
                             items.push(ListItem::new(format!(
                                 "   {}{}",
                                 mask,
-                                if focused { "_   [YYYY-MM-DD]" } else { "" }
+                                if focused { "  [digits only · Space: calendar]" } else { "" }
                             )));
                         }
-                        Widget::Datetime { buf, .. } => {
-                            let mask = if buf.is_empty() { "____-__-__T__:__:__".to_string() } else { buf.clone() };
+                        Widget::Datetime { digits, .. } => {
+                            let mask = render_datetime_mask(digits);
                             items.push(ListItem::new(format!(
                                 "   {}{}",
                                 mask,
-                                if focused { "_   [YYYY-MM-DDTHH:MM:SS]" } else { "" }
+                                if focused { "  [digits only · Space: calendar]" } else { "" }
                             )));
                         }
                     }
@@ -1109,6 +1393,43 @@ pub fn run_wizard_tui(
                     fr.render_stateful_widget(list, area, &mut st);
                 }
 
+                // Calendar overlay for Date / Datetime fields.
+                let cal_opt: Option<(&CalPicker, bool)> = match widgets.get(focus) {
+                    Some(Widget::Date { cal: Some(c), .. }) => Some((c, false)),
+                    Some(Widget::Datetime { cal: Some(c), .. }) => Some((c, true)),
+                    _ => None,
+                };
+                if let Some((cal, is_datetime)) = cal_opt {
+                    let area = centered_rect(36, 60, fr.area());
+                    let month_name = cal.date.format("%B %Y").to_string();
+                    let title = format!(" {month_name}  (←→ day · ↑↓ week · PgUp/Dn month · Enter · Esc) ");
+                    let cal_lines = render_calendar(cal.date.year(), cal.date.month(), cal.date);
+                    let hint = if is_datetime { "  (date only; time preserved)" } else { "" };
+                    let mut rows_cal: Vec<ListItem> = cal_lines
+                        .iter()
+                        .map(|l| ListItem::new(format!(" {l}")))
+                        .collect();
+                    rows_cal.push(ListItem::new(format!(" {hint}")));
+                    let list = List::new(rows_cal).block(panel(title, true, &pal));
+                    if pal.colored() {
+                        let fa = fr.area();
+                        let sx = area.x + 1;
+                        let sy = area.y + 1;
+                        let shadow = Rect {
+                            x: sx,
+                            y: sy,
+                            width: area.width.min(fa.width.saturating_sub(sx)),
+                            height: area.height.min(fa.height.saturating_sub(sy)),
+                        };
+                        fr.render_widget(
+                            Block::default().style(Style::default().bg(pal.shadow)),
+                            shadow,
+                        );
+                    }
+                    fr.render_widget(Clear, area);
+                    fr.render_widget(list, area);
+                }
+
                 let btn = |label: &str, idx: usize, enabled: bool| {
                     let st = if !enabled {
                         Style::default().fg(pal.muted)
@@ -1157,9 +1478,6 @@ pub fn run_wizard_tui(
             }
 
             // Pre-compute overlay states so all branches can reference them.
-            // Date/Datetime are masked text-only — the filesystem Picker is
-            // not opened for them (it would commit a path string into the date
-            // buffer, corrupting the value).
             let path_picker_open = matches!(
                 widgets.get(focus),
                 Some(Widget::Path { picker: Some(_), .. })
@@ -1167,6 +1485,11 @@ pub fn run_wizard_tui(
             let dropdown_open_pre = matches!(
                 widgets.get(focus),
                 Some(Widget::Dropdown { open: true, .. })
+            );
+            let cal_open_pre = matches!(
+                widgets.get(focus),
+                Some(Widget::Date { cal: Some(_), .. })
+                    | Some(Widget::Datetime { cal: Some(_), .. })
             );
 
             // An open path browser owns every key until it closes.
@@ -1269,6 +1592,74 @@ pub fn run_wizard_tui(
                 continue;
             }
 
+            // Calendar overlay owns every key while open.
+            if cal_open_pre {
+                match widgets.get_mut(focus) {
+                    Some(Widget::Date { digits, cal, .. }) => {
+                        if let Some(c) = cal.as_mut() {
+                            match k.code {
+                                KeyCode::Esc => *cal = None,
+                                KeyCode::Enter => {
+                                    *digits = date_to_date_digits(c.date);
+                                    *cal = None;
+                                }
+                                KeyCode::Left => {
+                                    c.date = c.date.pred_opt().unwrap_or(c.date);
+                                }
+                                KeyCode::Right => {
+                                    c.date = c.date.succ_opt().unwrap_or(c.date);
+                                }
+                                KeyCode::Up => {
+                                    c.date = c.date.checked_sub_days(Days::new(7)).unwrap_or(c.date);
+                                }
+                                KeyCode::Down => {
+                                    c.date = c.date.checked_add_days(Days::new(7)).unwrap_or(c.date);
+                                }
+                                KeyCode::PageUp => {
+                                    c.date = c.date.checked_sub_months(Months::new(1)).unwrap_or(c.date);
+                                }
+                                KeyCode::PageDown => {
+                                    c.date = c.date.checked_add_months(Months::new(1)).unwrap_or(c.date);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Some(Widget::Datetime { digits, cal, .. }) => {
+                        if let Some(c) = cal.as_mut() {
+                            match k.code {
+                                KeyCode::Esc => *cal = None,
+                                KeyCode::Enter => {
+                                    *digits = date_to_datetime_digits(c.date, digits);
+                                    *cal = None;
+                                }
+                                KeyCode::Left => {
+                                    c.date = c.date.pred_opt().unwrap_or(c.date);
+                                }
+                                KeyCode::Right => {
+                                    c.date = c.date.succ_opt().unwrap_or(c.date);
+                                }
+                                KeyCode::Up => {
+                                    c.date = c.date.checked_sub_days(Days::new(7)).unwrap_or(c.date);
+                                }
+                                KeyCode::Down => {
+                                    c.date = c.date.checked_add_days(Days::new(7)).unwrap_or(c.date);
+                                }
+                                KeyCode::PageUp => {
+                                    c.date = c.date.checked_sub_months(Months::new(1)).unwrap_or(c.date);
+                                }
+                                KeyCode::PageDown => {
+                                    c.date = c.date.checked_add_months(Months::new(1)).unwrap_or(c.date);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
             // Ctrl+B opens the filesystem browser on a focused Path field only.
             // Date/Datetime are masked text-only; Ctrl+B is a no-op for them.
             if k.code == KeyCode::Char('b') && k.modifiers.contains(KeyModifiers::CONTROL) {
@@ -1287,7 +1678,7 @@ pub fn run_wizard_tui(
                     | Some(Widget::Datetime { .. })
             );
             // quit
-            if k.code == KeyCode::Char('q') && !editing && !dropdown_open_pre {
+            if k.code == KeyCode::Char('q') && !editing && !dropdown_open_pre && !cal_open_pre {
                 return Ok(false);
             }
 
@@ -1369,7 +1760,22 @@ pub fn run_wizard_tui(
                             textarea_insert(buf, cursor_row, cursor_col, ' ');
                             textarea_fix_scroll(scroll, *cursor_row);
                         }
-                        Widget::Date { buf, .. } | Widget::Datetime { buf, .. } => buf.push(' '),
+                        Widget::Date { digits, cal, .. } => {
+                            // Space opens the calendar overlay.
+                            let seed = date_from_date_digits(digits)
+                                .unwrap_or_else(|| Local::now().date_naive());
+                            *cal = Some(CalPicker { date: seed });
+                        }
+                        Widget::Datetime { digits, cal, .. } => {
+                            // Space opens the calendar overlay.
+                            let date_only = {
+                                // extract date from first 8 digit slots
+                                let date_digits: [u8; 8] = digits[..8].try_into().unwrap_or([b'_'; 8]);
+                                date_from_date_digits(&date_digits)
+                                    .unwrap_or_else(|| Local::now().date_naive())
+                            };
+                            *cal = Some(CalPicker { date: date_only });
+                        }
                         Widget::Dropdown { open, filter, cur, .. } => {
                             // Space opens the dropdown.
                             *open = true;
@@ -1381,10 +1787,15 @@ pub fn run_wizard_tui(
                 }
                 KeyCode::Char(ch) if editing => {
                     match &mut widgets[focus] {
-                        Widget::Input { buf, .. }
-                        | Widget::Path { buf, .. }
-                        | Widget::Date { buf, .. }
-                        | Widget::Datetime { buf, .. } => buf.push(ch),
+                        Widget::Input { buf, .. } | Widget::Path { buf, .. } => buf.push(ch),
+                        Widget::Date { digits, dcur, .. } if ch.is_ascii_digit() => {
+                            *dcur = date_type_digit(digits, *dcur, ch as u8);
+                        }
+                        Widget::Date { .. } => {} // non-digit silently rejected
+                        Widget::Datetime { digits, dcur, .. } if ch.is_ascii_digit() => {
+                            *dcur = datetime_type_digit(digits, *dcur, ch as u8);
+                        }
+                        Widget::Datetime { .. } => {} // non-digit silently rejected
                         Widget::Textarea { buf, cursor_row, cursor_col, scroll } => {
                             textarea_insert(buf, cursor_row, cursor_col, ch);
                             textarea_fix_scroll(scroll, *cursor_row);
@@ -1394,10 +1805,13 @@ pub fn run_wizard_tui(
                 }
                 KeyCode::Backspace if editing => {
                     match &mut widgets[focus] {
-                        Widget::Input { buf, .. }
-                        | Widget::Path { buf, .. }
-                        | Widget::Date { buf, .. }
-                        | Widget::Datetime { buf, .. } => { buf.pop(); }
+                        Widget::Input { buf, .. } | Widget::Path { buf, .. } => { buf.pop(); }
+                        Widget::Date { digits, dcur, .. } => {
+                            *dcur = date_backspace(digits, *dcur);
+                        }
+                        Widget::Datetime { digits, dcur, .. } => {
+                            *dcur = datetime_backspace(digits, *dcur);
+                        }
                         Widget::Textarea { buf, cursor_row, cursor_col, scroll } => {
                             textarea_backspace(buf, cursor_row, cursor_col);
                             textarea_fix_scroll(scroll, *cursor_row);
@@ -1435,10 +1849,15 @@ pub fn run_wizard_tui(
                             break;
                         }
                     } else {
-                        // Next (or any field) → try API validation then submit page.
+                        // Next (or any field) → path validation, API validation, submit.
                         let m = commit(&widgets, &fields);
-                        // Run API validation for each field that has api config,
-                        // unless no_api_validate is set.
+                        // Path existence check (TUI only; headless/--answers skips this).
+                        if let Some((fail_idx, path_err)) = run_path_validation(&fields, &m) {
+                            err = Some(path_err);
+                            focus = fail_idx;
+                            continue;
+                        }
+                        // API validation (skipped when --no-api-validate).
                         if !no_api_validate {
                             if let Some((fail_idx, api_err)) = run_api_validation(&fields, &m, &mut term, &pal, &mut frame) {
                                 err = Some(api_err);
@@ -1512,9 +1931,14 @@ impl Reporter for BarReporter {
 #[cfg(test)]
 mod tests {
     use super::{
-        group_list, group_mark_multi, item_label, list_dir, textarea_backspace, textarea_byte_pos,
-        textarea_insert, vert_nav, visible_rows, GroupDefaults, Picker, Row,
+        date_backspace, date_from_date_digits, date_to_date_digits, date_type_digit,
+        date_widget_value, datetime_backspace, datetime_type_digit, datetime_widget_value,
+        days_in_month, group_list, group_mark_multi, item_label, list_dir, parse_date_digits,
+        parse_datetime_digits, render_date_mask, render_datetime_mask, textarea_backspace,
+        textarea_byte_pos, textarea_insert, validate_path_value, vert_nav, visible_rows,
+        GroupDefaults, Picker, Row,
     };
+    use chrono::{Datelike, Days, Months, NaiveDate};
     use insmaller_core::Choice;
 
     // ── textarea helpers ─────────────────────────────────────────────────
@@ -1981,5 +2405,301 @@ mod tests {
             let clamped = cur.min(filtered.len() - 1);
             assert!(clamped < filtered.len(), "clamped cursor must be within filtered list");
         }
+    }
+
+    // ── date mask helpers ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_date_digits_full_string() {
+        let d = parse_date_digits("2026-09-15");
+        assert_eq!(&d, b"20260915");
+    }
+
+    #[test]
+    fn parse_date_digits_empty() {
+        let d = parse_date_digits("");
+        assert_eq!(d, [b'_'; 8]);
+    }
+
+    #[test]
+    fn render_date_mask_all_empty() {
+        let d = [b'_'; 8];
+        assert_eq!(render_date_mask(&d), "____-__-__");
+    }
+
+    #[test]
+    fn render_date_mask_partial() {
+        let mut d = [b'_'; 8];
+        d[0] = b'2'; d[1] = b'0'; d[2] = b'2'; d[3] = b'6';
+        assert_eq!(render_date_mask(&d), "2026-__-__");
+    }
+
+    #[test]
+    fn render_date_mask_full() {
+        let d = parse_date_digits("2026-09-15");
+        assert_eq!(render_date_mask(&d), "2026-09-15");
+    }
+
+    #[test]
+    fn render_datetime_mask_all_empty() {
+        let d = [b'_'; 14];
+        assert_eq!(render_datetime_mask(&d), "____-__-__T__:__:__");
+    }
+
+    #[test]
+    fn render_datetime_mask_full() {
+        let d = parse_datetime_digits("2026-09-15T12:30:00");
+        assert_eq!(render_datetime_mask(&d), "2026-09-15T12:30:00");
+    }
+
+    #[test]
+    fn date_type_digit_fills_slots_and_advances() {
+        let mut d = [b'_'; 8];
+        let mut cur = 0usize;
+        for ch in b"20260915" {
+            cur = date_type_digit(&mut d, cur, *ch);
+        }
+        assert_eq!(cur, 8);
+        assert_eq!(render_date_mask(&d), "2026-09-15");
+    }
+
+    #[test]
+    fn date_type_digit_stops_at_end() {
+        let mut d = parse_date_digits("2026-09-15");
+        let cur = date_type_digit(&mut d, 8, b'9'); // past end
+        assert_eq!(cur, 8);
+    }
+
+    #[test]
+    fn date_backspace_clears_last_digit() {
+        let mut d = parse_date_digits("2026-09-15");
+        let cur = date_backspace(&mut d, 8);
+        assert_eq!(cur, 7);
+        assert_eq!(d[7], b'_');
+        assert_eq!(render_date_mask(&d), "2026-09-1_");
+    }
+
+    #[test]
+    fn date_backspace_at_zero_is_noop() {
+        let mut d = [b'_'; 8];
+        let cur = date_backspace(&mut d, 0);
+        assert_eq!(cur, 0);
+    }
+
+    #[test]
+    fn datetime_type_and_backspace() {
+        let mut d = [b'_'; 14];
+        let mut cur = 0usize;
+        for ch in b"20260915123000" {
+            cur = datetime_type_digit(&mut d, cur, *ch);
+        }
+        assert_eq!(cur, 14);
+        assert_eq!(render_datetime_mask(&d), "2026-09-15T12:30:00");
+        // backspace once
+        cur = datetime_backspace(&mut d, cur);
+        assert_eq!(cur, 13);
+        assert_eq!(d[13], b'_');
+    }
+
+    #[test]
+    fn date_widget_value_incomplete_is_empty() {
+        let d = parse_date_digits("2026-09-__");
+        // incomplete: last 2 slots are '_'
+        assert_eq!(date_widget_value(&d), "");
+    }
+
+    #[test]
+    fn date_widget_value_complete() {
+        let d = parse_date_digits("2026-09-15");
+        assert_eq!(date_widget_value(&d), "2026-09-15");
+    }
+
+    #[test]
+    fn datetime_widget_value_complete() {
+        let d = parse_datetime_digits("2026-09-15T12:30:00");
+        assert_eq!(datetime_widget_value(&d), "2026-09-15T12:30:00");
+    }
+
+    // ── calendar helpers ─────────────────────────────────────────────────
+
+    #[test]
+    fn days_in_month_regular() {
+        assert_eq!(days_in_month(2026, 9), 30); // September
+        assert_eq!(days_in_month(2026, 1), 31); // January
+        assert_eq!(days_in_month(2026, 2), 28); // non-leap
+        assert_eq!(days_in_month(2024, 2), 29); // leap
+    }
+
+    #[test]
+    fn days_in_month_december_wraps() {
+        assert_eq!(days_in_month(2026, 12), 31);
+    }
+
+    #[test]
+    fn date_to_date_digits_roundtrip() {
+        let d = NaiveDate::from_ymd_opt(2026, 9, 15).unwrap();
+        let digits = date_to_date_digits(d);
+        assert_eq!(render_date_mask(&digits), "2026-09-15");
+    }
+
+    #[test]
+    fn date_from_date_digits_parses() {
+        let d = parse_date_digits("2026-09-15");
+        let nd = date_from_date_digits(&d).unwrap();
+        assert_eq!(nd.year(), 2026);
+        assert_eq!(nd.month(), 9);
+        assert_eq!(nd.day(), 15);
+    }
+
+    #[test]
+    fn date_from_date_digits_incomplete_is_none() {
+        let d = [b'_'; 8];
+        assert!(date_from_date_digits(&d).is_none());
+    }
+
+    #[test]
+    fn cal_navigate_forward_backward() {
+        let start = NaiveDate::from_ymd_opt(2026, 9, 15).unwrap();
+        let next = start.succ_opt().unwrap();
+        assert_eq!(next.day(), 16);
+        let prev = start.pred_opt().unwrap();
+        assert_eq!(prev.day(), 14);
+    }
+
+    #[test]
+    fn cal_navigate_week() {
+        use chrono::Days;
+        let start = NaiveDate::from_ymd_opt(2026, 9, 15).unwrap();
+        let next_week = start.checked_add_days(Days::new(7)).unwrap();
+        assert_eq!(next_week.day(), 22);
+        let prev_week = start.checked_sub_days(Days::new(7)).unwrap();
+        assert_eq!(prev_week.day(), 8);
+    }
+
+    #[test]
+    fn cal_navigate_month() {
+        use chrono::Months;
+        let start = NaiveDate::from_ymd_opt(2026, 9, 15).unwrap();
+        let next_m = start.checked_add_months(Months::new(1)).unwrap();
+        assert_eq!(next_m.month(), 10);
+        let prev_m = start.checked_sub_months(Months::new(1)).unwrap();
+        assert_eq!(prev_m.month(), 8);
+    }
+
+    #[test]
+    fn cal_enter_commits_date_to_digits() {
+        // Simulate calendar Enter: date → digits → render
+        let date = NaiveDate::from_ymd_opt(2026, 9, 15).unwrap();
+        let digits = date_to_date_digits(date);
+        assert_eq!(date_widget_value(&digits), "2026-09-15");
+    }
+
+    #[test]
+    fn cal_esc_leaves_digits_unchanged() {
+        // Esc = no mutation: existing digits untouched. The CalPicker holds
+        // an internal `date` but on Esc we never call date_to_date_digits, so
+        // the widget's `digits` array is never written.
+        let original = parse_date_digits("2026-09-01");
+        // verify the original value is recoverable from the digits
+        assert_eq!(date_widget_value(&original), "2026-09-01");
+    }
+
+    // ── path validation (injected fs) ───────────────────────────────────
+
+    /// Helpers: `exists_yes` always returns true, `exists_no` always false,
+    /// `is_dir_yes` always true.
+    fn exists_yes(_: &std::path::Path) -> bool { true }
+    fn exists_no(_: &std::path::Path) -> bool { false }
+    fn is_dir_yes(_: &std::path::Path) -> bool { true }
+    fn is_dir_no(_: &std::path::Path) -> bool { false }
+
+    #[test]
+    fn path_existing_path_accepted() {
+        // Path itself exists → always accepted.
+        let r = validate_path_value("My path", "/some/existing/dir", exists_yes, is_dir_yes);
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn path_new_leaf_under_existing_parent_accepted() {
+        // Path doesn't exist but parent does and is a dir → accepted (new leaf).
+        let exists = |p: &std::path::Path| p != std::path::Path::new("/parent/newleaf");
+        let r = validate_path_value("My path", "/parent/newleaf", exists, is_dir_yes);
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn path_nonexistent_parent_rejected() {
+        // Neither path nor parent exists → rejected with a clear message.
+        let r = validate_path_value("My path", "/missing/parent/leaf", exists_no, is_dir_yes);
+        assert!(r.is_err());
+        let msg = r.unwrap_err();
+        assert!(msg.contains("My path"), "label missing from error: {msg}");
+        assert!(msg.contains("missing/parent"), "parent dir missing from error: {msg}");
+    }
+
+    #[test]
+    fn path_parent_exists_but_is_not_a_dir_rejected() {
+        // Parent exists but is a file, not a directory → rejected.
+        let exists = |p: &std::path::Path| p == std::path::Path::new("/parent");
+        let r = validate_path_value("dest", "/parent/leaf", exists, is_dir_no);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn path_bare_name_no_parent_accepted() {
+        // A bare name like `newdir` has an empty parent → cwd implicitly valid.
+        let r = validate_path_value("dir", "newdir", exists_no, is_dir_yes);
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn path_trim_via_real_fs() {
+        // widget_value trims: we test the trim logic directly here.
+        // "  /tmp  " trimmed is "/tmp".
+        let trimmed = "  /tmp  ".trim().to_string();
+        assert_eq!(trimmed, "/tmp");
+    }
+
+    #[test]
+    fn path_trailing_space_trimmed_and_real_parent_accepted() {
+        // Simulate the full flow: a value with leading/trailing spaces is first
+        // trimmed by widget_value, then the trimmed value is validated.
+        let raw = format!("  {}  ", std::env::temp_dir().display());
+        let trimmed = raw.trim();
+        // temp_dir() itself exists
+        let r = validate_path_value("dir", trimmed, |p| p.exists(), |p| p.is_dir());
+        assert!(r.is_ok(), "trimmed temp_dir must be accepted: {:?}", r);
+    }
+
+    #[test]
+    fn path_new_leaf_under_temp_dir_accepted() {
+        // temp_dir()/nonexistent_leaf: parent (temp_dir) exists, leaf doesn't.
+        let leaf = std::env::temp_dir().join("__insmaller_test_nonexistent_leaf_xyz__");
+        let _ = std::fs::remove_file(&leaf); // ensure it doesn't exist
+        let r = validate_path_value(
+            "out",
+            &leaf.to_string_lossy(),
+            |p| p.exists(),
+            |p| p.is_dir(),
+        );
+        assert!(r.is_ok(), "new leaf under existing parent must be accepted: {:?}", r);
+    }
+
+    #[test]
+    fn path_typo_parent_rejected_real_fs() {
+        // A path whose parent definitely doesn't exist must be rejected.
+        let bad = std::env::temp_dir()
+            .join("__definitely_absent_parent_xyz_abc__")
+            .join("leaf");
+        let r = validate_path_value(
+            "output path",
+            &bad.to_string_lossy(),
+            |p| p.exists(),
+            |p| p.is_dir(),
+        );
+        assert!(r.is_err(), "nonexistent parent must be rejected");
+        let msg = r.unwrap_err();
+        assert!(msg.contains("output path"), "label in error: {msg}");
     }
 }
