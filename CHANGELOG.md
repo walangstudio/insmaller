@@ -4,6 +4,33 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] - 2026-06-01
+
+### Added
+- **`dropdown` field type.** A collapsed, type-to-search select: the list is
+  hidden until the user starts typing, then filters to matching options. Distinct
+  from `single_select`, which remains an expanded radio list.
+- **`textarea` field type.** Multi-line free text; newlines are preserved in the
+  collected value.
+- **`date` field type.** Single-line date entry; the accepted format is ISO
+  `YYYY-MM-DD`. Range bounds via `min`/`max` (ISO date strings).
+- **`datetime` field type.** Single-line date-time entry; the accepted format is
+  ISO `YYYY-MM-DDTHH:MM:SS`. Range bounds via `min`/`max` (ISO date strings).
+- **`[page.field.api]` — field-level API validation.** After local validators
+  pass, the engine renders `{{value}}` into the configured `url` (and optionally
+  `headers`/`body`), fires an HTTP request, and accepts the value only if the
+  response matches `expect_status` (default: any 2xx) and, when set,
+  `expect_json_path` resolves truthy. On failure the field stays focused and
+  shows the `error` message. Keys: `url` (required, http/https, may contain
+  `{{value}}`), `method` (default `GET`), `headers` (array of `[name, value]`
+  pairs), `body`, `expect_status`, `expect_json_path`, `timeout_ms` (default
+  5000), `error`. Skipped on `--answers` / unattended runs by design; `--no-api-validate`
+  skips all API checks (useful offline/CI).
+
+### Changed
+- `min`/`max` on a field now accept an ISO date string in addition to a number.
+  Existing numeric bounds are unaffected (backwards compatible).
+
 ## [0.6.2] - 2026-05-31
 
 ### Added

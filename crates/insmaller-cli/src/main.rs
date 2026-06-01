@@ -466,7 +466,7 @@ fn collect_keys(a: &[String]) -> Vec<String> {
     while i < a.len() {
         match a[i].as_str() {
             "--config" | "--catalog" | "--jobs" | "-j" => i += 2,
-            "--dry-run" | "--json" | "--force" | "--parallel" | "-p" => i += 1,
+            "--dry-run" | "--json" | "--force" | "--parallel" | "-p" | "--no-api-validate" => i += 1,
             k => {
                 keys.push(k.to_string());
                 i += 1;
@@ -529,6 +529,10 @@ async fn cmd_setup(a: &[String], name: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Err(e) = insmaller_core::validate_wizard_schema(&wiz) {
+        eprintln!("wizard error: {e}");
+        return ExitCode::FAILURE;
+    }
 
     // --answers F → non-blocking StaticAnswerer; else interactive stdin.
     // Unattended (--answers or no TTY) → non-blocking StaticAnswerer.
@@ -552,6 +556,7 @@ async fn cmd_setup(a: &[String], name: &str) -> ExitCode {
     }
 
     let palette = theme::Palette::resolve(&cfg.settings);
+    let no_api_validate = has(a, "--no-api-validate");
     let unattended = has(a, "--answers") || !std::io::stdin().is_terminal();
     let (outcome, tui_used): (WizardOutcome, bool) = if unattended {
         let f = opt(a, "--answers", "answers.toml");
@@ -576,7 +581,7 @@ async fn cmd_setup(a: &[String], name: &str) -> ExitCode {
             collapsed: cfg.settings.collapsed_groups.clone(),
             expanded: cfg.settings.expanded_groups.clone(),
         };
-        match tui::run_wizard_tui(&mut session, palette, &gd) {
+        match tui::run_wizard_tui(&mut session, palette, &gd, no_api_validate) {
             Ok(true) => (session.finish(), true),
             Ok(false) => {
                 println!("Setup cancelled.");

@@ -71,8 +71,9 @@ wizard page that collects the union of declared inputs of the selection;
 atomically; named `[task.*]` lifecycle pipelines (`insmaller task <name>`) with
 `needs` ordering, per-task `parallel`/`when`/`unless`, and per-OS step
 overrides; field validators (`pattern`, `format`, `min`/`max`,
-`min_length`/`max_length`); and a `[project]` block of presentation strings and
-opaque pass-through `extra` for task templating. All of it is optional and
+`min_length`/`max_length`); field-level API validation (`[page.field.api]`); and
+a `[project]` block of presentation strings and opaque pass-through `extra` for
+task templating. All of it is optional and
 additive — existing catalogs are unaffected. See
 [`docs/fields.md`](docs/fields.md) for the full field/flag/task reference.
 
@@ -108,13 +109,56 @@ insmaller status             # list what is installed (alias: query; --json)
 
 Add `--dry-run` to any of these to see what would happen without doing it.
 `--answers FILE`, or simply not having a terminal, makes the run fully
-unattended. `--config`, `--catalog`, and `--wizard` override the discovered or
-configured paths when you need them. `--force` overrides the uninstall
-dependency check.
+unattended. `--no-api-validate` skips all `[page.field.api]` checks (useful
+offline or in CI). `--config`, `--catalog`, and `--wizard` override the
+discovered or configured paths when you need them. `--force` overrides the
+uninstall dependency check.
 
 The [`examples/`](examples/README.md) directory has a self-contained demo that
 runs entirely in a temp folder with no network, plus a script that launches the
 interactive wizard so you can see it.
+
+## Wizard field types
+
+| type | value | notes |
+|------|-------|-------|
+| `text` | string | free text |
+| `secret` | string | masked in the TUI |
+| `path` | string | `Ctrl+B` opens a file/dir browser |
+| `single_select` | string | expanded radio list |
+| `dropdown` | string | collapsed type-to-search select |
+| `multiselect` | string[] | many choices; `[x]/[~]/[ ]` group headers |
+| `toggle` | bool | on/off |
+| `textarea` | string | multi-line text |
+| `date` | string | ISO `YYYY-MM-DD`; `min`/`max` accept ISO date strings |
+| `datetime` | string | ISO `YYYY-MM-DDTHH:MM:SS`; `min`/`max` accept ISO date strings |
+
+Configs using `dropdown`, `textarea`, `date`, or `datetime` require insmaller >= 0.7.0.
+
+### `[page.field.api]` — field-level API validation
+
+After local validators pass, the engine fires an HTTP request with `{{value}}`
+rendered into the URL (and optionally headers/body), and accepts the value only
+if the response matches `expect_status` (default: any 2xx). Skipped on
+`--answers` / unattended runs; `--no-api-validate` skips all API checks.
+
+```toml
+[[page.field]]
+id   = "GH_USER"
+type = "text"
+
+[page.field.api]
+url            = "https://api.github.com/users/{{value}}"
+method         = "GET"
+headers        = [["Accept", "application/vnd.github+json"]]
+expect_status  = 200
+timeout_ms     = 5000
+error          = "GitHub user not found"
+```
+
+Keys: `url` (required), `method` (`GET`/`POST`/`HEAD`; default `GET`), `headers`
+(array of `[name, value]` pairs), `body`, `expect_status`, `expect_json_path`
+(JSONPath expression; must resolve truthy), `timeout_ms`, `error`.
 
 ## How it is put together
 

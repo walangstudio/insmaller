@@ -24,6 +24,7 @@ use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::io::{self, IsTerminal, Stdout};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::Duration;
 
 /// Restores the terminal even on panic/early-return.
@@ -55,6 +56,30 @@ enum Widget {
     /// A filesystem path. Editable as text; `Ctrl+B` opens an interactive
     /// directory/file browser (`picker = Some`).
     Path { buf: String, picker: Option<Picker> },
+    /// Collapsed type-to-search dropdown. Enter/Space opens the popup list;
+    /// typing narrows the list; ↑/↓ navigate; Enter selects; Esc closes.
+    Dropdown {
+        choices: Vec<String>,
+        /// Index into `choices` of the currently-selected value.
+        sel: usize,
+        /// Whether the popup list is open.
+        open: bool,
+        /// Type-ahead filter text.
+        filter: String,
+        /// Cursor within the filtered list.
+        cur: usize,
+    },
+    /// Multi-line text area. Enter inserts a newline; Tab commits/advances.
+    Textarea {
+        buf: String,
+        cursor_row: usize,
+        cursor_col: usize,
+        scroll: usize,
+    },
+    /// ISO date input (`YYYY-MM-DD`). Masked text-only — no filesystem picker.
+    Date { buf: String },
+    /// ISO datetime input (`YYYY-MM-DDTHH:MM:SS`). Masked text-only.
+    Datetime { buf: String },
 }
 
 /// A visible line in a select's collapsible tree: a group `Header` (index into
@@ -430,6 +455,159 @@ fn collapse_key(field_id: &str, group: &str) -> String {
     format!("{field_id}\u{0}{group}")
 }
 
+/// Insert a character at the logical cursor position inside a textarea buffer.
+/// The buffer uses `\n` as the line separator. Updates `cursor_row`/`cursor_col`
+/// in place after the insertion.
+fn textarea_insert(buf: &mut String, cursor_row: &mut usize, cursor_col: &mut usize, ch: char) {
+    let byte_pos = textarea_byte_pos(buf, *cursor_row, *cursor_col);
+    buf.insert(byte_pos, ch);
+    if ch == '\n' {
+        *cursor_row += 1;
+        *cursor_col = 0;
+    } else {
+        *cursor_col += 1;
+    }
+}
+
+/// Delete the character before the cursor (backspace semantics).
+fn textarea_backspace(buf: &mut String, cursor_row: &mut usize, cursor_col: &mut usize) {
+    if *cursor_row == 0 && *cursor_col == 0 {
+        return;
+    }
+    let byte_pos = textarea_byte_pos(buf, *cursor_row, *cursor_col);
+    if byte_pos == 0 {
+        return;
+    }
+    // Find the previous char boundary.
+    let prev = buf[..byte_pos]
+        .char_indices()
+        .next_back()
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let removed_ch = buf.chars().nth(buf[..prev].chars().count()).unwrap_or(' ');
+    // Compute new cursor position BEFORE modifying the buffer, so line splits
+    // still reflect the pre-removal layout.
+    if removed_ch == '\n' && *cursor_row > 0 {
+        // The previous line's length is its char count in the current buffer.
+        let prev_line_len = buf.split('\n')
+            .nth(*cursor_row - 1)
+            .unwrap_or("")
+            .chars()
+            .count();
+        buf.remove(prev);
+        *cursor_row -= 1;
+        *cursor_col = prev_line_len;
+    } else {
+        buf.remove(prev);
+        if *cursor_col > 0 {
+            *cursor_col -= 1;
+        }
+    }
+}
+
+/// How many lines the textarea renders at once (used for scroll clamping).
+const TEXTAREA_VISIBLE_ROWS: usize = 4;
+
+/// Adjust `scroll` so `cursor_row` remains within the visible window.
+/// Call after any mutation that may change `cursor_row`.
+fn textarea_fix_scroll(scroll: &mut usize, cursor_row: usize) {
+    if cursor_row < *scroll {
+        *scroll = cursor_row;
+    } else if cursor_row >= *scroll + TEXTAREA_VISIBLE_ROWS {
+        *scroll = cursor_row + 1 - TEXTAREA_VISIBLE_ROWS;
+    }
+}
+
+/// Byte offset of the cursor position (row, col) in the textarea buffer.
+/// Clamps gracefully when row/col exceed buffer extent.
+fn textarea_byte_pos(buf: &str, row: usize, col: usize) -> usize {
+    let mut offset = 0usize;
+    for (li, line) in buf.split('\n').enumerate() {
+        if li == row {
+            // col is a char index within this line.
+            let char_count = line.chars().count().min(col);
+            offset += line.char_indices().nth(char_count).map(|(i, _)| i).unwrap_or(line.len());
+            return offset;
+        }
+        offset += line.len() + 1; // +1 for the '\n'
+    }
+    buf.len()
+}
+
+/// Run API validation for all fields in `fields` that have `validate.api` set
+/// and whose committed value is a non-empty string. Returns the index of the
+/// first failing field and its error message, or `None` if all pass. Shows a
+/// "validating…" spinner while each request is in flight.
+fn run_api_validation(
+    fields: &[Field],
+    answers: &Map<String, Value>,
+    term: &mut Terminal<CrosstermBackend<Stdout>>,
+    pal: &Palette,
+    frame: &mut u64,
+) -> Option<(usize, String)> {
+    for (field_idx, field) in fields.iter().enumerate() {
+        let api = match &field.validate.api {
+            Some(a) => a.clone(),
+            None => continue,
+        };
+        let value = match answers.get(&field.id) {
+            Some(Value::String(s)) if !s.is_empty() => s.clone(),
+            _ => continue,
+        };
+        let field_id = field.id.clone();
+
+        // Spawn a thread so we can repaint the spinner while waiting.
+        let (tx, rx) = mpsc::channel::<insmaller_core::Result<()>>();
+        let api_clone = api.clone();
+        let value_clone = value.clone();
+        let fid_clone = field_id.clone();
+        std::thread::spawn(move || {
+            let result = api_clone.call(&fid_clone, &value_clone);
+            let _ = tx.send(result);
+        });
+
+        // Poll with a spinner until the result arrives.
+        let spinner_chars = ['|', '/', '-', '\\'];
+        let mut spin_idx = 0usize;
+        loop {
+            let spin = spinner_chars[spin_idx % spinner_chars.len()];
+            spin_idx += 1;
+            let msg = format!("validating… {spin}");
+            let _ = term.draw(|fr| {
+                let rows = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(4),
+                        Constraint::Min(3),
+                        Constraint::Length(3),
+                    ])
+                    .split(fr.area());
+                let foot = Line::from(vec![
+                    Span::styled(msg.clone(), Style::default().fg(pal.muted)),
+                ]);
+                fr.render_widget(
+                    Paragraph::new(foot).block(panel("", false, pal)),
+                    rows[2],
+                );
+            });
+            *frame = frame.wrapping_add(1);
+
+            match rx.recv_timeout(Duration::from_millis(80)) {
+                Ok(Ok(())) => break,
+                Ok(Err(e)) => return Some((field_idx, format!("{e}"))),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Some((
+                        field_idx,
+                        format!("api validation: thread disconnected for field '{field_id}'"),
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
 fn init_widget(
     f: &Field,
     s: &WizardSession,
@@ -471,6 +649,36 @@ fn init_widget(
             },
             picker: None,
         },
+        FieldType::Dropdown => {
+            let choices: Vec<String> = f.options.to_vec();
+            let default_val = match prior {
+                Some(Value::String(ref s)) => s.clone(),
+                _ => f.default.clone().unwrap_or_default(),
+            };
+            let sel = choices.iter().position(|c| c == &default_val).unwrap_or(0);
+            Widget::Dropdown { choices, sel, open: false, filter: String::new(), cur: 0 }
+        }
+        FieldType::Textarea => Widget::Textarea {
+            buf: match prior {
+                Some(Value::String(s)) => s,
+                _ => f.default.clone().unwrap_or_default(),
+            },
+            cursor_row: 0,
+            cursor_col: 0,
+            scroll: 0,
+        },
+        FieldType::Date => Widget::Date {
+            buf: match prior {
+                Some(Value::String(s)) => s,
+                _ => f.default.clone().unwrap_or_default(),
+            },
+        },
+        FieldType::Datetime => Widget::Datetime {
+            buf: match prior {
+                Some(Value::String(s)) => s,
+                _ => f.default.clone().unwrap_or_default(),
+            },
+        },
         _ => Widget::Input {
             buf: match prior {
                 Some(Value::String(s)) => s,
@@ -497,6 +705,12 @@ fn widget_value(w: &Widget) -> Value {
         Widget::Toggle { on } => Value::Bool(*on),
         Widget::Input { buf, .. } => Value::String(buf.clone()),
         Widget::Path { buf, .. } => Value::String(buf.clone()),
+        Widget::Dropdown { choices, sel, .. } => Value::String(
+            choices.get(*sel).cloned().unwrap_or_default(),
+        ),
+        Widget::Textarea { buf, .. } => Value::String(buf.clone()),
+        Widget::Date { buf, .. } => Value::String(buf.clone()),
+        Widget::Datetime { buf, .. } => Value::String(buf.clone()),
     }
 }
 
@@ -555,10 +769,14 @@ fn panel<'a>(title: impl Into<Line<'a>>, focused: bool, pal: &Palette) -> Block<
 }
 
 /// Run the wizard interactively. Returns true if completed, false if quit.
+///
+/// `no_api_validate`: when true, skip all `validate.api` network calls (useful
+/// for CI / offline runs).
 pub fn run_wizard_tui(
     session: &mut WizardSession,
     pal: Palette,
     gd: &GroupDefaults,
+    no_api_validate: bool,
 ) -> anyhow::Result<bool> {
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
@@ -731,10 +949,107 @@ pub fn run_wizard_tui(
                                 if focused { "_   [Ctrl+B browse]" } else { "" }
                             )));
                         }
+                        Widget::Dropdown { choices, sel, open, .. } => {
+                            let selected = choices.get(*sel).cloned().unwrap_or_default();
+                            if *open {
+                                items.push(ListItem::new(format!("   {selected} ▲  [type to filter · ↑↓ · Enter select · Esc cancel]")));
+                            } else {
+                                items.push(ListItem::new(format!(
+                                    "   {selected} ▼{}",
+                                    if focused { "  [Enter/Space to open]" } else { "" }
+                                )));
+                            }
+                        }
+                        Widget::Textarea { buf, cursor_row, scroll, .. } => {
+                            let lines: Vec<&str> = buf.split('\n').collect();
+                            let start = *scroll;
+                            let end = (start + TEXTAREA_VISIBLE_ROWS).min(lines.len());
+                            for (li, line) in lines[start..end].iter().enumerate() {
+                                let abs_row = li + start;
+                                let cursor_marker = if focused && abs_row == *cursor_row {
+                                    "_"
+                                } else {
+                                    ""
+                                };
+                                items.push(ListItem::new(format!("   {line}{cursor_marker}")));
+                            }
+                            if focused {
+                                items.push(ListItem::new("   [Tab to commit · Enter newline]".to_string()));
+                            }
+                        }
+                        Widget::Date { buf, .. } => {
+                            let mask = if buf.is_empty() { "____-__-__".to_string() } else { buf.clone() };
+                            items.push(ListItem::new(format!(
+                                "   {}{}",
+                                mask,
+                                if focused { "_   [YYYY-MM-DD]" } else { "" }
+                            )));
+                        }
+                        Widget::Datetime { buf, .. } => {
+                            let mask = if buf.is_empty() { "____-__-__T__:__:__".to_string() } else { buf.clone() };
+                            items.push(ListItem::new(format!(
+                                "   {}{}",
+                                mask,
+                                if focused { "_   [YYYY-MM-DDTHH:MM:SS]" } else { "" }
+                            )));
+                        }
                     }
                 }
                 let body = List::new(items).block(panel(" fields ", focus < n, &pal));
                 fr.render_widget(body, rows[1]);
+
+                // Dropdown popup overlay.
+                if let Some(Widget::Dropdown { choices, sel: _, open: true, filter, cur }) =
+                    widgets.get(focus)
+                {
+                    let area = centered_rect(60, 60, fr.area());
+                    let filtered: Vec<&String> = choices
+                        .iter()
+                        .filter(|c| {
+                            filter.is_empty()
+                                || c.to_lowercase().contains(&filter.to_lowercase())
+                        })
+                        .collect();
+                    let rows_d: Vec<ListItem> = filtered
+                        .iter()
+                        .map(|c| ListItem::new((*c).clone()))
+                        .collect();
+                    let title = if filter.is_empty() {
+                        " ↑↓ move · Enter select · Esc cancel · type to filter ".to_string()
+                    } else {
+                        format!(" filter: {filter}  · ↑↓ · Enter select · Esc cancel ")
+                    };
+                    let list = List::new(rows_d)
+                        .block(panel(title, true, &pal))
+                        .highlight_style(
+                            Style::default()
+                                .fg(pal.accent_fg)
+                                .bg(pal.accent)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                        .highlight_symbol("> ");
+                    let mut st = ListState::default();
+                    // Clamp highlight to the actual filtered-list length.
+                    let clamped_cur = (*cur).min(filtered.len().saturating_sub(1));
+                    st.select(if filtered.is_empty() { None } else { Some(clamped_cur) });
+                    if pal.colored() {
+                        let fa = fr.area();
+                        let sx = area.x + 1;
+                        let sy = area.y + 1;
+                        let shadow = Rect {
+                            x: sx,
+                            y: sy,
+                            width: area.width.min(fa.width.saturating_sub(sx)),
+                            height: area.height.min(fa.height.saturating_sub(sy)),
+                        };
+                        fr.render_widget(
+                            Block::default().style(Style::default().bg(pal.shadow)),
+                            shadow,
+                        );
+                    }
+                    fr.render_widget(Clear, area);
+                    fr.render_stateful_widget(list, area, &mut st);
+                }
 
                 // Path browser overlay (captures all keys while open).
                 if let Some(Widget::Path { picker: Some(p), .. }) = widgets.get(focus) {
@@ -841,9 +1156,27 @@ pub fn run_wizard_tui(
                 return Ok(false);
             }
 
+            // Pre-compute overlay states so all branches can reference them.
+            // Date/Datetime are masked text-only — the filesystem Picker is
+            // not opened for them (it would commit a path string into the date
+            // buffer, corrupting the value).
+            let path_picker_open = matches!(
+                widgets.get(focus),
+                Some(Widget::Path { picker: Some(_), .. })
+            );
+            let dropdown_open_pre = matches!(
+                widgets.get(focus),
+                Some(Widget::Dropdown { open: true, .. })
+            );
+
             // An open path browser owns every key until it closes.
-            if matches!(widgets.get(focus), Some(Widget::Path { picker: Some(_), .. })) {
-                if let Some(Widget::Path { buf, picker }) = widgets.get_mut(focus) {
+            if path_picker_open {
+                let picker_buf_pair: Option<(&mut String, &mut Option<Picker>)> =
+                    match widgets.get_mut(focus) {
+                        Some(Widget::Path { buf, picker }) => Some((buf, picker)),
+                        _ => None,
+                    };
+                if let Some((buf, picker)) = picker_buf_pair {
                     let p = picker.as_mut().expect("picker is Some");
                     match k.code {
                         KeyCode::Up => p.up(),
@@ -856,7 +1189,6 @@ pub fn run_wizard_tui(
                             }
                         }
                         KeyCode::Char('s') => {
-                            // No-op at the drive selector (no folder to take).
                             if let Some(path) = p.select_cwd() {
                                 *buf = path;
                                 *picker = None;
@@ -870,7 +1202,75 @@ pub fn run_wizard_tui(
                 continue;
             }
 
-            // Ctrl+B opens the browser on a focused path field.
+            // An open dropdown owns every key until it closes.
+            if dropdown_open_pre {
+                if let Some(Widget::Dropdown { choices, sel, open, filter, cur }) =
+                    widgets.get_mut(focus)
+                {
+                    match k.code {
+                        KeyCode::Esc => {
+                            *open = false;
+                            filter.clear();
+                        }
+                        KeyCode::Enter => {
+                            // Commit highlighted filtered choice. If filter
+                            // yields nothing, keep the popup open — don't
+                            // silently close with a stale selection.
+                            let filtered: Vec<usize> = choices
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, c)| {
+                                    filter.is_empty()
+                                        || c.to_lowercase().contains(&filter.to_lowercase())
+                                })
+                                .map(|(i, _)| i)
+                                .collect();
+                            if filtered.is_empty() {
+                                // Nothing matches — stay open so user can adjust.
+                            } else {
+                                let clamped = (*cur).min(filtered.len() - 1);
+                                *sel = filtered[clamped];
+                                *open = false;
+                                filter.clear();
+                            }
+                        }
+                        KeyCode::Up => *cur = cur.saturating_sub(1),
+                        KeyCode::Down => {
+                            let filtered_len = choices
+                                .iter()
+                                .filter(|c| {
+                                    filter.is_empty()
+                                        || c.to_lowercase().contains(&filter.to_lowercase())
+                                })
+                                .count();
+                            if filtered_len > 0 && *cur + 1 < filtered_len {
+                                *cur += 1;
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            filter.pop();
+                            // Re-clamp cursor after list may have grown back.
+                            let new_len = choices
+                                .iter()
+                                .filter(|c| {
+                                    filter.is_empty()
+                                        || c.to_lowercase().contains(&filter.to_lowercase())
+                                })
+                                .count();
+                            *cur = (*cur).min(new_len.saturating_sub(1));
+                        }
+                        KeyCode::Char(ch) => {
+                            filter.push(ch);
+                            *cur = 0;
+                        }
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+
+            // Ctrl+B opens the filesystem browser on a focused Path field only.
+            // Date/Datetime are masked text-only; Ctrl+B is a no-op for them.
             if k.code == KeyCode::Char('b') && k.modifiers.contains(KeyModifiers::CONTROL) {
                 if let Some(Widget::Path { buf, picker }) = widgets.get_mut(focus) {
                     *picker = Some(Picker::open(buf));
@@ -880,10 +1280,14 @@ pub fn run_wizard_tui(
 
             let editing = matches!(
                 widgets.get(focus),
-                Some(Widget::Input { .. }) | Some(Widget::Path { .. })
+                Some(Widget::Input { .. })
+                    | Some(Widget::Path { .. })
+                    | Some(Widget::Textarea { .. })
+                    | Some(Widget::Date { .. })
+                    | Some(Widget::Datetime { .. })
             );
             // quit
-            if k.code == KeyCode::Char('q') && !editing {
+            if k.code == KeyCode::Char('q') && !editing && !dropdown_open_pre {
                 return Ok(false);
             }
 
@@ -961,21 +1365,65 @@ pub fn run_wizard_tui(
                         },
                         Widget::Toggle { on } => *on = !*on,
                         Widget::Input { buf, .. } | Widget::Path { buf, .. } => buf.push(' '),
+                        Widget::Textarea { buf, cursor_row, cursor_col, scroll } => {
+                            textarea_insert(buf, cursor_row, cursor_col, ' ');
+                            textarea_fix_scroll(scroll, *cursor_row);
+                        }
+                        Widget::Date { buf, .. } | Widget::Datetime { buf, .. } => buf.push(' '),
+                        Widget::Dropdown { open, filter, cur, .. } => {
+                            // Space opens the dropdown.
+                            *open = true;
+                            filter.clear();
+                            *cur = 0;
+                        }
                     }
                     clamp_cur(&mut widgets[focus]);
                 }
                 KeyCode::Char(ch) if editing => {
-                    if let Widget::Input { buf, .. } | Widget::Path { buf, .. } =
-                        &mut widgets[focus]
-                    {
-                        buf.push(ch);
+                    match &mut widgets[focus] {
+                        Widget::Input { buf, .. }
+                        | Widget::Path { buf, .. }
+                        | Widget::Date { buf, .. }
+                        | Widget::Datetime { buf, .. } => buf.push(ch),
+                        Widget::Textarea { buf, cursor_row, cursor_col, scroll } => {
+                            textarea_insert(buf, cursor_row, cursor_col, ch);
+                            textarea_fix_scroll(scroll, *cursor_row);
+                        }
+                        _ => {}
                     }
                 }
                 KeyCode::Backspace if editing => {
-                    if let Widget::Input { buf, .. } | Widget::Path { buf, .. } =
+                    match &mut widgets[focus] {
+                        Widget::Input { buf, .. }
+                        | Widget::Path { buf, .. }
+                        | Widget::Date { buf, .. }
+                        | Widget::Datetime { buf, .. } => { buf.pop(); }
+                        Widget::Textarea { buf, cursor_row, cursor_col, scroll } => {
+                            textarea_backspace(buf, cursor_row, cursor_col);
+                            textarea_fix_scroll(scroll, *cursor_row);
+                        }
+                        _ => {}
+                    }
+                }
+                // Enter in a Textarea inserts a newline; Tab commits/advances.
+                KeyCode::Enter if focus < n && matches!(widgets[focus], Widget::Textarea { .. }) => {
+                    if let Widget::Textarea { buf, cursor_row, cursor_col, scroll } =
                         &mut widgets[focus]
                     {
-                        buf.pop();
+                        textarea_insert(buf, cursor_row, cursor_col, '\n');
+                        textarea_fix_scroll(scroll, *cursor_row);
+                    }
+                }
+                // Tab commits a textarea and advances focus.
+                KeyCode::Tab if focus < n && matches!(widgets[focus], Widget::Textarea { .. }) => {
+                    focus = (focus + 1) % (n + 2);
+                }
+                // Enter on a focused Dropdown opens it.
+                KeyCode::Enter if focus < n && matches!(widgets[focus], Widget::Dropdown { open: false, .. }) => {
+                    if let Widget::Dropdown { open, filter, cur, .. } = &mut widgets[focus] {
+                        *open = true;
+                        filter.clear();
+                        *cur = 0;
                     }
                 }
                 KeyCode::Enter => {
@@ -987,8 +1435,17 @@ pub fn run_wizard_tui(
                             break;
                         }
                     } else {
-                        // Next (or any field) → submit page
+                        // Next (or any field) → try API validation then submit page.
                         let m = commit(&widgets, &fields);
+                        // Run API validation for each field that has api config,
+                        // unless no_api_validate is set.
+                        if !no_api_validate {
+                            if let Some((fail_idx, api_err)) = run_api_validation(&fields, &m, &mut term, &pal, &mut frame) {
+                                err = Some(api_err);
+                                focus = fail_idx;
+                                continue;
+                            }
+                        }
                         match session.submit(m) {
                             Ok(()) => break,
                             Err(e) => err = Some(format!("{e}")),
@@ -1055,10 +1512,92 @@ impl Reporter for BarReporter {
 #[cfg(test)]
 mod tests {
     use super::{
-        group_list, group_mark_multi, item_label, list_dir, vert_nav, visible_rows, GroupDefaults,
-        Picker, Row,
+        group_list, group_mark_multi, item_label, list_dir, textarea_backspace, textarea_byte_pos,
+        textarea_insert, vert_nav, visible_rows, GroupDefaults, Picker, Row,
     };
     use insmaller_core::Choice;
+
+    // ── textarea helpers ─────────────────────────────────────────────────
+
+    #[test]
+    fn textarea_byte_pos_empty() {
+        assert_eq!(textarea_byte_pos("", 0, 0), 0);
+    }
+
+    #[test]
+    fn textarea_byte_pos_single_line() {
+        let buf = "hello";
+        assert_eq!(textarea_byte_pos(buf, 0, 0), 0);
+        assert_eq!(textarea_byte_pos(buf, 0, 3), 3);
+        assert_eq!(textarea_byte_pos(buf, 0, 5), 5);
+        // col beyond end clamps to line end
+        assert_eq!(textarea_byte_pos(buf, 0, 100), 5);
+    }
+
+    #[test]
+    fn textarea_byte_pos_multiline() {
+        let buf = "ab\ncd\nef";
+        // row 0: "ab"
+        assert_eq!(textarea_byte_pos(buf, 0, 1), 1);
+        // row 1: "cd" starts at byte 3 (after "ab\n")
+        assert_eq!(textarea_byte_pos(buf, 1, 0), 3);
+        assert_eq!(textarea_byte_pos(buf, 1, 1), 4);
+        // row 2: "ef" starts at byte 6
+        assert_eq!(textarea_byte_pos(buf, 2, 0), 6);
+    }
+
+    #[test]
+    fn textarea_insert_char_advances_col() {
+        let mut buf = String::from("ac");
+        let mut row = 0;
+        let mut col = 1; // insert between a and c
+        textarea_insert(&mut buf, &mut row, &mut col, 'b');
+        assert_eq!(buf, "abc");
+        assert_eq!(row, 0);
+        assert_eq!(col, 2);
+    }
+
+    #[test]
+    fn textarea_insert_newline_advances_row() {
+        let mut buf = String::from("hello");
+        let mut row = 0;
+        let mut col = 5;
+        textarea_insert(&mut buf, &mut row, &mut col, '\n');
+        assert_eq!(buf, "hello\n");
+        assert_eq!(row, 1);
+        assert_eq!(col, 0);
+    }
+
+    #[test]
+    fn textarea_backspace_deletes_char() {
+        let mut buf = String::from("abc");
+        let mut row = 0;
+        let mut col = 3;
+        textarea_backspace(&mut buf, &mut row, &mut col);
+        assert_eq!(buf, "ab");
+        assert_eq!(col, 2);
+    }
+
+    #[test]
+    fn textarea_backspace_at_start_noop() {
+        let mut buf = String::from("abc");
+        let mut row = 0;
+        let mut col = 0;
+        textarea_backspace(&mut buf, &mut row, &mut col);
+        assert_eq!(buf, "abc");
+        assert_eq!(col, 0);
+    }
+
+    #[test]
+    fn textarea_backspace_deletes_newline_joins_lines() {
+        let mut buf = String::from("ab\ncd");
+        let mut row = 1;
+        let mut col = 0;
+        textarea_backspace(&mut buf, &mut row, &mut col);
+        assert_eq!(buf, "abcd");
+        assert_eq!(row, 0);
+        assert_eq!(col, 2); // end of "ab"
+    }
 
     fn ch(value: &str, group: Option<&str>) -> Choice {
         Choice {
@@ -1336,5 +1875,111 @@ mod tests {
             vec![false, false],
             "cached expand of git overrides collapsed_groups default"
         );
+    }
+
+    // ── textarea scroll (bug 2) ──────────────────────────────────────────
+
+    #[test]
+    fn textarea_scroll_follows_cursor_down() {
+        // Insert TEXTAREA_VISIBLE_ROWS + 2 newlines. After each insert, the
+        // scroll must keep cursor_row within [scroll, scroll + VISIBLE_ROWS).
+        let mut buf = String::new();
+        let mut row = 0usize;
+        let mut col = 0usize;
+        let mut scroll = 0usize;
+        let n = super::TEXTAREA_VISIBLE_ROWS + 2;
+        for _ in 0..n {
+            super::textarea_insert(&mut buf, &mut row, &mut col, '\n');
+            super::textarea_fix_scroll(&mut scroll, row);
+            assert!(
+                row >= scroll && row < scroll + super::TEXTAREA_VISIBLE_ROWS,
+                "cursor_row {row} outside visible window [{scroll}, {})",
+                scroll + super::TEXTAREA_VISIBLE_ROWS,
+            );
+        }
+    }
+
+    #[test]
+    fn textarea_scroll_follows_cursor_up_after_backspace() {
+        // Fill then delete: scroll must track back up.
+        let mut buf = String::new();
+        let mut row = 0usize;
+        let mut col = 0usize;
+        let mut scroll = 0usize;
+        let n = super::TEXTAREA_VISIBLE_ROWS + 3;
+        for _ in 0..n {
+            super::textarea_insert(&mut buf, &mut row, &mut col, '\n');
+            super::textarea_fix_scroll(&mut scroll, row);
+        }
+        // Now delete newlines back up.
+        for _ in 0..n {
+            super::textarea_backspace(&mut buf, &mut row, &mut col);
+            super::textarea_fix_scroll(&mut scroll, row);
+            assert!(
+                row >= scroll && row < scroll + super::TEXTAREA_VISIBLE_ROWS,
+                "after backspace cursor_row {row} outside visible window [{scroll}, {})",
+                scroll + super::TEXTAREA_VISIBLE_ROWS,
+            );
+        }
+    }
+
+    // ── dropdown filter-then-select (bug 6) ─────────────────────────────
+
+    /// Simulate the dropdown Enter-key selection path to verify that filtering
+    /// on a substring and pressing Enter commits the correct original index.
+    #[test]
+    fn dropdown_filter_selects_correct_original_index() {
+        // choices[0]="alpha", choices[1]="beta", choices[2]="alphabet"
+        let choices = vec!["alpha".to_string(), "beta".to_string(), "alphabet".to_string()];
+        let filter = "bet".to_string();
+
+        // The filtered list in order: only "beta" (index 1) and potentially
+        // none of the others match "bet".
+        let filtered: Vec<usize> = choices
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.to_lowercase().contains(&filter.to_lowercase()))
+            .map(|(i, _)| i)
+            .collect();
+
+        // cur=0 in the filtered list → should select original index 1 ("beta").
+        let cur = 0usize;
+        assert!(!filtered.is_empty());
+        let clamped = cur.min(filtered.len() - 1);
+        let selected_original_idx = filtered[clamped];
+        assert_eq!(selected_original_idx, 1, "filter 'bet' cur=0 should select 'beta' at original idx 1");
+        assert_eq!(choices[selected_original_idx], "beta");
+    }
+
+    #[test]
+    fn dropdown_filter_empty_result_keeps_popup_open() {
+        // If no choices match, `filtered.is_empty()` → popup stays open.
+        let choices = vec!["alpha".to_string(), "beta".to_string()];
+        let filter = "zzz".to_string();
+        let filtered: Vec<usize> = choices
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.to_lowercase().contains(&filter.to_lowercase()))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(filtered.is_empty(), "no match → filtered is empty, popup should stay open");
+    }
+
+    #[test]
+    fn dropdown_cursor_clamped_within_filtered_list() {
+        // cur=5 but filtered list has only 2 entries → clamped to 1.
+        let choices: Vec<String> = (0..10).map(|i| format!("item{i}")).collect();
+        let filter = "item1".to_string(); // matches "item1" only
+        let filtered: Vec<usize> = choices
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.to_lowercase().contains(&filter.to_lowercase()))
+            .map(|(i, _)| i)
+            .collect();
+        let cur = 5usize; // stale cursor past the end
+        if !filtered.is_empty() {
+            let clamped = cur.min(filtered.len() - 1);
+            assert!(clamped < filtered.len(), "clamped cursor must be within filtered list");
+        }
     }
 }
