@@ -75,12 +75,17 @@ description = "Secret field with optional API-call validation."
 [[page.field]]
 id = "DEMO_API_KEY"
 type = "secret"
-prompt = "Demo API key (any non-empty string)"
+prompt = "Demo API key (must start with 'demo-')"
 required = true
 # The [page.field.api] block is validated live unless --no-api-validate is set.
-# Uses httpbin.org's /get endpoint — returns 200 for any request (harmless).
+# Points at the bundled local validator (examples/serve-validate.py) so the
+# whole API-validation path runs on 127.0.0.1 — no third party, no signup, no
+# egress. Start it first:  python serve-validate.py
+# It returns 200 {"valid": true} for keys starting with "demo-", else 401.
 [page.field.api]
-url = "https://httpbin.org/get?key={{value}}"
+url = "http://127.0.0.1:8787/validate?key={{value}}"
 method = "GET"
-timeout_ms = 8000
-error = "Could not reach the validation endpoint — check your network or use --no-api-validate."
+expect_status = 200
+expect_json_path = "valid"
+timeout_ms = 5000
+error = "Key rejected (must start with 'demo-') or the local validator isn't running (python serve-validate.py)."

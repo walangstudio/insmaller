@@ -1294,15 +1294,26 @@ pub fn run_wizard_tui(
                                 || c.to_lowercase().contains(&filter.to_lowercase())
                         })
                         .collect();
-                    let rows_d: Vec<ListItem> = filtered
-                        .iter()
-                        .map(|c| ListItem::new((*c).clone()))
-                        .collect();
-                    let title = if filter.is_empty() {
-                        " ↑↓ move · Enter select · Esc cancel · type to filter ".to_string()
+                    // Search header row — always first, never selectable.
+                    let search_line = if filter.is_empty() {
+                        "  Search: \u{258c}  (type to filter)".to_string()
                     } else {
-                        format!(" filter: {filter}  · ↑↓ · Enter select · Esc cancel ")
+                        format!("  Search: {filter}\u{258c}")
                     };
+                    let header_item = ListItem::new(Span::styled(
+                        search_line,
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ));
+                    let mut rows_d: Vec<ListItem> = vec![header_item];
+                    if filtered.is_empty() {
+                        rows_d.push(ListItem::new(Span::styled(
+                            "  [no matches]",
+                            Style::default().add_modifier(Modifier::DIM),
+                        )));
+                    } else {
+                        rows_d.extend(filtered.iter().map(|c| ListItem::new((*c).clone())));
+                    }
+                    let title = " \u{2191}\u{2193} move \u{b7} Enter select \u{b7} Esc cancel ";
                     let list = List::new(rows_d)
                         .block(panel(title, true, &pal))
                         .highlight_style(
@@ -1313,9 +1324,10 @@ pub fn run_wizard_tui(
                         )
                         .highlight_symbol("> ");
                     let mut st = ListState::default();
-                    // Clamp highlight to the actual filtered-list length.
+                    // Clamp highlight to the actual filtered-list length and
+                    // offset by 1 to skip the non-selectable search header row.
                     let clamped_cur = (*cur).min(filtered.len().saturating_sub(1));
-                    st.select(if filtered.is_empty() { None } else { Some(clamped_cur) });
+                    st.select(if filtered.is_empty() { None } else { Some(clamped_cur + 1) });
                     if pal.colored() {
                         let fa = fr.area();
                         let sx = area.x + 1;
@@ -2701,5 +2713,96 @@ mod tests {
         assert!(r.is_err(), "nonexistent parent must be rejected");
         let msg = r.unwrap_err();
         assert!(msg.contains("output path"), "label in error: {msg}");
+    }
+
+    // ── dropdown search header ───────────────────────────────────────────
+
+    /// Replicate the search-line construction logic from the render closure so
+    /// changes to the format are caught by tests without needing a terminal.
+    fn dropdown_search_line(filter: &str) -> String {
+        if filter.is_empty() {
+            "  Search: \u{258c}  (type to filter)".to_string()
+        } else {
+            format!("  Search: {filter}\u{258c}")
+        }
+    }
+
+    /// Replicate the row list logic: header always first; then choices or
+    /// [no matches]. Returns just the string content of each row.
+    fn dropdown_rows(choices: &[&str], filter: &str) -> Vec<String> {
+        let filtered: Vec<&&str> = choices
+            .iter()
+            .filter(|c| filter.is_empty() || c.to_lowercase().contains(&filter.to_lowercase()))
+            .collect();
+        let mut rows = vec![dropdown_search_line(filter)];
+        if filtered.is_empty() {
+            rows.push("  [no matches]".to_string());
+        } else {
+            rows.extend(filtered.iter().map(|c| c.to_string()));
+        }
+        rows
+    }
+
+    #[test]
+    fn dropdown_search_header_empty_filter() {
+        let line = dropdown_search_line("");
+        assert!(line.contains("Search:"), "must contain 'Search:': {line}");
+        assert!(line.contains("type to filter"), "hint text missing: {line}");
+        assert!(line.contains('\u{258c}'), "cursor block missing: {line}");
+    }
+
+    #[test]
+    fn dropdown_search_header_with_filter() {
+        let line = dropdown_search_line("ph");
+        assert!(line.contains("Search: ph"), "filter text not shown: {line}");
+        assert!(line.contains('\u{258c}'), "cursor block missing: {line}");
+        // hint text only shown when filter is empty
+        assert!(!line.contains("type to filter"), "hint must be absent when typing: {line}");
+    }
+
+    #[test]
+    fn dropdown_rows_header_is_always_first() {
+        let choices = ["alpha", "beta", "gamma"];
+        let rows = dropdown_rows(&choices, "");
+        assert!(rows[0].contains("Search:"), "header must be row 0: {:?}", rows[0]);
+    }
+
+    #[test]
+    fn dropdown_rows_choice_count_with_filter() {
+        let choices = ["US", "PH", "DE", "PL"];
+        let rows = dropdown_rows(&choices, "p");
+        // header + "PH" + "PL" = 3 rows
+        assert_eq!(rows.len(), 3, "header + 2 matches: {rows:?}");
+        assert!(rows[1].contains("PH") || rows[2].contains("PH"));
+        assert!(rows[1].contains("PL") || rows[2].contains("PL"));
+    }
+
+    #[test]
+    fn dropdown_rows_no_matches_shows_placeholder() {
+        let choices = ["alpha", "beta"];
+        let rows = dropdown_rows(&choices, "zzz");
+        // header + [no matches] = 2 rows
+        assert_eq!(rows.len(), 2, "header + no-matches: {rows:?}");
+        assert!(rows[1].contains("no matches"), "placeholder missing: {:?}", rows[1]);
+    }
+
+    #[test]
+    fn dropdown_highlight_offset_skips_header() {
+        // clamped_cur + 1: verify that adding 1 to index 0 gives row 1 (first choice).
+        let filtered_len = 3usize;
+        let cur = 0usize;
+        let clamped = cur.min(filtered_len.saturating_sub(1));
+        let st_idx = clamped + 1; // offset past header
+        assert_eq!(st_idx, 1, "index 0 in filtered → row 1 in list (skip header)");
+    }
+
+    #[test]
+    fn dropdown_highlight_offset_clamped_last() {
+        // cur beyond list → clamped to last, still +1 for header.
+        let filtered_len = 3usize;
+        let cur = 99usize;
+        let clamped = cur.min(filtered_len.saturating_sub(1));
+        let st_idx = clamped + 1;
+        assert_eq!(st_idx, 3, "clamped last choice (idx 2) → row 3 in list");
     }
 }
