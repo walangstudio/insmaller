@@ -756,6 +756,16 @@ fn textarea_byte_pos(buf: &str, row: usize, col: usize) -> usize {
     buf.len()
 }
 
+/// Return the char count of line `row` in `buf` (0 if row is out of range).
+fn textarea_line_char_len(buf: &str, row: usize) -> usize {
+    buf.split('\n').nth(row).map(|l| l.chars().count()).unwrap_or(0)
+}
+
+/// Number of lines in `buf` (always >= 1).
+fn textarea_line_count(buf: &str) -> usize {
+    buf.split('\n').count()
+}
+
 /// Check a non-empty Path value for plausible existence. Returns `Ok(())` when
 /// the path itself exists OR its parent directory exists (so a new leaf under an
 /// existing directory is accepted). Returns `Err(message)` with a clear label
@@ -1244,21 +1254,30 @@ pub fn run_wizard_tui(
                                 )));
                             }
                         }
-                        Widget::Textarea { buf, cursor_row, scroll, .. } => {
+                        Widget::Textarea { buf, cursor_row, cursor_col, scroll } => {
                             let lines: Vec<&str> = buf.split('\n').collect();
+                            let total = lines.len();
                             let start = *scroll;
-                            let end = (start + TEXTAREA_VISIBLE_ROWS).min(lines.len());
+                            let end = (start + TEXTAREA_VISIBLE_ROWS).min(total);
                             for (li, line) in lines[start..end].iter().enumerate() {
                                 let abs_row = li + start;
-                                let cursor_marker = if focused && abs_row == *cursor_row {
-                                    "_"
+                                let rendered = if focused && abs_row == *cursor_row {
+                                    // Insert a block cursor glyph at cursor_col.
+                                    let col = (*cursor_col).min(line.chars().count());
+                                    let before: String = line.chars().take(col).collect();
+                                    let after: String = line.chars().skip(col).collect();
+                                    format!("   {before}\u{258c}{after}")
                                 } else {
-                                    ""
+                                    format!("   {line}")
                                 };
-                                items.push(ListItem::new(format!("   {line}{cursor_marker}")));
+                                items.push(ListItem::new(rendered));
                             }
                             if focused {
-                                items.push(ListItem::new("   [Tab to commit · Enter newline]".to_string()));
+                                items.push(ListItem::new(format!(
+                                    "   [Tab: next · Enter: newline · \u{2191}\u{2193}\u{2190}\u{2192}: navigate  (line {}/{})]",
+                                    cursor_row + 1,
+                                    total
+                                )));
                             }
                         }
                         Widget::Date { digits, .. } => {
@@ -1732,6 +1751,111 @@ pub fn run_wizard_tui(
                 KeyCode::BackTab | KeyCode::Left if !editing => {
                     focus = (focus + n + 1) % (n + 2)
                 }
+                // ── Textarea cursor navigation (intercept before field-nav) ──
+                KeyCode::Up
+                    if focus < n && matches!(widgets[focus], Widget::Textarea { .. }) =>
+                {
+                    if let Widget::Textarea { buf, cursor_row, cursor_col, scroll } =
+                        &mut widgets[focus]
+                    {
+                        if *cursor_row > 0 {
+                            *cursor_row -= 1;
+                            *cursor_col =
+                                (*cursor_col).min(textarea_line_char_len(buf, *cursor_row));
+                            textarea_fix_scroll(scroll, *cursor_row);
+                        }
+                    }
+                }
+                KeyCode::Down
+                    if focus < n && matches!(widgets[focus], Widget::Textarea { .. }) =>
+                {
+                    if let Widget::Textarea { buf, cursor_row, cursor_col, scroll } =
+                        &mut widgets[focus]
+                    {
+                        let last = textarea_line_count(buf).saturating_sub(1);
+                        if *cursor_row < last {
+                            *cursor_row += 1;
+                            *cursor_col =
+                                (*cursor_col).min(textarea_line_char_len(buf, *cursor_row));
+                            textarea_fix_scroll(scroll, *cursor_row);
+                        }
+                    }
+                }
+                KeyCode::Left
+                    if focus < n && matches!(widgets[focus], Widget::Textarea { .. }) =>
+                {
+                    if let Widget::Textarea { buf, cursor_row, cursor_col, scroll } =
+                        &mut widgets[focus]
+                    {
+                        if *cursor_col > 0 {
+                            *cursor_col -= 1;
+                        } else if *cursor_row > 0 {
+                            *cursor_row -= 1;
+                            *cursor_col = textarea_line_char_len(buf, *cursor_row);
+                            textarea_fix_scroll(scroll, *cursor_row);
+                        }
+                    }
+                }
+                KeyCode::Right
+                    if focus < n && matches!(widgets[focus], Widget::Textarea { .. }) =>
+                {
+                    if let Widget::Textarea { buf, cursor_row, cursor_col, scroll } =
+                        &mut widgets[focus]
+                    {
+                        let line_len = textarea_line_char_len(buf, *cursor_row);
+                        if *cursor_col < line_len {
+                            *cursor_col += 1;
+                        } else {
+                            let last = textarea_line_count(buf).saturating_sub(1);
+                            if *cursor_row < last {
+                                *cursor_row += 1;
+                                *cursor_col = 0;
+                                textarea_fix_scroll(scroll, *cursor_row);
+                            }
+                        }
+                    }
+                }
+                KeyCode::Home
+                    if focus < n && matches!(widgets[focus], Widget::Textarea { .. }) =>
+                {
+                    if let Widget::Textarea { cursor_col, .. } = &mut widgets[focus] {
+                        *cursor_col = 0;
+                    }
+                }
+                KeyCode::End
+                    if focus < n && matches!(widgets[focus], Widget::Textarea { .. }) =>
+                {
+                    if let Widget::Textarea { buf, cursor_row, cursor_col, .. } =
+                        &mut widgets[focus]
+                    {
+                        *cursor_col = textarea_line_char_len(buf, *cursor_row);
+                    }
+                }
+                KeyCode::PageUp
+                    if focus < n && matches!(widgets[focus], Widget::Textarea { .. }) =>
+                {
+                    if let Widget::Textarea { buf, cursor_row, cursor_col, scroll } =
+                        &mut widgets[focus]
+                    {
+                        *cursor_row = cursor_row.saturating_sub(TEXTAREA_VISIBLE_ROWS);
+                        *cursor_col =
+                            (*cursor_col).min(textarea_line_char_len(buf, *cursor_row));
+                        textarea_fix_scroll(scroll, *cursor_row);
+                    }
+                }
+                KeyCode::PageDown
+                    if focus < n && matches!(widgets[focus], Widget::Textarea { .. }) =>
+                {
+                    if let Widget::Textarea { buf, cursor_row, cursor_col, scroll } =
+                        &mut widgets[focus]
+                    {
+                        let last = textarea_line_count(buf).saturating_sub(1);
+                        *cursor_row = (*cursor_row + TEXTAREA_VISIBLE_ROWS).min(last);
+                        *cursor_col =
+                            (*cursor_col).min(textarea_line_char_len(buf, *cursor_row));
+                        textarea_fix_scroll(scroll, *cursor_row);
+                    }
+                }
                 KeyCode::Esc => {
                     let m = commit(&widgets, &fields);
                     session.store(m);
@@ -1945,6 +2069,7 @@ mod tests {
     use super::{
         date_backspace, date_from_date_digits, date_to_date_digits, date_type_digit,
         date_widget_value, datetime_backspace, datetime_type_digit, datetime_widget_value,
+        textarea_line_char_len, textarea_line_count,
         days_in_month, group_list, group_mark_multi, item_label, list_dir, parse_date_digits,
         parse_datetime_digits, render_date_mask, render_datetime_mask, textarea_backspace,
         textarea_byte_pos, textarea_insert, validate_path_value, vert_nav, visible_rows,
@@ -2804,5 +2929,194 @@ mod tests {
         let clamped = cur.min(filtered_len.saturating_sub(1));
         let st_idx = clamped + 1;
         assert_eq!(st_idx, 3, "clamped last choice (idx 2) → row 3 in list");
+    }
+
+    // ── textarea cursor navigation ───────────────────────────────────────
+
+    /// Simulate the Up key in a textarea: decrement row, clamp col.
+    fn ta_up(buf: &str, row: &mut usize, col: &mut usize) {
+        if *row > 0 {
+            *row -= 1;
+            *col = (*col).min(textarea_line_char_len(buf, *row));
+        }
+    }
+
+    /// Simulate the Down key.
+    fn ta_down(buf: &str, row: &mut usize, col: &mut usize) {
+        let last = textarea_line_count(buf).saturating_sub(1);
+        if *row < last {
+            *row += 1;
+            *col = (*col).min(textarea_line_char_len(buf, *row));
+        }
+    }
+
+    /// Simulate the Left key (wraps to end of previous line at col 0).
+    fn ta_left(buf: &str, row: &mut usize, col: &mut usize) {
+        if *col > 0 {
+            *col -= 1;
+        } else if *row > 0 {
+            *row -= 1;
+            *col = textarea_line_char_len(buf, *row);
+        }
+    }
+
+    /// Simulate the Right key (wraps to start of next line at line end).
+    fn ta_right(buf: &str, row: &mut usize, col: &mut usize) {
+        let line_len = textarea_line_char_len(buf, *row);
+        if *col < line_len {
+            *col += 1;
+        } else {
+            let last = textarea_line_count(buf).saturating_sub(1);
+            if *row < last {
+                *row += 1;
+                *col = 0;
+            }
+        }
+    }
+
+    #[test]
+    fn ta_up_moves_row_and_clamps_col_on_shorter_line() {
+        // "hello\nhi\nworld": row 2 col 4 → Up → row 1 ("hi" len 2) → col clamped to 2.
+        let buf = "hello\nhi\nworld";
+        let mut row = 2usize;
+        let mut col = 4usize;
+        ta_up(buf, &mut row, &mut col);
+        assert_eq!(row, 1);
+        assert_eq!(col, 2, "col clamped to len of 'hi'");
+    }
+
+    #[test]
+    fn ta_down_moves_row_and_clamps_col_on_shorter_line() {
+        let buf = "hello\nhi";
+        let mut row = 0usize;
+        let mut col = 4usize;
+        ta_down(buf, &mut row, &mut col);
+        assert_eq!(row, 1);
+        assert_eq!(col, 2, "col clamped to len of 'hi'");
+    }
+
+    #[test]
+    fn ta_up_at_first_row_is_noop() {
+        let buf = "hello\nworld";
+        let mut row = 0usize;
+        let mut col = 3usize;
+        ta_up(buf, &mut row, &mut col);
+        assert_eq!(row, 0);
+        assert_eq!(col, 3);
+    }
+
+    #[test]
+    fn ta_down_at_last_row_is_noop() {
+        let buf = "hello\nworld";
+        let mut row = 1usize;
+        let mut col = 2usize;
+        ta_down(buf, &mut row, &mut col);
+        assert_eq!(row, 1);
+        assert_eq!(col, 2);
+    }
+
+    #[test]
+    fn ta_left_at_col_zero_wraps_to_end_of_prev_line() {
+        let buf = "hello\nworld";
+        let mut row = 1usize;
+        let mut col = 0usize;
+        ta_left(buf, &mut row, &mut col);
+        assert_eq!(row, 0);
+        assert_eq!(col, 5, "end of 'hello'");
+    }
+
+    #[test]
+    fn ta_left_within_line_decrements_col() {
+        let buf = "hello\nworld";
+        let mut row = 0usize;
+        let mut col = 3usize;
+        ta_left(buf, &mut row, &mut col);
+        assert_eq!(row, 0);
+        assert_eq!(col, 2);
+    }
+
+    #[test]
+    fn ta_left_at_very_start_is_noop() {
+        let buf = "hello";
+        let mut row = 0usize;
+        let mut col = 0usize;
+        ta_left(buf, &mut row, &mut col);
+        assert_eq!(row, 0);
+        assert_eq!(col, 0);
+    }
+
+    #[test]
+    fn ta_right_at_line_end_wraps_to_next_line_start() {
+        let buf = "hello\nworld";
+        let mut row = 0usize;
+        let mut col = 5usize; // end of "hello"
+        ta_right(buf, &mut row, &mut col);
+        assert_eq!(row, 1);
+        assert_eq!(col, 0);
+    }
+
+    #[test]
+    fn ta_right_within_line_increments_col() {
+        let buf = "hello\nworld";
+        let mut row = 0usize;
+        let mut col = 2usize;
+        ta_right(buf, &mut row, &mut col);
+        assert_eq!(row, 0);
+        assert_eq!(col, 3);
+    }
+
+    #[test]
+    fn ta_right_at_very_end_is_noop() {
+        let buf = "hello";
+        let mut row = 0usize;
+        let mut col = 5usize;
+        ta_right(buf, &mut row, &mut col);
+        assert_eq!(row, 0);
+        assert_eq!(col, 5);
+    }
+
+    #[test]
+    fn ta_home_end_semantics() {
+        let buf = "hello\nworld";
+        // Home: col → 0
+        let col_after_home = 0usize;
+        assert_eq!(col_after_home, 0);
+        // End: col → line char len
+        let end_col = textarea_line_char_len(buf, 0);
+        assert_eq!(end_col, 5);
+    }
+
+    #[test]
+    fn textarea_scroll_scrolls_up_when_cursor_above_viewport() {
+        // Start at row 5 with scroll=3 (row 5 is in view). Navigate Up to row 2
+        // (above scroll); scroll must adjust to 2.
+        use super::{textarea_fix_scroll, TEXTAREA_VISIBLE_ROWS};
+        let mut scroll = 3usize;
+        let cursor_row = 2usize; // now above viewport
+        textarea_fix_scroll(&mut scroll, cursor_row);
+        assert_eq!(scroll, 2, "scroll must move up so cursor is visible");
+        assert!(
+            cursor_row >= scroll && cursor_row < scroll + TEXTAREA_VISIBLE_ROWS,
+            "cursor must be in visible window"
+        );
+    }
+
+    #[test]
+    fn textarea_line_counter_string() {
+        // The hint format is "(line {row+1}/{total})". Verify arithmetic.
+        let buf = "a\nb\nc";
+        let total = textarea_line_count(buf);
+        assert_eq!(total, 3);
+        let cursor_row = 1usize;
+        let hint = format!("(line {}/{})", cursor_row + 1, total);
+        assert_eq!(hint, "(line 2/3)");
+    }
+
+    #[test]
+    fn textarea_line_char_len_multibyte() {
+        // A line with multi-byte chars: char count != byte count.
+        let buf = "café\nhi";
+        assert_eq!(textarea_line_char_len(buf, 0), 4); // c-a-f-é = 4 chars
+        assert_eq!(textarea_line_char_len(buf, 1), 2);
     }
 }
