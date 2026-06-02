@@ -619,6 +619,16 @@ fn datetime_backspace(digits: &mut [u8; 14], dcur: usize) -> usize {
     prev
 }
 
+/// First empty (`b'_'`) slot index in a digit array, or the array length if all
+/// filled. Used to restore the editing cursor to the right position on re-entry.
+fn first_empty_slot_8(digits: &[u8; 8]) -> usize {
+    digits.iter().position(|&b| b == b'_').unwrap_or(8)
+}
+
+fn first_empty_slot_14(digits: &[u8; 14]) -> usize {
+    digits.iter().position(|&b| b == b'_').unwrap_or(14)
+}
+
 /// Build the `widget_value` string for a Date widget (empty string if incomplete).
 fn date_widget_value(digits: &[u8; 8]) -> String {
     digits_to_date_str(digits).unwrap_or_default()
@@ -642,36 +652,33 @@ fn days_in_month(year: i32, month: u32) -> u32 {
 }
 
 /// Render a calendar month as a vector of lines to display inside the overlay.
-/// Highlights `sel` with `[DD]` brackets; other days are ` DD`. Width is fixed
-/// at 20 chars for the week rows (7 × 3 = 21 minus the trailing space).
+/// Every cell (header and body alike) is exactly 3 chars; cells are joined with
+/// a single space, giving a uniform 4-char-per-column stride across every row.
+/// Selected day uses `>DD`, normal days use ` DD`, leading empty slots use `   `.
 fn render_calendar(year: i32, month: u32, sel: NaiveDate) -> Vec<String> {
-    let mut lines: Vec<String> = Vec::new();
-    lines.push("Su Mo Tu We Th Fr Sa".to_string());
+    // Header: each weekday name is 2 chars, right-padded to 3.
+    let header = ["Su ", "Mo ", "Tu ", "We ", "Th ", "Fr ", "Sa "]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut lines: Vec<String> = vec![header];
     let first = NaiveDate::from_ymd_opt(year, month, 1).unwrap_or(sel);
     // weekday of the 1st: Sun=0 … Sat=6
     let start_wd = first.weekday().num_days_from_sunday() as usize;
     let dim = days_in_month(year, month);
-    let mut row = String::new();
-    // leading blanks
+    // Build week rows as 7-slot arrays of 3-char strings, then join with " ".
+    let mut cells: Vec<String> = Vec::with_capacity(start_wd + dim as usize);
     for _ in 0..start_wd {
-        row.push_str("   ");
+        cells.push("   ".to_string());
     }
-    let mut col = start_wd;
     for day in 1..=dim {
         let d = NaiveDate::from_ymd_opt(year, month, day).unwrap_or(sel);
-        // 3 chars per cell so the columns line up: selected = `>DD`, normal = ` DD`.
         let marker = if d == sel { '>' } else { ' ' };
-        row.push_str(&format!("{marker}{day:02}"));
-        col += 1;
-        if col == 7 {
-            lines.push(row.clone());
-            row.clear();
-            col = 0;
-        } else {
-            row.push(' ');
-        }
+        cells.push(format!("{marker}{day:02}"));
     }
-    if !row.trim().is_empty() {
+    for week in cells.chunks(7) {
+        let row = week.join(" ");
         lines.push(row);
     }
     lines
@@ -764,6 +771,31 @@ fn textarea_line_char_len(buf: &str, row: usize) -> usize {
 /// Number of lines in `buf` (always >= 1).
 fn textarea_line_count(buf: &str) -> usize {
     buf.split('\n').count()
+}
+
+/// Check all Date/Datetime widgets for partial input (at least one digit filled
+/// but not all). Returns the index and error message of the first partial field,
+/// or `None` if all are either fully empty or fully filled.
+fn check_partial_dates(fields: &[Field], widgets: &[Widget]) -> Option<(usize, String)> {
+    for (idx, (field, widget)) in fields.iter().zip(widgets.iter()).enumerate() {
+        let label = field.prompt.as_deref().unwrap_or(&field.id);
+        match widget {
+            Widget::Date { digits, .. } => {
+                let filled = digits.iter().filter(|&&b| b != b'_').count();
+                if filled > 0 && filled < 8 {
+                    return Some((idx, format!("{label}: incomplete date (YYYY-MM-DD)")));
+                }
+            }
+            Widget::Datetime { digits, .. } => {
+                let filled = digits.iter().filter(|&&b| b != b'_').count();
+                if filled > 0 && filled < 14 {
+                    return Some((idx, format!("{label}: incomplete datetime (YYYY-MM-DDTHH:MM:SS)")));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Check a non-empty Path value for plausible existence. Returns `Ok(())` when
@@ -964,14 +996,18 @@ fn init_widget(
                 Some(Value::String(ref v)) => v.clone(),
                 _ => f.default.clone().unwrap_or_default(),
             };
-            Widget::Date { digits: parse_date_digits(&s), dcur: 0, cal: None }
+            let digits = parse_date_digits(&s);
+            let dcur = first_empty_slot_8(&digits);
+            Widget::Date { digits, dcur, cal: None }
         }
         FieldType::Datetime => {
             let s = match prior {
                 Some(Value::String(ref v)) => v.clone(),
                 _ => f.default.clone().unwrap_or_default(),
             };
-            Widget::Datetime { digits: parse_datetime_digits(&s), dcur: 0, cal: None }
+            let digits = parse_datetime_digits(&s);
+            let dcur = first_empty_slot_14(&digits);
+            Widget::Datetime { digits, dcur, cal: None }
         }
         _ => Widget::Input {
             buf: match prior {
@@ -1964,9 +2000,13 @@ pub fn run_wizard_tui(
                         textarea_fix_scroll(scroll, *cursor_row);
                     }
                 }
-                // Tab commits a textarea and advances focus.
+                // Tab commits a textarea and advances focus forward.
                 KeyCode::Tab if focus < n && matches!(widgets[focus], Widget::Textarea { .. }) => {
                     focus = (focus + 1) % (n + 2);
+                }
+                // BackTab goes to the previous field.
+                KeyCode::BackTab if focus < n && matches!(widgets[focus], Widget::Textarea { .. }) => {
+                    focus = (focus + n + 1) % (n + 2);
                 }
                 // Enter on a focused Dropdown opens it.
                 KeyCode::Enter if focus < n && matches!(widgets[focus], Widget::Dropdown { open: false, .. }) => {
@@ -1985,8 +2025,14 @@ pub fn run_wizard_tui(
                             break;
                         }
                     } else {
-                        // Next (or any field) → path validation, API validation, submit.
+                        // Next (or any field) → partial-date, path, API validation, submit.
                         let m = commit(&widgets, &fields);
+                        // Partial date/datetime check (before commit so digits are still live).
+                        if let Some((fail_idx, date_err)) = check_partial_dates(&fields, &widgets) {
+                            err = Some(date_err);
+                            focus = fail_idx;
+                            continue;
+                        }
                         // Path existence check (TUI only; headless/--answers skips this).
                         if let Some((fail_idx, path_err)) = run_path_validation(&fields, &m) {
                             err = Some(path_err);
@@ -2067,15 +2113,16 @@ impl Reporter for BarReporter {
 #[cfg(test)]
 mod tests {
     use super::{
-        date_backspace, date_from_date_digits, date_to_date_digits, date_type_digit,
-        date_widget_value, datetime_backspace, datetime_type_digit, datetime_widget_value,
-        textarea_line_char_len, textarea_line_count,
-        days_in_month, group_list, group_mark_multi, item_label, list_dir, parse_date_digits,
-        parse_datetime_digits, render_date_mask, render_datetime_mask, textarea_backspace,
-        textarea_byte_pos, textarea_insert, validate_path_value, vert_nav, visible_rows,
-        GroupDefaults, Picker, Row,
+        check_partial_dates, date_backspace, date_from_date_digits, date_to_date_digits,
+        date_type_digit, date_widget_value, datetime_backspace, datetime_type_digit,
+        datetime_widget_value, days_in_month, first_empty_slot_14, first_empty_slot_8,
+        group_list, group_mark_multi, item_label, list_dir, parse_date_digits,
+        parse_datetime_digits, render_calendar, render_date_mask, render_datetime_mask,
+        textarea_backspace, textarea_byte_pos, textarea_insert, textarea_line_char_len,
+        textarea_line_count, validate_path_value, vert_nav, visible_rows, GroupDefaults,
+        Picker, Row,
     };
-    use chrono::{Datelike, Days, Months, NaiveDate};
+    use chrono::{Datelike, NaiveDate};
     use insmaller_core::Choice;
 
     // ── textarea helpers ─────────────────────────────────────────────────
@@ -3118,5 +3165,160 @@ mod tests {
         let buf = "café\nhi";
         assert_eq!(textarea_line_char_len(buf, 0), 4); // c-a-f-é = 4 chars
         assert_eq!(textarea_line_char_len(buf, 1), 2);
+    }
+
+    // ── Bug 1: calendar column alignment ────────────────────────────────
+
+    /// Every column must have the same character offset in the header and body
+    /// rows. Each cell is 3 chars joined by 1 space → 4 chars per column slot.
+    #[test]
+    fn calendar_header_and_body_columns_align() {
+        // September 2026: the 1st is a Tuesday (column 2, 0-indexed from Sunday).
+        let sel = NaiveDate::from_ymd_opt(2026, 9, 15).unwrap();
+        let rows = render_calendar(2026, 9, sel);
+
+        // Row 0 is the header; row 1 is the first week (leading blank, blank, 1...).
+        let header = &rows[0];
+        let week1 = &rows[1];
+
+        // Column offsets for a 4-char stride (3-char cell + 1 space separator):
+        // col 0 at 0, col 1 at 4, col 2 at 8, col 3 at 12, ...
+        for col in 0..7usize {
+            let offset = col * 4;
+            let h_cell: String = header.chars().skip(offset).take(3).collect();
+            let b_cell: String = week1.chars().skip(offset).take(3).collect();
+            // The header cell for column 2 (Tuesday) should be "Tu "
+            // and the body cell for column 2 (day 1 of Sep 2026) should be " 01".
+            if col == 0 || col == 1 {
+                // Su, Mo — leading blanks in body
+                assert_eq!(h_cell.trim(), ["Su", "Mo"][col],
+                    "header col {col} mismatch: {h_cell:?}");
+                assert_eq!(b_cell, "   ",
+                    "body col {col} should be blank: {b_cell:?}");
+            } else if col == 2 {
+                assert_eq!(h_cell.trim(), "Tu",
+                    "header col 2 (Tuesday) mismatch: {h_cell:?}");
+                assert_eq!(b_cell.trim(), "01",
+                    "body col 2 should be day 01: {b_cell:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn calendar_header_has_correct_structure() {
+        let sel = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+        let rows = render_calendar(2026, 9, sel);
+        assert!(rows[0].contains("Su"), "header must contain Su");
+        assert!(rows[0].contains("Sa"), "header must contain Sa");
+        // Header length: 7 cells × 3 chars + 6 separators = 27.
+        assert_eq!(rows[0].len(), 27, "header length must be 27: {:?}", rows[0]);
+    }
+
+    // ── Bug 3: partial date detection ───────────────────────────────────
+
+    #[test]
+    fn partial_date_detected() {
+        use super::Widget;
+        use insmaller_core::{Field, FieldType, Validate};
+        // 7 of 8 slots filled → partial.
+        let mut digits = [b'_'; 8];
+        digits[0] = b'2'; digits[1] = b'0'; digits[2] = b'2'; digits[3] = b'6';
+        digits[4] = b'0'; digits[5] = b'9'; digits[6] = b'1';
+        // digits[7] still b'_'
+        let field = Field {
+            id: "go_live".to_string(),
+            field_type: FieldType::Date,
+            prompt: Some("Go-live date".to_string()),
+            default: None, required: true, source: None,
+            options: vec![], condition: None,
+            validate: Validate::default(),
+        };
+        let widget = Widget::Date { digits, dcur: 7, cal: None };
+        let result = check_partial_dates(&[field], &[widget]);
+        assert!(result.is_some(), "partial date must be detected");
+        let (idx, msg) = result.unwrap();
+        assert_eq!(idx, 0);
+        assert!(msg.contains("Go-live date"), "label in error: {msg}");
+        assert!(msg.contains("incomplete"), "error must say incomplete: {msg}");
+    }
+
+    #[test]
+    fn all_empty_date_not_partial() {
+        use super::Widget;
+        use insmaller_core::{Field, FieldType, Validate};
+        let field = Field {
+            id: "dt".to_string(), field_type: FieldType::Date,
+            prompt: None, default: None, required: false, source: None,
+            options: vec![], condition: None, validate: Validate::default(),
+        };
+        let widget = Widget::Date { digits: [b'_'; 8], dcur: 0, cal: None };
+        assert!(check_partial_dates(&[field], &[widget]).is_none(),
+            "all-empty date must not trigger partial error");
+    }
+
+    #[test]
+    fn full_date_not_partial() {
+        use super::Widget;
+        use insmaller_core::{Field, FieldType, Validate};
+        let digits = parse_date_digits("2026-09-15");
+        let field = Field {
+            id: "dt".to_string(), field_type: FieldType::Date,
+            prompt: None, default: None, required: true, source: None,
+            options: vec![], condition: None, validate: Validate::default(),
+        };
+        let widget = Widget::Date { digits, dcur: 8, cal: None };
+        assert!(check_partial_dates(&[field], &[widget]).is_none(),
+            "fully-filled date must not trigger partial error");
+    }
+
+    // ── Bug 4: dcur initialized to first empty slot ──────────────────────
+
+    #[test]
+    fn first_empty_slot_8_all_empty() {
+        assert_eq!(first_empty_slot_8(&[b'_'; 8]), 0);
+    }
+
+    #[test]
+    fn first_empty_slot_8_all_filled() {
+        let d = parse_date_digits("2026-09-15");
+        assert_eq!(first_empty_slot_8(&d), 8);
+    }
+
+    #[test]
+    fn first_empty_slot_8_partial() {
+        // 4 digits filled (YYYY), 4 empty → first empty at slot 4.
+        let mut d = [b'_'; 8];
+        d[0] = b'2'; d[1] = b'0'; d[2] = b'2'; d[3] = b'6';
+        assert_eq!(first_empty_slot_8(&d), 4);
+    }
+
+    #[test]
+    fn first_empty_slot_14_all_filled() {
+        let d = parse_datetime_digits("2026-09-15T12:30:00");
+        assert_eq!(first_empty_slot_14(&d), 14);
+    }
+
+    #[test]
+    fn first_empty_slot_14_partial() {
+        // Only date part filled (8 slots), time empty → first empty at 8.
+        let mut d = [b'_'; 14];
+        let date_d = parse_date_digits("2026-09-15");
+        d[..8].copy_from_slice(&date_d);
+        assert_eq!(first_empty_slot_14(&d), 8);
+    }
+
+    #[test]
+    fn dcur_for_reentry_after_partial_type() {
+        // Simulates Back→re-entry: 7 of 8 digit slots filled (YYYY-MM-D, day
+        // units digit not yet typed). Build the array directly rather than
+        // through parse_date_digits (which requires a full 10-char string).
+        let mut digits = [b'_'; 8];
+        // YYYY = 2026, MM = 09, D = 1  (7 slots: indices 0-6)
+        digits[0] = b'2'; digits[1] = b'0'; digits[2] = b'2'; digits[3] = b'6';
+        digits[4] = b'0'; digits[5] = b'9'; digits[6] = b'1';
+        // digits[7] is still b'_'
+        assert_eq!(digits[7], b'_', "slot 7 must be empty");
+        let dcur = first_empty_slot_8(&digits);
+        assert_eq!(dcur, 7, "cursor must resume at slot 7, not 0");
     }
 }

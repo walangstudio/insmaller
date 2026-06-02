@@ -571,18 +571,14 @@ pub fn validate_wizard_schema(def: &WizardDef) -> Result<()> {
 }
 
 fn validate_field_schema(field: &Field) -> Result<()> {
-    // Reject format= on types where it makes no sense.
+    // format= is meaningful only for free-text fields. Reject it on everything
+    // else: on select types it runs against the option label and falsely rejects
+    // valid options; on date/datetime/toggle it is semantically nonsensical.
     if let Some(fmt) = field.validate.format {
-        let bad = matches!(
-            (field.field_type, fmt),
-            (FieldType::Dropdown, _)
-                | (FieldType::Date, _)
-                | (FieldType::Datetime, _)
-                | (FieldType::Toggle, _)
-        );
-        if bad {
+        let allowed = matches!(field.field_type, FieldType::Text | FieldType::Secret | FieldType::Path);
+        if !allowed {
             return Err(EngineError::Config(format!(
-                "field '{}': format={:?} conflicts with type={:?}",
+                "field '{}': format={:?} is only valid on text/secret/path fields, not {:?}",
                 field.id, fmt, field.field_type
             )));
         }
@@ -600,6 +596,26 @@ fn validate_field_schema(field: &Field) -> Result<()> {
         if matches!(&field.validate.max, Some(Bound::Num(_))) {
             return Err(EngineError::Config(format!(
                 "field '{}': max= on a {:?} field must be an ISO string (e.g. max = \"2027-12-31\"), not a number",
+                field.id, field.field_type
+            )));
+        }
+    }
+
+    // Reject Bound::Str min/max on non-date fields: string bounds are only
+    // meaningful as ISO dates. A quoted number like `min = "5"` on a text field
+    // is silently ignored by the numeric-bound block, enforcing nothing.
+    if !matches!(field.field_type, FieldType::Date | FieldType::Datetime) {
+        if matches!(&field.validate.min, Some(Bound::Str(_))) {
+            return Err(EngineError::Config(format!(
+                "field '{}': min= is a quoted string but field type is {:?}; \
+                 string bounds are only valid on date/datetime fields (use an unquoted number for numeric bounds)",
+                field.id, field.field_type
+            )));
+        }
+        if matches!(&field.validate.max, Some(Bound::Str(_))) {
+            return Err(EngineError::Config(format!(
+                "field '{}': max= is a quoted string but field type is {:?}; \
+                 string bounds are only valid on date/datetime fields (use an unquoted number for numeric bounds)",
                 field.id, field.field_type
             )));
         }
@@ -2445,6 +2461,104 @@ max = "2027-12-31"
             id = "COUNTRY"
             type = "dropdown"
             options = ["US", "PH", "DE"]
+        "#).unwrap();
+        assert!(validate_wizard_schema(&wiz).is_ok());
+    }
+
+    // ── Fix 1 (extended): format rejected on single_select / multiselect ────────
+
+    #[test]
+    fn schema_rejects_format_on_single_select() {
+        let wiz = WizardDef::from_str(r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "ENV"
+            type = "single_select"
+            format = "email"
+            options = ["Production", "Staging"]
+        "#).unwrap();
+        assert!(matches!(validate_wizard_schema(&wiz), Err(EngineError::Config(_))));
+    }
+
+    #[test]
+    fn schema_rejects_format_on_multiselect() {
+        let wiz = WizardDef::from_str(r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "TOOLS"
+            type = "multiselect"
+            format = "integer"
+            options = ["node", "ripgrep"]
+        "#).unwrap();
+        assert!(matches!(validate_wizard_schema(&wiz), Err(EngineError::Config(_))));
+    }
+
+    #[test]
+    fn schema_accepts_format_on_text_field() {
+        let wiz = WizardDef::from_str(r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "PORT"
+            type = "text"
+            format = "integer"
+        "#).unwrap();
+        assert!(validate_wizard_schema(&wiz).is_ok());
+    }
+
+    // ── Fix 2: Bound::Str on non-date fields is rejected ─────────────────────
+
+    #[test]
+    fn schema_rejects_string_min_on_text_field() {
+        let wiz = WizardDef::from_str(r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "PORT"
+            type = "text"
+            min = "5"
+        "#).unwrap();
+        assert!(matches!(validate_wizard_schema(&wiz), Err(EngineError::Config(_))));
+    }
+
+    #[test]
+    fn schema_rejects_string_max_on_secret_field() {
+        let wiz = WizardDef::from_str(r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "KEY"
+            type = "secret"
+            max = "100"
+        "#).unwrap();
+        assert!(matches!(validate_wizard_schema(&wiz), Err(EngineError::Config(_))));
+    }
+
+    #[test]
+    fn schema_accepts_numeric_min_on_text_field() {
+        let wiz = WizardDef::from_str(r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "PORT"
+            type = "text"
+            min = 1
+            max = 65535
+        "#).unwrap();
+        assert!(validate_wizard_schema(&wiz).is_ok());
+    }
+
+    #[test]
+    fn schema_accepts_string_min_on_date_field() {
+        let wiz = WizardDef::from_str(r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "D"
+            type = "date"
+            min = "2026-01-01"
         "#).unwrap();
         assert!(validate_wizard_schema(&wiz).is_ok());
     }
