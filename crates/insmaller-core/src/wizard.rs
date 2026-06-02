@@ -2081,13 +2081,28 @@ max = "2027-12-31"
     fn start_http_server(response: &'static str) -> u16 {
         use std::io::{Read, Write};
         use std::net::TcpListener;
+        use std::time::Duration;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf);
+                // Drain the whole request (headers + any body) until the client
+                // pauses to wait for our response. Responding and closing before
+                // the client has finished sending its body resets the connection
+                // on Windows, so ureq reports a transport error and the POST-body
+                // test flakes. A short read timeout ends the loop once the client
+                // stops sending.
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+                let mut tmp = [0u8; 1024];
+                loop {
+                    match stream.read(&mut tmp) {
+                        Ok(0) => break,        // client closed
+                        Ok(_) => continue,     // more request bytes
+                        Err(_) => break,       // timeout: client now awaiting response
+                    }
+                }
                 let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
             }
         });
         port
