@@ -4,6 +4,70 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] - 2026-06-01
+
+### Added
+- **`dropdown` field type.** A collapsed, type-to-search select: the list is
+  hidden until the user starts typing, then filters to matching options. Distinct
+  from `single_select`, which remains an expanded radio list. The popup shows a
+  `Search:` line at the top; typing narrows the list in real time; `[no matches]`
+  is shown when nothing matches.
+- **`textarea` field type.** Multi-line free text; newlines are preserved in the
+  collected value. Press **Enter** to enter edit mode (`[Enter to edit]` shown
+  when focused but idle); **Esc** exits edit mode. While editing, ↑↓←→/Home/End/
+  PgUp/PgDn navigate within the text, Enter inserts a newline, and a
+  `(line N/total)` counter is shown. While not editing the field participates in
+  normal Tab/arrow field navigation.
+- **`date` field type.** Digit-only masked entry; the `-` separators at
+  positions 4 and 7 of `YYYY-MM-DD` are pre-placed and auto-skipped. Empty digit
+  slots are shown as `_`. Range bounds via `min`/`max` (ISO date strings). Press
+  **Space** to open a month calendar overlay (←/→ = ±1 day, ↑/↓ = ±1 week,
+  PgUp/PgDn = ±1 month, Enter commits, Esc cancels). On page re-entry the cursor
+  resumes at the first unfilled slot. A partially-typed date (at least one digit
+  filled but not all) is rejected with an "incomplete date" error instead of
+  being silently submitted empty.
+- **`datetime` field type.** Same masked-entry and calendar mechanics as `date`,
+  with 14 digit slots for `YYYY-MM-DDTHH:MM:SS`. The calendar commits only the
+  date portion; any time digits already typed are preserved.
+- **`[page.field.api]` — field-level API validation.** After local validators
+  pass, the engine renders `{{value}}` into the configured `url` (and optionally
+  `headers`/`body`), fires an HTTP request, and accepts the value only if the
+  response matches `expect_status` (default: any 2xx) and, when set,
+  `expect_json_path` resolves truthy. On failure the field stays focused and
+  shows the `error` message. Keys: `url` (required, http/https, may contain
+  `{{value}}`), `method` (default `GET`), `headers` (array of `[name, value]`
+  pairs), `body`, `expect_status`, `expect_json_path`, `timeout_ms` (default
+  5000), `error`. Skipped on `--answers` / unattended runs by design;
+  `--no-api-validate` skips all API checks (useful offline/CI).
+- **Path field validation.** A typed path value is trimmed of surrounding
+  whitespace and rejected if neither the path itself nor its parent directory
+  exists (catches typos and wrong case on Linux). A new leaf under an existing
+  parent is accepted; a bare name with no path component (implicit cwd parent) is
+  always accepted.
+- **Collected answers are printed after the wizard.** Secret fields are shown
+  as `***`. When answers were collected but no packages are selected, setup prints
+  `No packages to install (answers recorded above)` and exits cleanly.
+- **Field navigation.** Tab/Shift-Tab move between fields and skip a disabled
+  Back button; the focused field is always visibly highlighted with a `▶` marker
+  and a border focus-glow (colored themes).
+- **`examples/wizard-widgets.toml` + `examples/serve-validate.py`.** A bundled
+  demo that exercises every new field type. `serve-validate.py` is a dependency-
+  free Python HTTP server on `127.0.0.1:8787` that accepts keys starting with
+  `demo-` — letting you exercise the full `[page.field.api]` path entirely on
+  localhost without any third-party service or signup.
+- **Schema validation of the wizard at load time.** `validate_wizard_schema` is
+  called before the TUI starts and rejects: an empty or non-http(s) `api.url`;
+  `format=` on non-text fields (select/date/datetime/toggle); a numeric `min`/
+  `max` on a date/datetime field; a quoted/string `min`/`max` on a non-date
+  field; and `source = "catalog.*"` on a dropdown (dropdown answers are not
+  pushed to `selected_keys`).
+
+### Changed
+- `min`/`max` on a field now accept an ISO date string in addition to a number.
+  Existing numeric bounds are unaffected (backwards compatible).
+- Validation error messages use the field's `prompt` label instead of its `id`,
+  matching the text the user sees on screen.
+
 ## [0.6.2] - 2026-05-31
 
 ### Added

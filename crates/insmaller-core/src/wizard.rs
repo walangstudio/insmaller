@@ -19,10 +19,18 @@ use serde_json::{Map, Value};
 pub enum FieldType {
     Multiselect,
     SingleSelect,
+    /// Collapsed type-to-search selector (differs from `single_select` which stays expanded).
+    Dropdown,
     Text,
+    /// Multi-line text input.
+    Textarea,
     Secret,
     Path,
     Toggle,
+    /// ISO 8601 date (`YYYY-MM-DD`).
+    Date,
+    /// ISO 8601 datetime (`YYYY-MM-DDTHH:MM:SS`).
+    Datetime,
 }
 
 /// Named value validators for text-like fields (alternative/addition to a raw
@@ -60,16 +68,265 @@ impl FieldFormat {
                 let mut parts = v.splitn(2, '@');
                 let local = parts.next().unwrap_or("");
                 let domain = parts.next().unwrap_or("");
-                !local.is_empty() && domain.contains('.') && !domain.starts_with('.')
+                !local.is_empty()
+                    && domain.contains('.')
+                    && !domain.starts_with('.')
                     && !domain.ends_with('.')
             }
         }
     }
 }
 
+/// A bound value for `min`/`max` on a `Validate`. Accepts either a bare number
+/// (`min = 5`) or a quoted string (`min = "2026-06-01"`), deserialized via
+/// serde's untagged enum. Numeric fields use `Num`; date/datetime fields use
+/// `Str`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum Bound {
+    Num(f64),
+    Str(String),
+}
+
+/// Optional API-call validation block. Lives at the `[[page.field]]` level
+/// under the key `api` — e.g. `[page.field.api]`.
+///
+/// NOTE ON TOML PATH: `Validate` is `#[serde(flatten)]`-ed into `Field`, so
+/// its fields (including `api`) are promoted to the `[[page.field]]` level.
+/// The spec example shows `[page.field.validate.api]`, but that nesting does
+/// NOT match the flattened schema. The correct TOML path is `[page.field.api]`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ValidateApi {
+    /// Request URL; `{{value}}` is substituted with the field value before sending.
+    pub url: String,
+    /// HTTP method: `"GET"` (default), `"POST"`, or `"HEAD"`.
+    #[serde(default)]
+    pub method: Option<String>,
+    /// Extra headers as `[["name", "value"], …]`; values may contain `{{value}}`.
+    #[serde(default)]
+    pub headers: Vec<(String, String)>,
+    /// Request body for POST; `{{value}}` substitution allowed.
+    #[serde(default)]
+    pub body: Option<String>,
+    /// If set, the response status must equal this exactly; otherwise any 2xx is accepted.
+    #[serde(default)]
+    pub expect_status: Option<u16>,
+    /// Dotted JSON path (e.g. `"data.ok"`) whose value must be truthy in the response body.
+    #[serde(default)]
+    pub expect_json_path: Option<String>,
+    /// Request timeout in milliseconds (default 5000).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// Error message shown to the user on validation failure.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl ValidateApi {
+    /// Substitute `{{value}}` verbatim — for headers and body where the raw
+    /// value is required (e.g. an API key must not be percent-encoded).
+    fn render(template: &str, value: &str) -> String {
+        template.replace("{{value}}", value)
+    }
+
+    /// Substitute `{{value}}` with the value percent-encoded for a URL context.
+    /// Only the value segment is encoded; the surrounding URL template is left
+    /// as-is (the template author is responsible for the rest of the URL).
+    /// Encodes everything outside RFC 3986 unreserved chars (A-Z a-z 0-9 - _ . ~).
+    fn render_url(template: &str, value: &str) -> String {
+        let encoded: String = value
+            .bytes()
+            .flat_map(|b| {
+                if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+                    vec![b as char]
+                } else {
+                    format!("%{b:02X}").chars().collect()
+                }
+            })
+            .collect();
+        template.replace("{{value}}", &encoded)
+    }
+
+    /// Perform the API validation request synchronously (blocking). Intended
+    /// to be called from a `tokio::task::spawn_blocking` closure in the CLI.
+    ///
+    /// Returns `Ok(())` when the request passes all success criteria.
+    /// Returns `Err(EngineError::InvalidInput { .. })` on any failure,
+    /// using `self.error` as the message when set.
+    pub fn call(&self, field_id: &str, value: &str) -> Result<()> {
+        let fail = |reason: String| -> Result<()> {
+            Err(EngineError::InvalidInput {
+                field: field_id.to_string(),
+                message: self.error.clone().unwrap_or(reason),
+            })
+        };
+
+        // Security: refuse non-http(s) URLs.
+        // Value is percent-encoded for the URL context only (not for headers/body).
+        let url = Self::render_url(&self.url, value);
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return fail(format!(
+                "api.url must start with http:// or https://, got: {url}"
+            ));
+        }
+        // Refuse userinfo in the URL (token-exfil guard, mirrors processors_io).
+        if let Some(authority) = url
+            .split_once("://")
+            .and_then(|(_, rest)| rest.split(['/', '?', '#']).next())
+        {
+            if authority.contains('@') {
+                return fail(format!(
+                    "api.url must not contain userinfo (user@host): {url}"
+                ));
+            }
+        }
+
+        let timeout_ms = self.timeout_ms.unwrap_or(5000);
+        let method = self.method.as_deref().unwrap_or("GET").to_ascii_uppercase();
+
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(std::time::Duration::from_millis(timeout_ms)))
+            // Disable auto-error on non-2xx so we can inspect the status ourselves.
+            .http_status_as_error(false)
+            // No redirects: validation endpoints respond directly, and following
+            // redirects could replay secret-bearing headers to a different host.
+            .max_redirects(0)
+            .build()
+            .into();
+
+        // Rendered headers shared across all branches.
+        let rendered_headers: Vec<(String, String)> = self
+            .headers
+            .iter()
+            .map(|(k, v)| (k.clone(), Self::render(v, value)))
+            .collect();
+
+        let map_err = |e: ureq::Error| EngineError::InvalidInput {
+            field: field_id.to_string(),
+            message: self
+                .error
+                .clone()
+                .unwrap_or_else(|| format!("api validation request failed: {e}")),
+        };
+
+        // ureq 3: GET/HEAD → RequestBuilder<WithoutBody> (.call()), POST →
+        // RequestBuilder<WithBody> (.send(body)). The two types cannot be
+        // unified in a single `match`, so each branch is self-contained.
+        let mut resp = match method.as_str() {
+            "POST" => {
+                let body = self
+                    .body
+                    .as_deref()
+                    .map(|b| Self::render(b, value))
+                    .unwrap_or_default();
+                let mut req = agent.post(&url).header("User-Agent", "insmaller");
+                for (k, v) in &rendered_headers {
+                    req = req.header(k.as_str(), v.as_str());
+                }
+                req.send(body.as_bytes()).map_err(map_err)?
+            }
+            "HEAD" => {
+                let mut req = agent.head(&url).header("User-Agent", "insmaller");
+                for (k, v) in &rendered_headers {
+                    req = req.header(k.as_str(), v.as_str());
+                }
+                req.call().map_err(map_err)?
+            }
+            _ => {
+                let mut req = agent.get(&url).header("User-Agent", "insmaller");
+                for (k, v) in &rendered_headers {
+                    req = req.header(k.as_str(), v.as_str());
+                }
+                req.call().map_err(map_err)?
+            }
+        };
+
+        let status = resp.status().as_u16();
+
+        // Status check.
+        let status_ok = if let Some(expected) = self.expect_status {
+            status == expected
+        } else {
+            (200..300).contains(&status)
+        };
+        if !status_ok {
+            return fail(format!(
+                "api validation failed: HTTP {status}{}",
+                self.expect_status
+                    .map(|e| format!(" (expected {e})"))
+                    .unwrap_or_default()
+            ));
+        }
+
+        // JSON-path check: parse body and walk the dotted path.
+        if let Some(path) = &self.expect_json_path {
+            let body_str =
+                resp.body_mut()
+                    .read_to_string()
+                    .map_err(|e| EngineError::InvalidInput {
+                        field: field_id.to_string(),
+                        message: self
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| format!("api validation: failed to read body: {e}")),
+                    })?;
+            let json: serde_json::Value =
+                serde_json::from_str(&body_str).map_err(|e| EngineError::InvalidInput {
+                    field: field_id.to_string(),
+                    message: self
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| format!("api validation: response is not JSON: {e}")),
+                })?;
+
+            let resolved = resolve_json_path(&json, path);
+            if !is_truthy(resolved) {
+                return fail(format!(
+                    "api validation failed: JSON path '{path}' is not truthy"
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Walk a dotted JSON path (e.g. `"data.ok"` or `"items.0.ok"`) and return
+/// the value at that location, or `None` if the path does not resolve.
+/// Numeric segments index into arrays; string segments index into objects.
+fn resolve_json_path<'a>(v: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    let mut cur = v;
+    for key in path.split('.') {
+        cur = match cur {
+            serde_json::Value::Array(arr) => {
+                let idx = key.parse::<usize>().ok()?;
+                arr.get(idx)?
+            }
+            other => other.get(key)?,
+        };
+    }
+    Some(cur)
+}
+
+/// JSON value truthiness: `false`, `null`, `0`, `""`, `[]`, `{}` are falsy.
+fn is_truthy(v: Option<&serde_json::Value>) -> bool {
+    match v {
+        None => false,
+        Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::Number(n)) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
+        Some(serde_json::Value::String(s)) => !s.is_empty(),
+        Some(serde_json::Value::Array(a)) => !a.is_empty(),
+        Some(serde_json::Value::Object(o)) => !o.is_empty(),
+    }
+}
+
 /// Validation flags shared by `Field` and the catalog's `requires_input`
 /// declarations. All optional; applied to the scalar string value of a
 /// text/secret/path field (empties are handled by `required`).
+///
+/// Note: because this struct is `#[serde(flatten)]`-ed into `Field`, all
+/// fields here (including `api`) appear as direct keys on `[[page.field]]`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Validate {
     /// Regex the value must match in full (anchored automatically).
@@ -82,19 +339,25 @@ pub struct Validate {
     pub min_length: Option<usize>,
     #[serde(default)]
     pub max_length: Option<usize>,
-    /// Numeric bounds (value is parsed as f64; implies a numeric value).
+    /// Numeric or string bounds. `Bound::Num` for numeric fields; `Bound::Str`
+    /// for date/datetime fields (e.g. `min = "2026-06-01"`). Existing configs
+    /// using bare numbers (`min = 5`) continue to work via `Bound::Num`.
     #[serde(default)]
-    pub min: Option<f64>,
+    pub min: Option<Bound>,
     #[serde(default)]
-    pub max: Option<f64>,
+    pub max: Option<Bound>,
     /// Custom message shown instead of the generated one.
     #[serde(default)]
     pub error: Option<String>,
+    /// Optional API-call validation. Lives at the field level due to flatten.
+    #[serde(default)]
+    pub api: Option<ValidateApi>,
 }
 
 impl Validate {
     /// Validate a non-empty scalar value. `Ok(())` when it passes or when no
-    /// rules are set. `field_id` is used for the error.
+    /// rules are set. `field_id` is used for the error. Type-agnostic: handles
+    /// numeric bounds only (date range handled by `check_typed`).
     pub fn check(&self, field_id: &str, value: &str) -> Result<()> {
         if value.is_empty() {
             return Ok(());
@@ -121,16 +384,32 @@ impl Validate {
                 return fail(format!("must be {}", fmt.label()));
             }
         }
-        if self.min.is_some() || self.max.is_some() {
+        // Numeric bounds: only applied when the bound is Bound::Num (or when
+        // any numeric bound exists). Bound::Str bounds are handled in check_typed.
+        let num_min = self.min.as_ref().and_then(|b| {
+            if let Bound::Num(n) = b {
+                Some(*n)
+            } else {
+                None
+            }
+        });
+        let num_max = self.max.as_ref().and_then(|b| {
+            if let Bound::Num(n) = b {
+                Some(*n)
+            } else {
+                None
+            }
+        });
+        if num_min.is_some() || num_max.is_some() {
             match value.parse::<f64>() {
                 // reject NaN/inf: NaN passes every bound (all comparisons false).
                 Ok(n) if n.is_finite() => {
-                    if let Some(min) = self.min {
+                    if let Some(min) = num_min {
                         if n < min {
                             return fail(format!("must be >= {min}"));
                         }
                     }
-                    if let Some(max) = self.max {
+                    if let Some(max) = num_max {
                         if n > max {
                             return fail(format!("must be <= {max}"));
                         }
@@ -150,6 +429,250 @@ impl Validate {
         }
         Ok(())
     }
+
+    /// Like `check` but also applies date/datetime well-formedness and range
+    /// validation for `FieldType::Date` and `FieldType::Datetime`. For all
+    /// other types, delegates to `check` unchanged.
+    ///
+    /// Call sites that know the field type should use this instead of `check`.
+    pub fn check_typed(&self, field_type: FieldType, field_id: &str, value: &str) -> Result<()> {
+        if value.is_empty() {
+            return Ok(());
+        }
+        let fail = |reason: String| -> Result<()> {
+            Err(EngineError::InvalidInput {
+                field: field_id.to_string(),
+                message: self.error.clone().unwrap_or(reason),
+            })
+        };
+        match field_type {
+            FieldType::Date => {
+                let date = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| {
+                    EngineError::InvalidInput {
+                        field: field_id.to_string(),
+                        message: self.error.clone().unwrap_or_else(|| {
+                            format!("must be a valid date in YYYY-MM-DD format, got: {value}")
+                        }),
+                    }
+                })?;
+                if let Some(Bound::Str(min_s)) = &self.min {
+                    let min_d =
+                        chrono::NaiveDate::parse_from_str(min_s, "%Y-%m-%d").map_err(|_| {
+                            EngineError::Config(format!(
+                                "field '{field_id}' has an invalid date min bound: {min_s}"
+                            ))
+                        })?;
+                    if date < min_d {
+                        return fail(format!("must be on or after {min_s}"));
+                    }
+                }
+                if let Some(Bound::Str(max_s)) = &self.max {
+                    let max_d =
+                        chrono::NaiveDate::parse_from_str(max_s, "%Y-%m-%d").map_err(|_| {
+                            EngineError::Config(format!(
+                                "field '{field_id}' has an invalid date max bound: {max_s}"
+                            ))
+                        })?;
+                    if date > max_d {
+                        return fail(format!("must be on or before {max_s}"));
+                    }
+                }
+                // Run only length/pattern checks — NOT numeric bounds or FieldFormat,
+                // which don't apply to ISO date strings and produce misleading errors.
+                self.check_text_only(field_id, value)
+            }
+            FieldType::Datetime => {
+                let dt = chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S")
+                    .map_err(|_| EngineError::InvalidInput {
+                        field: field_id.to_string(),
+                        message: self.error.clone().unwrap_or_else(|| {
+                            format!(
+                                "must be a valid datetime in YYYY-MM-DDTHH:MM:SS format, got: {value}"
+                            )
+                        }),
+                    })?;
+                if let Some(Bound::Str(min_s)) = &self.min {
+                    let min_dt = chrono::NaiveDateTime::parse_from_str(min_s, "%Y-%m-%dT%H:%M:%S")
+                        .map_err(|_| {
+                            EngineError::Config(format!(
+                                "field '{field_id}' has an invalid datetime min bound: {min_s}"
+                            ))
+                        })?;
+                    if dt < min_dt {
+                        return fail(format!("must be on or after {min_s}"));
+                    }
+                }
+                if let Some(Bound::Str(max_s)) = &self.max {
+                    let max_dt = chrono::NaiveDateTime::parse_from_str(max_s, "%Y-%m-%dT%H:%M:%S")
+                        .map_err(|_| {
+                            EngineError::Config(format!(
+                                "field '{field_id}' has an invalid datetime max bound: {max_s}"
+                            ))
+                        })?;
+                    if dt > max_dt {
+                        return fail(format!("must be on or before {max_s}"));
+                    }
+                }
+                // Run only length/pattern checks — NOT numeric bounds or FieldFormat.
+                self.check_text_only(field_id, value)
+            }
+            _ => self.check(field_id, value),
+        }
+    }
+
+    /// Apply only min_length/max_length/pattern checks — no FieldFormat or
+    /// numeric-bound logic. Used by Date/Datetime paths in `check_typed` so
+    /// an ISO date string is never fed to the f64 or format validators.
+    fn check_text_only(&self, field_id: &str, value: &str) -> Result<()> {
+        if value.is_empty() {
+            return Ok(());
+        }
+        let fail = |reason: String| {
+            Err(EngineError::InvalidInput {
+                field: field_id.to_string(),
+                message: self.error.clone().unwrap_or(reason),
+            })
+        };
+        let len = value.chars().count();
+        if let Some(min) = self.min_length {
+            if len < min {
+                return fail(format!("must be at least {min} character(s)"));
+            }
+        }
+        if let Some(max) = self.max_length {
+            if len > max {
+                return fail(format!("must be at most {max} character(s)"));
+            }
+        }
+        if let Some(pat) = &self.pattern {
+            let re = regex::Regex::new(&format!("^(?:{pat})$")).map_err(|e| {
+                EngineError::Config(format!("field '{field_id}' has an invalid pattern: {e}"))
+            })?;
+            if !re.is_match(value) {
+                return fail(format!("must match {pat}"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Validate wizard schema constraints. Call after `WizardDef::from_str` to
+/// catch semantic errors that TOML deserialization cannot detect.
+///
+/// Returns `Err(EngineError::Config(_))` on a hard violation.
+/// Writes warnings to stderr for soft violations (non-fatal).
+pub fn validate_wizard_schema(def: &WizardDef) -> Result<()> {
+    for page in &def.pages {
+        for field in &page.fields {
+            validate_field_schema(field)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_field_schema(field: &Field) -> Result<()> {
+    // format= is meaningful only for free-text fields. Reject it on everything
+    // else: on select types it runs against the option label and falsely rejects
+    // valid options; on date/datetime/toggle it is semantically nonsensical.
+    if let Some(fmt) = field.validate.format {
+        let allowed = matches!(field.field_type, FieldType::Text | FieldType::Textarea | FieldType::Secret | FieldType::Path);
+        if !allowed {
+            return Err(EngineError::Config(format!(
+                "field '{}': format={:?} is only valid on text/secret/path fields, not {:?}",
+                field.id, fmt, field.field_type
+            )));
+        }
+    }
+
+    // Reject numeric Bound::Num on Date/Datetime fields: the bound must be an
+    // ISO string (e.g. `min = "2026-06-01"`), not a bare number.
+    if matches!(field.field_type, FieldType::Date | FieldType::Datetime) {
+        if matches!(&field.validate.min, Some(Bound::Num(_))) {
+            return Err(EngineError::Config(format!(
+                "field '{}': min= on a {:?} field must be an ISO string (e.g. min = \"2026-06-01\"), not a number",
+                field.id, field.field_type
+            )));
+        }
+        if matches!(&field.validate.max, Some(Bound::Num(_))) {
+            return Err(EngineError::Config(format!(
+                "field '{}': max= on a {:?} field must be an ISO string (e.g. max = \"2027-12-31\"), not a number",
+                field.id, field.field_type
+            )));
+        }
+    }
+
+    // Reject Bound::Str min/max on non-date fields: string bounds are only
+    // meaningful as ISO dates. A quoted number like `min = "5"` on a text field
+    // is silently ignored by the numeric-bound block, enforcing nothing.
+    if !matches!(field.field_type, FieldType::Date | FieldType::Datetime) {
+        if matches!(&field.validate.min, Some(Bound::Str(_))) {
+            return Err(EngineError::Config(format!(
+                "field '{}': min= is a quoted string but field type is {:?}; \
+                 string bounds are only valid on date/datetime fields (use an unquoted number for numeric bounds)",
+                field.id, field.field_type
+            )));
+        }
+        if matches!(&field.validate.max, Some(Bound::Str(_))) {
+            return Err(EngineError::Config(format!(
+                "field '{}': max= is a quoted string but field type is {:?}; \
+                 string bounds are only valid on date/datetime fields (use an unquoted number for numeric bounds)",
+                field.id, field.field_type
+            )));
+        }
+    }
+
+    // Reject catalog.* source on Dropdown: dropdown answers are stored as
+    // WizValue::Text and are never pushed to selected_keys, so a
+    // catalog-sourced dropdown would silently install nothing.
+    if field.field_type == FieldType::Dropdown {
+        if let Some(src) = &field.source {
+            if src.starts_with("catalog.") {
+                return Err(EngineError::Config(format!(
+                    "field '{}': source=\"{src}\" is not supported on type=dropdown \
+                     (dropdown answers are not pushed to selected_keys; use single_select instead)",
+                    field.id
+                )));
+            }
+        }
+    }
+
+    if let Some(api) = &field.validate.api {
+        // Hard reject: empty or non-http(s) url.
+        if api.url.is_empty() {
+            return Err(EngineError::Config(format!(
+                "field '{}': api.url must not be empty",
+                field.id
+            )));
+        }
+        if !api.url.starts_with("http://") && !api.url.starts_with("https://") {
+            return Err(EngineError::Config(format!(
+                "field '{}': api.url must start with http:// or https://, got: {}",
+                field.id, api.url
+            )));
+        }
+
+        // Soft warn: api on a secret field without {{value}} in headers/body
+        // (the value would never be sent — likely a config mistake).
+        if field.field_type == FieldType::Secret {
+            let has_value_in_headers = api.headers.iter().any(|(_, v)| v.contains("{{value}}"));
+            let has_value_in_body = api
+                .body
+                .as_deref()
+                .map(|b| b.contains("{{value}}"))
+                .unwrap_or(false);
+            let has_value_in_url = api.url.contains("{{value}}");
+            if !has_value_in_headers && !has_value_in_body && !has_value_in_url {
+                eprintln!(
+                    "warning: field '{}' is type=secret with api validation but {{{{value}}}} \
+                     is not used in api.url, api.headers, or api.body — the secret will not \
+                     be sent to the API",
+                    field.id
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -172,7 +695,8 @@ pub struct Field {
     pub options: Vec<String>,
     #[serde(default)]
     pub condition: Option<String>,
-    /// Value validators (text/secret/path fields).
+    /// Value validators (text/secret/path fields). Flattened: all Validate
+    /// fields appear as direct keys on `[[page.field]]`.
     #[serde(flatten)]
     pub validate: Validate,
 }
@@ -284,7 +808,9 @@ impl Answerer for StaticAnswerer {
     fn ask(&self, field: &Field, _choices: &[Choice]) -> Result<WizValue> {
         match self.0.get(&field.id) {
             Some(Value::Array(a)) => Ok(WizValue::Multi(
-                a.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect(),
             )),
             Some(Value::Bool(b)) => Ok(WizValue::Bool(*b)),
             Some(Value::String(s)) => Ok(match field.field_type {
@@ -367,9 +893,7 @@ fn version_cmp(a: &str, b: &str) -> Option<std::cmp::Ordering> {
 pub fn eval_condition(expr: &str, vars: &Map<String, Value>) -> bool {
     use std::cmp::Ordering;
     let s = expr.trim();
-    let get = |name: &str| -> String {
-        vars.get(name.trim()).map(var_as_str).unwrap_or_default()
-    };
+    let get = |name: &str| -> String { vars.get(name.trim()).map(var_as_str).unwrap_or_default() };
     let unwrap_var = |t: &str| {
         t.trim()
             .trim_start_matches("${")
@@ -535,7 +1059,8 @@ pub fn run_wizard(
                         WizValue::Bool(b) => Value::Bool(b),
                     };
                     if let Value::String(s) = &stored {
-                        synthetic.validate.check(&synthetic.id, s)?;
+                        let label = synthetic.prompt.as_deref().unwrap_or(&synthetic.id);
+                        synthetic.validate.check_typed(synthetic.field_type, label, s)?;
                     }
                     out.vars.insert(synthetic.id.clone(), stored);
                 }
@@ -561,7 +1086,8 @@ pub fn run_wizard(
                 WizValue::Bool(b) => Value::Bool(b),
             };
             if let Value::String(s) = &stored {
-                field.validate.check(&field.id, s)?;
+                let label = field.prompt.as_deref().unwrap_or(&field.id);
+                field.validate.check_typed(field.field_type, label, s)?;
             }
             out.vars.insert(field.id.clone(), stored);
         }
@@ -582,11 +1108,19 @@ pub fn collect_outcome(def: &WizardDef, vars: &Map<String, Value>) -> WizardOutc
         ..Default::default()
     };
     for page in &def.pages {
-        if page.condition.as_deref().is_some_and(|c| !eval_condition(c, vars)) {
+        if page
+            .condition
+            .as_deref()
+            .is_some_and(|c| !eval_condition(c, vars))
+        {
             continue;
         }
         for field in &page.fields {
-            if field.condition.as_deref().is_some_and(|c| !eval_condition(c, vars)) {
+            if field
+                .condition
+                .as_deref()
+                .is_some_and(|c| !eval_condition(c, vars))
+            {
                 continue;
             }
             if !is_catalog_source(field) {
@@ -596,9 +1130,7 @@ pub fn collect_outcome(def: &WizardDef, vars: &Map<String, Value>) -> WizardOutc
                 Some(Value::Array(a)) => out
                     .selected_keys
                     .extend(a.iter().filter_map(|v| v.as_str().map(String::from))),
-                Some(Value::String(s)) if !s.is_empty() => {
-                    out.selected_keys.push(s.clone())
-                }
+                Some(Value::String(s)) if !s.is_empty() => out.selected_keys.push(s.clone()),
                 _ => {}
             }
         }
@@ -709,7 +1241,9 @@ impl<'a> WizardSession<'a> {
     }
     /// (1-based step among active pages, total active given current answers).
     pub fn progress(&self) -> (usize, usize) {
-        let total = (0..self.def.pages.len()).filter(|&i| self.active(i)).count();
+        let total = (0..self.def.pages.len())
+            .filter(|&i| self.active(i))
+            .count();
         let step = (0..=self.idx.min(self.def.pages.len().saturating_sub(1)))
             .filter(|&i| self.active(i))
             .count();
@@ -726,7 +1260,8 @@ impl<'a> WizardSession<'a> {
                         || matches!(v, Value::Array(a) if a.is_empty())) =>
                 {
                     if let Value::String(s) = v {
-                        f.validate.check(&f.id, s)?;
+                        let label = f.prompt.as_deref().unwrap_or(&f.id);
+                        f.validate.check_typed(f.field_type, label, s)?;
                     }
                     self.vars.insert(f.id.clone(), v.clone());
                 }
@@ -829,11 +1364,17 @@ mod tests {
         ));
         assert!(!eval_condition(
             "${CODING} == 'claude'",
-            &serde_json::json!({"CODING":"aider"}).as_object().unwrap().clone()
+            &serde_json::json!({"CODING":"aider"})
+                .as_object()
+                .unwrap()
+                .clone()
         ));
         assert!(eval_condition(
             "${CODING} in 'claude,aider'",
-            &serde_json::json!({"CODING":"aider"}).as_object().unwrap().clone()
+            &serde_json::json!({"CODING":"aider"})
+                .as_object()
+                .unwrap()
+                .clone()
         ));
     }
 
@@ -928,7 +1469,10 @@ mod tests {
         let c = cat();
         let mut s = WizardSession::new(&d, &c, vec![]);
         let mut a = Map::new();
-        a.insert("INSTALL_TOOLS".into(), serde_json::json!(["ripgrep", "node"]));
+        a.insert(
+            "INSTALL_TOOLS".into(),
+            serde_json::json!(["ripgrep", "node"]),
+        );
         s.submit(a).unwrap();
         let mut k = Map::new();
         k.insert("OPENAI_API_KEY".into(), Value::String("sk".into()));
@@ -1109,57 +1653,91 @@ mod tests {
 
     #[test]
     fn validate_format_and_bounds() {
-        let v = Validate { format: Some(FieldFormat::Integer), ..Default::default() };
+        let v = Validate {
+            format: Some(FieldFormat::Integer),
+            ..Default::default()
+        };
         assert!(v.check("PORT", "8080").is_ok());
         assert!(v.check("PORT", "8a").is_err());
-        assert!(v.check("PORT", "").is_ok()); // emptiness is `required`'s job
+        assert!(v.check("PORT", "").is_ok()); // empties are `required`'s job
 
         let r = Validate {
             format: Some(FieldFormat::Integer),
-            min: Some(1.0),
-            max: Some(65535.0),
+            min: Some(Bound::Num(1.0)),
+            max: Some(Bound::Num(65535.0)),
             ..Default::default()
         };
         assert!(r.check("PORT", "443").is_ok());
         assert!(r.check("PORT", "0").is_err());
         assert!(r.check("PORT", "70000").is_err());
 
-        assert!(Validate { format: Some(FieldFormat::Alpha), ..Default::default() }
-            .check("N", "abcZ")
-            .is_ok());
-        assert!(Validate { format: Some(FieldFormat::Alpha), ..Default::default() }
-            .check("N", "ab1")
-            .is_err());
-        assert!(Validate { format: Some(FieldFormat::Email), ..Default::default() }
-            .check("E", "a@b.co")
-            .is_ok());
-        assert!(Validate { format: Some(FieldFormat::Email), ..Default::default() }
-            .check("E", "nope")
-            .is_err());
+        assert!(Validate {
+            format: Some(FieldFormat::Alpha),
+            ..Default::default()
+        }
+        .check("N", "abcZ")
+        .is_ok());
+        assert!(Validate {
+            format: Some(FieldFormat::Alpha),
+            ..Default::default()
+        }
+        .check("N", "ab1")
+        .is_err());
+        assert!(Validate {
+            format: Some(FieldFormat::Email),
+            ..Default::default()
+        }
+        .check("E", "a@b.co")
+        .is_ok());
+        assert!(Validate {
+            format: Some(FieldFormat::Email),
+            ..Default::default()
+        }
+        .check("E", "nope")
+        .is_err());
     }
 
     #[test]
     fn validate_rejects_nan_and_inf() {
         // NaN compares false to every bound, so it must be rejected outright,
         // both as a `number` format and under min/max bounds.
-        let num = Validate { format: Some(FieldFormat::Number), ..Default::default() };
+        let num = Validate {
+            format: Some(FieldFormat::Number),
+            ..Default::default()
+        };
         assert!(num.check("X", "nan").is_err());
         assert!(num.check("X", "inf").is_err());
         assert!(num.check("X", "3.14").is_ok());
 
-        let bounded = Validate { min: Some(1.0), max: Some(10.0), ..Default::default() };
-        assert!(bounded.check("X", "nan").is_err(), "NaN must not slip past bounds");
+        let bounded = Validate {
+            min: Some(Bound::Num(1.0)),
+            max: Some(Bound::Num(10.0)),
+            ..Default::default()
+        };
+        assert!(
+            bounded.check("X", "nan").is_err(),
+            "NaN must not slip past bounds"
+        );
         assert!(bounded.check("X", "inf").is_err());
         assert!(bounded.check("X", "5").is_ok());
     }
 
     #[test]
     fn validate_pattern_is_full_match_and_length() {
-        let v = Validate { pattern: Some("[a-z]+".into()), ..Default::default() };
+        let v = Validate {
+            pattern: Some("[a-z]+".into()),
+            ..Default::default()
+        };
         assert!(v.check("S", "abc").is_ok());
-        assert!(v.check("S", "abc1").is_err(), "anchored: trailing digit rejected");
+        assert!(
+            v.check("S", "abc1").is_err(),
+            "anchored: trailing digit rejected"
+        );
 
-        let l = Validate { max_length: Some(3), ..Default::default() };
+        let l = Validate {
+            max_length: Some(3),
+            ..Default::default()
+        };
         assert!(l.check("S", "abc").is_ok());
         assert!(l.check("S", "abcd").is_err());
     }
@@ -1176,7 +1754,10 @@ mod tests {
 
     #[test]
     fn invalid_pattern_is_config_error() {
-        let v = Validate { pattern: Some("(".into()), ..Default::default() };
+        let v = Validate {
+            pattern: Some("(".into()),
+            ..Default::default()
+        };
         assert!(matches!(v.check("S", "x"), Err(EngineError::Config(_))));
     }
 
@@ -1192,5 +1773,847 @@ mod tests {
         let r = run_wizard(&wiz, &cat, &StaticAnswerer(m), &[]);
         assert!(matches!(r, Err(EngineError::InvalidInput { .. })));
     }
-}
 
+    // ── new FieldType variants ───────────────────────────────────────────────
+
+    #[test]
+    fn new_field_types_deserialize() {
+        let wiz = WizardDef::from_str(
+            r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "country"
+            type = "dropdown"
+            [[page.field]]
+            id = "notes"
+            type = "textarea"
+            [[page.field]]
+            id = "go_live"
+            type = "date"
+            [[page.field]]
+            id = "launch_at"
+            type = "datetime"
+        "#,
+        )
+        .unwrap();
+        let fields = &wiz.pages[0].fields;
+        assert_eq!(fields[0].field_type, FieldType::Dropdown);
+        assert_eq!(fields[1].field_type, FieldType::Textarea);
+        assert_eq!(fields[2].field_type, FieldType::Date);
+        assert_eq!(fields[3].field_type, FieldType::Datetime);
+    }
+
+    // ── Bound untagged enum ──────────────────────────────────────────────────
+
+    #[test]
+    fn bound_num_parses_from_toml() {
+        #[derive(Deserialize)]
+        struct T {
+            min: Bound,
+            max: Bound,
+        }
+        let t: T = toml::from_str("min = 5\nmax = 65535.0\n").unwrap();
+        assert_eq!(t.min, Bound::Num(5.0));
+        assert_eq!(t.max, Bound::Num(65535.0));
+    }
+
+    #[test]
+    fn bound_str_parses_from_toml() {
+        #[derive(Deserialize)]
+        struct T {
+            min: Bound,
+            max: Bound,
+        }
+        let t: T = toml::from_str(
+            r#"min = "2026-06-01"
+max = "2027-12-31"
+"#,
+        )
+        .unwrap();
+        assert_eq!(t.min, Bound::Str("2026-06-01".into()));
+        assert_eq!(t.max, Bound::Str("2027-12-31".into()));
+    }
+
+    #[test]
+    fn existing_numeric_min_max_configs_still_work() {
+        let wiz = WizardDef::from_str(
+            r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "PORT"
+            type = "text"
+            format = "integer"
+            min = 1
+            max = 65535
+        "#,
+        )
+        .unwrap();
+        let v = &wiz.pages[0].fields[0].validate;
+        assert!(matches!(v.min, Some(Bound::Num(n)) if n == 1.0));
+        assert!(matches!(v.max, Some(Bound::Num(n)) if n == 65535.0));
+        assert!(v.check("PORT", "443").is_ok());
+        assert!(v.check("PORT", "0").is_err());
+    }
+
+    // ── Date validation ──────────────────────────────────────────────────────
+
+    #[test]
+    fn date_valid_passes() {
+        let v = Validate::default();
+        assert!(v.check_typed(FieldType::Date, "D", "2026-06-01").is_ok());
+    }
+
+    #[test]
+    fn date_malformed_rejected() {
+        let v = Validate::default();
+        assert!(v.check_typed(FieldType::Date, "D", "not-a-date").is_err());
+        assert!(v.check_typed(FieldType::Date, "D", "2026-13-01").is_err());
+        assert!(v.check_typed(FieldType::Date, "D", "2026/06/01").is_err());
+    }
+
+    #[test]
+    fn date_range_enforced() {
+        let v = Validate {
+            min: Some(Bound::Str("2026-06-01".into())),
+            max: Some(Bound::Str("2027-12-31".into())),
+            ..Default::default()
+        };
+        assert!(v.check_typed(FieldType::Date, "D", "2026-06-01").is_ok());
+        assert!(v.check_typed(FieldType::Date, "D", "2027-12-31").is_ok());
+        assert!(v.check_typed(FieldType::Date, "D", "2026-05-31").is_err());
+        assert!(v.check_typed(FieldType::Date, "D", "2028-01-01").is_err());
+    }
+
+    #[test]
+    fn date_empty_passes() {
+        let v = Validate {
+            min: Some(Bound::Str("2026-06-01".into())),
+            ..Default::default()
+        };
+        // empty is `required`'s job, not validate's
+        assert!(v.check_typed(FieldType::Date, "D", "").is_ok());
+    }
+
+    // ── Datetime validation ──────────────────────────────────────────────────
+
+    #[test]
+    fn datetime_valid_passes() {
+        let v = Validate::default();
+        assert!(v
+            .check_typed(FieldType::Datetime, "DT", "2026-06-01T10:00:00")
+            .is_ok());
+    }
+
+    #[test]
+    fn datetime_malformed_rejected() {
+        let v = Validate::default();
+        assert!(v
+            .check_typed(FieldType::Datetime, "DT", "2026-06-01")
+            .is_err());
+        assert!(v
+            .check_typed(FieldType::Datetime, "DT", "not-a-datetime")
+            .is_err());
+    }
+
+    #[test]
+    fn datetime_range_enforced() {
+        let v = Validate {
+            min: Some(Bound::Str("2026-06-01T00:00:00".into())),
+            max: Some(Bound::Str("2026-12-31T23:59:59".into())),
+            ..Default::default()
+        };
+        assert!(v
+            .check_typed(FieldType::Datetime, "DT", "2026-06-01T00:00:00")
+            .is_ok());
+        assert!(v
+            .check_typed(FieldType::Datetime, "DT", "2025-12-31T23:59:59")
+            .is_err());
+        assert!(v
+            .check_typed(FieldType::Datetime, "DT", "2027-01-01T00:00:00")
+            .is_err());
+    }
+
+    // ── ValidateApi deserialization ──────────────────────────────────────────
+
+    #[test]
+    fn validate_api_deserializes_from_field_level_toml() {
+        // [page.field.api] because Validate is flattened into Field.
+        let wiz = WizardDef::from_str(
+            r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "KEY"
+            type = "secret"
+            [page.field.api]
+            url = "https://api.example.com/check"
+            method = "POST"
+            headers = [["x-api-key", "{{value}}"]]
+            body = '{"test":true}'
+            expect_status = 200
+            expect_json_path = "data.ok"
+            timeout_ms = 3000
+            error = "Bad key"
+        "#,
+        )
+        .unwrap();
+        let api = wiz.pages[0].fields[0].validate.api.as_ref().unwrap();
+        assert_eq!(api.url, "https://api.example.com/check");
+        assert_eq!(api.method.as_deref(), Some("POST"));
+        assert_eq!(api.headers, vec![("x-api-key".into(), "{{value}}".into())]);
+        assert_eq!(api.expect_status, Some(200));
+        assert_eq!(api.expect_json_path.as_deref(), Some("data.ok"));
+        assert_eq!(api.timeout_ms, Some(3000));
+        assert_eq!(api.error.as_deref(), Some("Bad key"));
+    }
+
+    #[test]
+    fn validate_api_defaults() {
+        let wiz = WizardDef::from_str(
+            r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "K"
+            type = "text"
+            [page.field.api]
+            url = "https://api.example.com/v"
+        "#,
+        )
+        .unwrap();
+        let api = wiz.pages[0].fields[0].validate.api.as_ref().unwrap();
+        assert!(api.method.is_none());
+        assert!(api.headers.is_empty());
+        assert!(api.body.is_none());
+        assert!(api.expect_status.is_none());
+        assert!(api.expect_json_path.is_none());
+        assert!(api.timeout_ms.is_none());
+        assert!(api.error.is_none());
+    }
+
+    // ── Schema validator ─────────────────────────────────────────────────────
+
+    #[test]
+    fn schema_rejects_empty_api_url() {
+        let wiz = WizardDef::from_str(
+            r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "K"
+            type = "text"
+            [page.field.api]
+            url = ""
+        "#,
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_wizard_schema(&wiz),
+            Err(EngineError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn schema_rejects_non_http_api_url() {
+        let wiz = WizardDef::from_str(
+            r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "K"
+            type = "text"
+            [page.field.api]
+            url = "ftp://example.com/check"
+        "#,
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_wizard_schema(&wiz),
+            Err(EngineError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn schema_rejects_format_on_dropdown() {
+        let wiz = WizardDef::from_str(
+            r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "K"
+            type = "dropdown"
+            format = "integer"
+            options = ["1","2"]
+        "#,
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_wizard_schema(&wiz),
+            Err(EngineError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn schema_rejects_format_on_date() {
+        let wiz = WizardDef::from_str(
+            r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "D"
+            type = "date"
+            format = "integer"
+        "#,
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_wizard_schema(&wiz),
+            Err(EngineError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn schema_accepts_valid_wizard() {
+        let wiz = WizardDef::from_str(
+            r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "K"
+            type = "text"
+            format = "email"
+            [page.field.api]
+            url = "https://api.example.com/check"
+        "#,
+        )
+        .unwrap();
+        assert!(validate_wizard_schema(&wiz).is_ok());
+    }
+
+    // ── API validation call (offline: localhost ephemeral server) ─────────────
+
+    fn start_http_server(response: &'static str) -> u16 {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                // Drain the whole request (headers + any body) until the client
+                // pauses to wait for our response. Responding and closing before
+                // the client has finished sending its body resets the connection
+                // on Windows, so ureq reports a transport error and the POST-body
+                // test flakes. A short read timeout ends the loop once the client
+                // stops sending.
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+                let mut tmp = [0u8; 1024];
+                loop {
+                    match stream.read(&mut tmp) {
+                        Ok(0) => break,        // client closed
+                        Ok(_) => continue,     // more request bytes
+                        Err(_) => break,       // timeout: client now awaiting response
+                    }
+                }
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn api_call_success_2xx() {
+        let port = start_http_server(
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\n\r\nok",
+        );
+        let api = ValidateApi {
+            url: format!("http://127.0.0.1:{port}/check"),
+            method: None,
+            headers: vec![],
+            body: None,
+            expect_status: None,
+            expect_json_path: None,
+            timeout_ms: Some(2000),
+            error: None,
+        };
+        assert!(api.call("field", "somevalue").is_ok());
+    }
+
+    #[test]
+    fn api_call_expect_status_match() {
+        let port = start_http_server("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n");
+        let api = ValidateApi {
+            url: format!("http://127.0.0.1:{port}/check"),
+            method: None,
+            headers: vec![],
+            body: None,
+            expect_status: Some(401),
+            expect_json_path: None,
+            timeout_ms: Some(2000),
+            error: None,
+        };
+        assert!(api.call("field", "somevalue").is_ok());
+    }
+
+    #[test]
+    fn api_call_expect_status_mismatch_fails() {
+        let port = start_http_server("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
+        let api = ValidateApi {
+            url: format!("http://127.0.0.1:{port}/check"),
+            method: None,
+            headers: vec![],
+            body: None,
+            expect_status: Some(200),
+            expect_json_path: None,
+            timeout_ms: Some(2000),
+            error: None,
+        };
+        assert!(matches!(
+            api.call("field", "somevalue"),
+            Err(EngineError::InvalidInput { .. })
+        ));
+    }
+
+    #[test]
+    fn api_call_json_path_truthy_passes() {
+        let port = start_http_server(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 20\r\n\r\n{\"data\":{\"ok\":true}}",
+        );
+        let api = ValidateApi {
+            url: format!("http://127.0.0.1:{port}/check"),
+            method: None,
+            headers: vec![],
+            body: None,
+            expect_status: None,
+            expect_json_path: Some("data.ok".into()),
+            timeout_ms: Some(2000),
+            error: None,
+        };
+        assert!(api.call("field", "somevalue").is_ok());
+    }
+
+    #[test]
+    fn api_call_json_path_falsy_fails() {
+        let port = start_http_server(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 21\r\n\r\n{\"data\":{\"ok\":false}}",
+        );
+        let api = ValidateApi {
+            url: format!("http://127.0.0.1:{port}/check"),
+            method: None,
+            headers: vec![],
+            body: None,
+            expect_status: None,
+            expect_json_path: Some("data.ok".into()),
+            timeout_ms: Some(2000),
+            error: None,
+        };
+        assert!(matches!(
+            api.call("field", "somevalue"),
+            Err(EngineError::InvalidInput { .. })
+        ));
+    }
+
+    #[test]
+    fn api_call_value_substituted_in_url() {
+        // Server just returns 200; we check the URL was rendered (can't
+        // inspect what ureq sent, but a wrong port → error which would fail).
+        let port = start_http_server("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        let api = ValidateApi {
+            url: format!("http://127.0.0.1:{port}/check/{{{{value}}}}"),
+            method: None,
+            headers: vec![],
+            body: None,
+            expect_status: None,
+            expect_json_path: None,
+            timeout_ms: Some(2000),
+            error: None,
+        };
+        assert!(api.call("field", "myval").is_ok());
+    }
+
+    #[test]
+    fn api_call_non_http_url_rejected() {
+        let api = ValidateApi {
+            url: "ftp://example.com/check".into(),
+            method: None,
+            headers: vec![],
+            body: None,
+            expect_status: None,
+            expect_json_path: None,
+            timeout_ms: Some(100),
+            error: None,
+        };
+        assert!(matches!(
+            api.call("field", "val"),
+            Err(EngineError::InvalidInput { .. })
+        ));
+    }
+
+    #[test]
+    fn api_call_timeout_is_error() {
+        // Connect to a port that will never respond. Use a port the OS is
+        // unlikely to have bound. Even if the OS refuses the connection
+        // immediately, ureq will return an error which maps to InvalidInput.
+        let api = ValidateApi {
+            url: "http://127.0.0.1:19999/check".into(),
+            method: None,
+            headers: vec![],
+            body: None,
+            expect_status: None,
+            expect_json_path: None,
+            timeout_ms: Some(200),
+            error: None,
+        };
+        assert!(matches!(
+            api.call("field", "val"),
+            Err(EngineError::InvalidInput { .. })
+        ));
+    }
+
+    #[test]
+    fn api_call_post_with_body() {
+        let port = start_http_server("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        let api = ValidateApi {
+            url: format!("http://127.0.0.1:{port}/check"),
+            method: Some("POST".into()),
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: Some("{\"key\":\"{{value}}\"}".into()),
+            expect_status: None,
+            expect_json_path: None,
+            timeout_ms: Some(2000),
+            error: None,
+        };
+        assert!(api.call("field", "mykey").is_ok());
+    }
+
+    // ── JSON path + is_truthy helpers ────────────────────────────────────────
+
+    #[test]
+    fn json_path_resolves_nested() {
+        let v = serde_json::json!({"a": {"b": {"c": 42}}});
+        assert_eq!(
+            resolve_json_path(&v, "a.b.c"),
+            Some(&serde_json::Value::Number(42.into()))
+        );
+        assert!(resolve_json_path(&v, "a.b.x").is_none());
+    }
+
+    #[test]
+    fn json_path_indexes_arrays() {
+        let v = serde_json::json!({"items": [{"ok": true}, {"ok": false}]});
+        // numeric segment indexes into the array
+        assert_eq!(
+            resolve_json_path(&v, "items.0.ok"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            resolve_json_path(&v, "items.1.ok"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        // out-of-bounds → None
+        assert!(resolve_json_path(&v, "items.2.ok").is_none());
+        // non-numeric key on an array → None
+        assert!(resolve_json_path(&v, "items.x").is_none());
+    }
+
+    #[test]
+    fn api_call_json_path_array_indexed_truthy() {
+        let port = start_http_server(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 23\r\n\r\n{\"items\":[{\"ok\":true}]}",
+        );
+        let api = ValidateApi {
+            url: format!("http://127.0.0.1:{port}/check"),
+            method: None,
+            headers: vec![],
+            body: None,
+            expect_status: None,
+            expect_json_path: Some("items.0.ok".into()),
+            timeout_ms: Some(2000),
+            error: None,
+        };
+        assert!(api.call("field", "somevalue").is_ok());
+    }
+
+    #[test]
+    fn api_call_json_path_array_indexed_falsy() {
+        let port = start_http_server(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 24\r\n\r\n{\"items\":[{\"ok\":false}]}",
+        );
+        let api = ValidateApi {
+            url: format!("http://127.0.0.1:{port}/check"),
+            method: None,
+            headers: vec![],
+            body: None,
+            expect_status: None,
+            expect_json_path: Some("items.0.ok".into()),
+            timeout_ms: Some(2000),
+            error: None,
+        };
+        assert!(matches!(
+            api.call("field", "somevalue"),
+            Err(EngineError::InvalidInput { .. })
+        ));
+    }
+
+    #[test]
+    fn is_truthy_values() {
+        assert!(is_truthy(Some(&serde_json::Value::Bool(true))));
+        assert!(!is_truthy(Some(&serde_json::Value::Bool(false))));
+        assert!(!is_truthy(Some(&serde_json::Value::Null)));
+        assert!(is_truthy(Some(&serde_json::Value::String("x".into()))));
+        assert!(!is_truthy(Some(&serde_json::Value::String("".into()))));
+        assert!(!is_truthy(None));
+    }
+
+    // ── Fix 2: date/datetime check_typed must not apply numeric/format checks ─
+
+    #[test]
+    fn date_with_numeric_bound_in_validate_does_not_produce_must_be_a_number() {
+        // A config mistake: numeric Bound::Num on a date field. The schema
+        // validator rejects this at load time, but check_typed must not panic
+        // or emit "must be a number" — it simply skips the numeric path.
+        let v = Validate {
+            min: Some(Bound::Num(5.0)),
+            ..Default::default()
+        };
+        // Should not return "must be a number" for a valid ISO date string.
+        // (Bound::Num is skipped for Date fields; schema validator catches this.)
+        let result = v.check_typed(FieldType::Date, "D", "2026-06-01");
+        assert!(result.is_ok(), "numeric Bound::Num must not trigger on date: {result:?}");
+    }
+
+    #[test]
+    fn date_with_format_integer_in_validate_does_not_misfire() {
+        // format=integer on a date field is rejected by schema validator, but
+        // check_typed must not apply FieldFormat to the ISO string.
+        let v = Validate {
+            format: Some(FieldFormat::Integer),
+            ..Default::default()
+        };
+        let result = v.check_typed(FieldType::Date, "D", "2026-06-01");
+        assert!(result.is_ok(), "FieldFormat must not apply in date check_typed: {result:?}");
+    }
+
+    // ── Fix 3: schema validator new rejections ────────────────────────────────
+
+    #[test]
+    fn schema_rejects_numeric_min_on_date_field() {
+        let wiz = WizardDef::from_str(r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "D"
+            type = "date"
+            min = 5
+        "#).unwrap();
+        assert!(matches!(validate_wizard_schema(&wiz), Err(EngineError::Config(_))));
+    }
+
+    #[test]
+    fn schema_rejects_numeric_max_on_datetime_field() {
+        let wiz = WizardDef::from_str(r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "DT"
+            type = "datetime"
+            max = 9999
+        "#).unwrap();
+        assert!(matches!(validate_wizard_schema(&wiz), Err(EngineError::Config(_))));
+    }
+
+    #[test]
+    fn schema_accepts_string_min_max_on_date_field() {
+        let wiz = WizardDef::from_str(r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "D"
+            type = "date"
+            min = "2026-06-01"
+            max = "2027-12-31"
+        "#).unwrap();
+        assert!(validate_wizard_schema(&wiz).is_ok());
+    }
+
+    #[test]
+    fn schema_rejects_catalog_source_on_dropdown() {
+        let wiz = WizardDef::from_str(r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "TOOLS"
+            type = "dropdown"
+            source = "catalog.tools"
+        "#).unwrap();
+        assert!(matches!(validate_wizard_schema(&wiz), Err(EngineError::Config(_))));
+    }
+
+    #[test]
+    fn schema_accepts_static_options_on_dropdown() {
+        let wiz = WizardDef::from_str(r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "COUNTRY"
+            type = "dropdown"
+            options = ["US", "PH", "DE"]
+        "#).unwrap();
+        assert!(validate_wizard_schema(&wiz).is_ok());
+    }
+
+    // ── Fix 1 (extended): format rejected on single_select / multiselect ────────
+
+    #[test]
+    fn schema_rejects_format_on_single_select() {
+        let wiz = WizardDef::from_str(r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "ENV"
+            type = "single_select"
+            format = "email"
+            options = ["Production", "Staging"]
+        "#).unwrap();
+        assert!(matches!(validate_wizard_schema(&wiz), Err(EngineError::Config(_))));
+    }
+
+    #[test]
+    fn schema_rejects_format_on_multiselect() {
+        let wiz = WizardDef::from_str(r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "TOOLS"
+            type = "multiselect"
+            format = "integer"
+            options = ["node", "ripgrep"]
+        "#).unwrap();
+        assert!(matches!(validate_wizard_schema(&wiz), Err(EngineError::Config(_))));
+    }
+
+    #[test]
+    fn schema_accepts_format_on_text_field() {
+        let wiz = WizardDef::from_str(r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "PORT"
+            type = "text"
+            format = "integer"
+        "#).unwrap();
+        assert!(validate_wizard_schema(&wiz).is_ok());
+    }
+
+    #[test]
+    fn schema_accepts_format_on_textarea() {
+        let wiz = WizardDef::from_str(r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "NOTES"
+            type = "textarea"
+            format = "integer"
+        "#).unwrap();
+        assert!(validate_wizard_schema(&wiz).is_ok());
+    }
+
+    // ── Fix 2: Bound::Str on non-date fields is rejected ─────────────────────
+
+    #[test]
+    fn schema_rejects_string_min_on_text_field() {
+        let wiz = WizardDef::from_str(r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "PORT"
+            type = "text"
+            min = "5"
+        "#).unwrap();
+        assert!(matches!(validate_wizard_schema(&wiz), Err(EngineError::Config(_))));
+    }
+
+    #[test]
+    fn schema_rejects_string_max_on_secret_field() {
+        let wiz = WizardDef::from_str(r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "KEY"
+            type = "secret"
+            max = "100"
+        "#).unwrap();
+        assert!(matches!(validate_wizard_schema(&wiz), Err(EngineError::Config(_))));
+    }
+
+    #[test]
+    fn schema_accepts_numeric_min_on_text_field() {
+        let wiz = WizardDef::from_str(r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "PORT"
+            type = "text"
+            min = 1
+            max = 65535
+        "#).unwrap();
+        assert!(validate_wizard_schema(&wiz).is_ok());
+    }
+
+    #[test]
+    fn schema_accepts_string_min_on_date_field() {
+        let wiz = WizardDef::from_str(r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "D"
+            type = "date"
+            min = "2026-01-01"
+        "#).unwrap();
+        assert!(validate_wizard_schema(&wiz).is_ok());
+    }
+
+    // ── Fix 4: URL percent-encoding of {{value}} ──────────────────────────────
+
+    #[test]
+    fn render_url_encodes_special_chars() {
+        // / ? # @ and spaces must be encoded; unreserved chars must not be.
+        let encoded = ValidateApi::render_url("https://example.com/check/{{value}}", "a/b?c#d@e f");
+        assert_eq!(encoded, "https://example.com/check/a%2Fb%3Fc%23d%40e%20f");
+    }
+
+    #[test]
+    fn render_url_leaves_unreserved_intact() {
+        let encoded = ValidateApi::render_url("https://example.com/{{value}}", "abc-XYZ_1.2~");
+        assert_eq!(encoded, "https://example.com/abc-XYZ_1.2~");
+    }
+
+    #[test]
+    fn render_leaves_headers_raw() {
+        // headers/body use render(), not render_url() — value must stay verbatim.
+        let raw = ValidateApi::render("Bearer {{value}}", "sk-abc/def?x=1");
+        assert_eq!(raw, "Bearer sk-abc/def?x=1");
+    }
+
+    #[test]
+    fn api_call_non_http_url_still_rejected_after_encoding() {
+        // A value that encodes to something benign; the scheme is still ftp.
+        let api = ValidateApi {
+            url: "ftp://example.com/{{value}}".into(),
+            method: None,
+            headers: vec![],
+            body: None,
+            expect_status: None,
+            expect_json_path: None,
+            timeout_ms: Some(100),
+            error: None,
+        };
+        assert!(matches!(
+            api.call("field", "val"),
+            Err(EngineError::InvalidInput { .. })
+        ));
+    }
+}

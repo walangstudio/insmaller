@@ -18,9 +18,9 @@ mod theme;
 mod tui;
 
 use insmaller_core::{
-    builtins, run_wizard, Catalog, Ctx, EnvResolver, InputResolver, InstallSummary, LoadedConfig,
-    Reporter, Sentinel, SentinelData, Settings, StaticAnswerer, StdoutReporter, WizardDef,
-    WizardOutcome, WizardSession,
+    builtins, run_wizard, Catalog, Ctx, EnvResolver, FieldType, InputResolver, InstallSummary,
+    LoadedConfig, Reporter, Sentinel, SentinelData, Settings, StaticAnswerer, StdoutReporter,
+    WizardDef, WizardOutcome, WizardSession,
 };
 use serde_json::{Map, Value};
 use std::io::IsTerminal;
@@ -466,7 +466,7 @@ fn collect_keys(a: &[String]) -> Vec<String> {
     while i < a.len() {
         match a[i].as_str() {
             "--config" | "--catalog" | "--jobs" | "-j" => i += 2,
-            "--dry-run" | "--json" | "--force" | "--parallel" | "-p" => i += 1,
+            "--dry-run" | "--json" | "--force" | "--parallel" | "-p" | "--no-api-validate" => i += 1,
             k => {
                 keys.push(k.to_string());
                 i += 1;
@@ -529,6 +529,10 @@ async fn cmd_setup(a: &[String], name: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Err(e) = insmaller_core::validate_wizard_schema(&wiz) {
+        eprintln!("wizard error: {e}");
+        return ExitCode::FAILURE;
+    }
 
     // --answers F → non-blocking StaticAnswerer; else interactive stdin.
     // Unattended (--answers or no TTY) → non-blocking StaticAnswerer.
@@ -552,6 +556,7 @@ async fn cmd_setup(a: &[String], name: &str) -> ExitCode {
     }
 
     let palette = theme::Palette::resolve(&cfg.settings);
+    let no_api_validate = has(a, "--no-api-validate");
     let unattended = has(a, "--answers") || !std::io::stdin().is_terminal();
     let (outcome, tui_used): (WizardOutcome, bool) = if unattended {
         let f = opt(a, "--answers", "answers.toml");
@@ -576,7 +581,7 @@ async fn cmd_setup(a: &[String], name: &str) -> ExitCode {
             collapsed: cfg.settings.collapsed_groups.clone(),
             expanded: cfg.settings.expanded_groups.clone(),
         };
-        match tui::run_wizard_tui(&mut session, palette, &gd) {
+        match tui::run_wizard_tui(&mut session, palette, &gd, no_api_validate) {
             Ok(true) => (session.finish(), true),
             Ok(false) => {
                 println!("Setup cancelled.");
@@ -628,9 +633,41 @@ async fn cmd_setup(a: &[String], name: &str) -> ExitCode {
         }
     };
 
+    // Collect secret field ids so we can mask their values in the summary.
+    // Cover both static wizard fields AND catalog requires_input declarations
+    // (selected.inputs expansion path), which are not in wiz.pages.
+    let mut secret_ids: std::collections::HashSet<String> = wiz
+        .pages
+        .iter()
+        .flat_map(|p| p.fields.iter())
+        .filter(|f| f.field_type == FieldType::Secret)
+        .map(|f| f.id.clone())
+        .collect();
+    for decl in cat.required_inputs(&outcome.selected_keys) {
+        if decl.r#type == FieldType::Secret {
+            secret_ids.insert(decl.id.clone());
+        }
+    }
+
+    if !outcome.vars.is_empty() {
+        println!("Answers:");
+        let mut keys: Vec<&String> = outcome.vars.keys().collect();
+        keys.sort();
+        for k in keys {
+            if let Some(v) = outcome.vars.get(k) {
+                let display = format_answer_value(v, secret_ids.contains(k));
+                println!("  {k} = {display}");
+            }
+        }
+    }
+
     println!("Selected: {:?}", outcome.selected_keys);
     if outcome.selected_keys.is_empty() {
-        println!("Nothing selected.");
+        if outcome.vars.is_empty() {
+            println!("Nothing selected.");
+        } else {
+            println!("No packages to install (answers recorded above).");
+        }
         render_outro();
         return ExitCode::SUCCESS;
     }
@@ -849,12 +886,30 @@ async fn cmd_status(a: &[String], name: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Format a single answer value for display. Secrets are replaced with `***`;
+/// arrays join their string elements with `", "`.
+fn format_answer_value(v: &Value, is_secret: bool) -> String {
+    if is_secret {
+        return "***".to_string();
+    }
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Array(a) => a
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        Value::Bool(b) => b.to_string(),
+        other => other.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         app_home_candidates_posix, app_home_candidates_windows, discover_config_in,
-        find_config, inject_exe_vars, program_name_from, resolve_sibling, usage_text,
-        CONFIG_NAMES,
+        find_config, format_answer_value, inject_exe_vars, program_name_from, resolve_sibling,
+        usage_text, CONFIG_NAMES,
     };
     use serde_json::{Map, Value};
     use std::path::{Path, PathBuf};
@@ -1209,5 +1264,102 @@ mod tests {
             cands[2],
             PathBuf::from(r"C:\ProgramData").join("mytool").join("installer.toml")
         );
+    }
+
+    // ── format_answer_value (answers masking) ─────────────────────────────
+
+    #[test]
+    fn secret_field_is_masked() {
+        let v = Value::String("sk-supersecretkey".to_string());
+        assert_eq!(format_answer_value(&v, true), "***");
+    }
+
+    #[test]
+    fn string_field_shown_plaintext() {
+        let v = Value::String("PH".to_string());
+        assert_eq!(format_answer_value(&v, false), "PH");
+    }
+
+    #[test]
+    fn array_value_joined_with_comma() {
+        let v = Value::Array(vec![
+            Value::String("node".to_string()),
+            Value::String("ripgrep".to_string()),
+        ]);
+        assert_eq!(format_answer_value(&v, false), "node, ripgrep");
+    }
+
+    #[test]
+    fn bool_value_rendered_as_string() {
+        assert_eq!(format_answer_value(&Value::Bool(true), false), "true");
+        assert_eq!(format_answer_value(&Value::Bool(false), false), "false");
+    }
+
+    #[test]
+    fn secret_array_is_still_masked() {
+        // Even an array in a secret field is fully masked.
+        let v = Value::Array(vec![Value::String("tok1".to_string())]);
+        assert_eq!(format_answer_value(&v, true), "***");
+    }
+
+    // ── requires_input secret masking ─────────────────────────────────────
+
+    #[test]
+    fn requires_input_secret_is_masked() {
+        // Build a catalog with a CLI entry whose requires_input declares a
+        // Secret token. Confirm that required_inputs returns it and that the
+        // token's value is masked (is_secret = true).
+        let cat = insmaller_core::Catalog::from_json_str(
+            r#"{"clis":[{
+                "key":"myapp","install":"npm:myapp",
+                "requires_input":[{"id":"MYAPP_TOKEN","type":"secret","required":true}]
+            }]}"#,
+        )
+        .unwrap();
+
+        let selected = vec!["myapp".to_string()];
+        let decls = cat.required_inputs(&selected);
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].id, "MYAPP_TOKEN");
+        assert_eq!(decls[0].r#type, insmaller_core::FieldType::Secret);
+
+        // Simulate what cmd_setup does: check r#type == Secret → add to set.
+        let mut secret_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for decl in &decls {
+            if decl.r#type == insmaller_core::FieldType::Secret {
+                secret_ids.insert(decl.id.clone());
+            }
+        }
+        assert!(secret_ids.contains("MYAPP_TOKEN"),
+            "requires_input secret must be in secret_ids");
+
+        // Confirm the value is masked via format_answer_value.
+        let token_val = Value::String("sk-supersecret".to_string());
+        let is_secret = secret_ids.contains("MYAPP_TOKEN");
+        assert_eq!(format_answer_value(&token_val, is_secret), "***",
+            "requires_input secret value must be masked, not printed");
+    }
+
+    #[test]
+    fn requires_input_non_secret_is_not_masked() {
+        // A requires_input of type "text" must NOT be in secret_ids.
+        let cat = insmaller_core::Catalog::from_json_str(
+            r#"{"clis":[{
+                "key":"tool","install":"npm:tool",
+                "requires_input":[{"id":"AUTHOR","type":"text","required":true}]
+            }]}"#,
+        )
+        .unwrap();
+        let decls = cat.required_inputs(&["tool".to_string()]);
+        let mut secret_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for decl in &decls {
+            if decl.r#type == insmaller_core::FieldType::Secret {
+                secret_ids.insert(decl.id.clone());
+            }
+        }
+        assert!(!secret_ids.contains("AUTHOR"),
+            "non-secret requires_input must not be masked");
+        let val = Value::String("Alice".to_string());
+        assert_eq!(format_answer_value(&val, false), "Alice");
     }
 }

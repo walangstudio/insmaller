@@ -1,0 +1,91 @@
+# wizard-widgets.toml — exercises every new field type added in the
+# form-widgets feature: dropdown, textarea, date, datetime, and a secret
+# field with API-call validation.
+#
+# Headless run (no API calls):
+#   insmaller setup --wizard examples/wizard-widgets.toml \
+#     --config examples/demo.installer.toml \
+#     --answers examples/wizard-widgets-answers.toml \
+#     --no-api-validate
+
+[[page]]
+id = "basics"
+title = "Basic info"
+description = "Text fields and a long dropdown."
+
+[[page.field]]
+id = "country"
+type = "dropdown"
+prompt = "Country"
+default = "US"
+options = [
+  "AF","AL","DZ","AD","AO","AG","AR","AM","AU","AT",
+  "AZ","BS","BH","BD","BB","BY","BE","BZ","BJ","BT",
+  "BO","BA","BW","BR","BN","BG","BF","BI","CV","KH",
+  "CM","CA","CF","TD","CL","CN","CO","KM","CG","CR",
+  "HR","CU","CY","CZ","DK","DJ","DM","DO","EC","EG",
+  "SV","GQ","ER","EE","SZ","ET","FJ","FI","FR","GA",
+  "GM","GE","DE","GH","GR","GD","GT","GN","GW","GY",
+  "HT","HN","HU","IS","IN","ID","IR","IQ","IE","IL",
+  "IT","JM","JP","JO","KZ","KE","KI","KP","KR","KW",
+  "KG","LA","LV","LB","LS","LR","LY","LI","LT","LU",
+  "MG","MW","MY","MV","ML","MT","MH","MR","MU","MX",
+  "FM","MD","MC","MN","ME","MA","MZ","MM","NA","NR",
+  "NP","NL","NZ","NI","NE","NG","NO","OM","PK","PW",
+  "PA","PG","PY","PE","PH","PL","PT","QA","RO","RU",
+  "RW","KN","LC","VC","WS","SM","ST","SA","SN","RS",
+  "SC","SL","SG","SK","SI","SB","SO","ZA","SS","ES",
+  "LK","SD","SR","SE","CH","SY","TW","TJ","TZ","TH",
+  "TL","TG","TO","TT","TN","TR","TM","TV","UG","UA",
+  "AE","GB","US","UY","UZ","VU","VE","VN","YE","ZM","ZW",
+]
+
+[[page.field]]
+id = "release_notes"
+type = "textarea"
+prompt = "Release notes (multi-line, 10 chars minimum)"
+required = false
+min_length = 10
+
+[[page]]
+id = "schedule"
+title = "Schedule"
+description = "Date and datetime fields with range constraints."
+
+[[page.field]]
+id = "go_live_date"
+type = "date"
+prompt = "Go-live date (2026-06-01 to 2027-12-31)"
+min = "2026-06-01"
+max = "2027-12-31"
+
+[[page.field]]
+id = "go_live_time"
+type = "datetime"
+prompt = "Go-live datetime (e.g. 2026-09-01T09:00:00)"
+required = false
+min = "2026-06-01T00:00:00"
+max = "2027-12-31T23:59:59"
+
+[[page]]
+id = "credentials"
+title = "API credentials"
+description = "Secret field with optional API-call validation."
+
+[[page.field]]
+id = "DEMO_API_KEY"
+type = "secret"
+prompt = "Demo API key (must start with 'demo-')"
+required = true
+# The [page.field.api] block is validated live unless --no-api-validate is set.
+# Points at the bundled local validator (examples/serve-validate.py) so the
+# whole API-validation path runs on 127.0.0.1 — no third party, no signup, no
+# egress. Start it first:  python serve-validate.py
+# It returns 200 {"valid": true} for keys starting with "demo-", else 401.
+[page.field.api]
+url = "http://127.0.0.1:8787/validate?key={{value}}"
+method = "GET"
+expect_status = 200
+expect_json_path = "valid"
+timeout_ms = 5000
+error = "Key rejected (must start with 'demo-') or the local validator isn't running (python serve-validate.py)."

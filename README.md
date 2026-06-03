@@ -3,7 +3,7 @@
 ![version](https://img.shields.io/github/v/release/walangstudio/insmaller?sort=semver&color=blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![rust](https://img.shields.io/badge/rust-1.95-orange)
-![tests](https://img.shields.io/badge/tests-327%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-496%20passing-brightgreen)
 
 <sub>*(it's "insmaller" — "inshorter" just didn't sound right.)*</sub>
 
@@ -71,8 +71,9 @@ wizard page that collects the union of declared inputs of the selection;
 atomically; named `[task.*]` lifecycle pipelines (`insmaller task <name>`) with
 `needs` ordering, per-task `parallel`/`when`/`unless`, and per-OS step
 overrides; field validators (`pattern`, `format`, `min`/`max`,
-`min_length`/`max_length`); and a `[project]` block of presentation strings and
-opaque pass-through `extra` for task templating. All of it is optional and
+`min_length`/`max_length`); field-level API validation (`[page.field.api]`); and
+a `[project]` block of presentation strings and opaque pass-through `extra` for
+task templating. All of it is optional and
 additive — existing catalogs are unaffected. See
 [`docs/fields.md`](docs/fields.md) for the full field/flag/task reference.
 
@@ -108,13 +109,82 @@ insmaller status             # list what is installed (alias: query; --json)
 
 Add `--dry-run` to any of these to see what would happen without doing it.
 `--answers FILE`, or simply not having a terminal, makes the run fully
-unattended. `--config`, `--catalog`, and `--wizard` override the discovered or
-configured paths when you need them. `--force` overrides the uninstall
-dependency check.
+unattended. `--no-api-validate` skips all `[page.field.api]` checks (useful
+offline or in CI). `--config`, `--catalog`, and `--wizard` override the
+discovered or configured paths when you need them. `--force` overrides the
+uninstall dependency check.
 
 The [`examples/`](examples/README.md) directory has a self-contained demo that
 runs entirely in a temp folder with no network, plus a script that launches the
 interactive wizard so you can see it.
+
+## Wizard field types
+
+| type | value | notes |
+|------|-------|-------|
+| `text` | string | free text |
+| `secret` | string | masked in the TUI |
+| `path` | string | `Ctrl+B` opens a file/dir browser; parent dir must exist |
+| `single_select` | string | expanded radio list |
+| `dropdown` | string | collapsed type-to-search select; popup has a `Search:` box |
+| `multiselect` | string[] | many choices; `[x]/[~]/[ ]` group headers |
+| `toggle` | bool | on/off |
+| `textarea` | string | Enter to edit, Esc to stop; ↑↓←→/Home/End/PgUp/PgDn navigate |
+| `date` | string | ISO `YYYY-MM-DD`; digit-only masked entry; Space opens calendar |
+| `datetime` | string | ISO `YYYY-MM-DDTHH:MM:SS`; same mask/calendar as `date` |
+
+Configs using `dropdown`, `textarea`, `date`, or `datetime` require insmaller >= 0.7.0.
+
+**Date/datetime details.** The `-`, `T`, `:` separators are pre-placed; only
+digits are typed; empty slots show as `_`. Press Space on a focused date field
+for a month calendar: ←/→ = ±1 day, ↑/↓ = ±1 week, PgUp/PgDn = ±1 month,
+Enter commits, Esc cancels. A partially-typed date is rejected with an
+"incomplete date" error rather than silently submitted empty.
+
+**Path validation.** The typed value is trimmed and rejected if neither the path
+nor its parent directory exists on disk (catches case errors on Linux). A new
+leaf under an existing parent is accepted.
+
+**Dropdown search.** The popup opens with a `Search:` line; typing filters the
+list in real time; `[no matches]` shown when nothing matches.
+
+### `[page.field.api]` — field-level API validation
+
+After local validators pass, the engine fires an HTTP request with `{{value}}`
+rendered into the URL (and optionally headers/body), and accepts the value only
+if the response matches `expect_status` (default: any 2xx). Skipped on
+`--answers` / unattended runs; `--no-api-validate` skips all API checks.
+
+```toml
+[[page.field]]
+id   = "GH_USER"
+type = "text"
+
+[page.field.api]
+url            = "https://api.github.com/users/{{value}}"
+method         = "GET"
+headers        = [["Accept", "application/vnd.github+json"]]
+expect_status  = 200
+timeout_ms     = 5000
+error          = "GitHub user not found"
+```
+
+Keys: `url` (required), `method` (`GET`/`POST`/`HEAD`; default `GET`), `headers`
+(array of `[name, value]` pairs), `body`, `expect_status`, `expect_json_path`
+(JSONPath expression; must resolve truthy), `timeout_ms`, `error`.
+
+**Try the demo.** `examples/wizard-widgets.toml` exercises every new field type.
+`examples/serve-validate.py` is a dependency-free local validator (Python stdlib
+only, no signup, no egress) that accepts keys starting with `demo-`. Run it once,
+then run the wizard in a second terminal:
+
+```sh
+python examples/serve-validate.py
+insmaller setup --wizard examples/wizard-widgets.toml --config examples/demo.installer.toml
+```
+
+This exercises the `[page.field.api]` path against `127.0.0.1:8787` so nothing
+leaves the machine. Pass `--no-api-validate` to skip the API call entirely.
 
 ## How it is put together
 
