@@ -18,9 +18,9 @@ mod theme;
 mod tui;
 
 use insmaller_core::{
-    builtins, run_wizard, Catalog, Ctx, EnvResolver, InputResolver, InstallSummary, LoadedConfig,
-    Reporter, Sentinel, SentinelData, Settings, StaticAnswerer, StdoutReporter, WizardDef,
-    WizardOutcome, WizardSession,
+    builtins, run_wizard, Catalog, Ctx, EnvResolver, FieldType, InputResolver, InstallSummary,
+    LoadedConfig, Reporter, Sentinel, SentinelData, Settings, StaticAnswerer, StdoutReporter,
+    WizardDef, WizardOutcome, WizardSession,
 };
 use serde_json::{Map, Value};
 use std::io::IsTerminal;
@@ -633,9 +633,34 @@ async fn cmd_setup(a: &[String], name: &str) -> ExitCode {
         }
     };
 
+    // Collect secret field ids so we can mask their values in the summary.
+    let secret_ids: std::collections::HashSet<String> = wiz
+        .pages
+        .iter()
+        .flat_map(|p| p.fields.iter())
+        .filter(|f| f.field_type == FieldType::Secret)
+        .map(|f| f.id.clone())
+        .collect();
+
+    if !outcome.vars.is_empty() {
+        println!("Answers:");
+        let mut keys: Vec<&String> = outcome.vars.keys().collect();
+        keys.sort();
+        for k in keys {
+            if let Some(v) = outcome.vars.get(k) {
+                let display = format_answer_value(v, secret_ids.contains(k));
+                println!("  {k} = {display}");
+            }
+        }
+    }
+
     println!("Selected: {:?}", outcome.selected_keys);
     if outcome.selected_keys.is_empty() {
-        println!("Nothing selected.");
+        if outcome.vars.is_empty() {
+            println!("Nothing selected.");
+        } else {
+            println!("No packages to install (answers recorded above).");
+        }
         render_outro();
         return ExitCode::SUCCESS;
     }
@@ -854,12 +879,30 @@ async fn cmd_status(a: &[String], name: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Format a single answer value for display. Secrets are replaced with `***`;
+/// arrays join their string elements with `", "`.
+fn format_answer_value(v: &Value, is_secret: bool) -> String {
+    if is_secret {
+        return "***".to_string();
+    }
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Array(a) => a
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        Value::Bool(b) => b.to_string(),
+        other => other.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         app_home_candidates_posix, app_home_candidates_windows, discover_config_in,
-        find_config, inject_exe_vars, program_name_from, resolve_sibling, usage_text,
-        CONFIG_NAMES,
+        find_config, format_answer_value, inject_exe_vars, program_name_from, resolve_sibling,
+        usage_text, CONFIG_NAMES,
     };
     use serde_json::{Map, Value};
     use std::path::{Path, PathBuf};
@@ -1214,5 +1257,41 @@ mod tests {
             cands[2],
             PathBuf::from(r"C:\ProgramData").join("mytool").join("installer.toml")
         );
+    }
+
+    // ── format_answer_value (answers masking) ─────────────────────────────
+
+    #[test]
+    fn secret_field_is_masked() {
+        let v = Value::String("sk-supersecretkey".to_string());
+        assert_eq!(format_answer_value(&v, true), "***");
+    }
+
+    #[test]
+    fn string_field_shown_plaintext() {
+        let v = Value::String("PH".to_string());
+        assert_eq!(format_answer_value(&v, false), "PH");
+    }
+
+    #[test]
+    fn array_value_joined_with_comma() {
+        let v = Value::Array(vec![
+            Value::String("node".to_string()),
+            Value::String("ripgrep".to_string()),
+        ]);
+        assert_eq!(format_answer_value(&v, false), "node, ripgrep");
+    }
+
+    #[test]
+    fn bool_value_rendered_as_string() {
+        assert_eq!(format_answer_value(&Value::Bool(true), false), "true");
+        assert_eq!(format_answer_value(&Value::Bool(false), false), "false");
+    }
+
+    #[test]
+    fn secret_array_is_still_masked() {
+        // Even an array in a secret field is fully masked.
+        let v = Value::Array(vec![Value::String("tok1".to_string())]);
+        assert_eq!(format_answer_value(&v, true), "***");
     }
 }

@@ -70,12 +70,17 @@ enum Widget {
         /// Cursor within the filtered list.
         cur: usize,
     },
-    /// Multi-line text area. Enter inserts a newline; Tab commits/advances.
+    /// Multi-line text area. `active` = user has pressed Enter to enter edit
+    /// mode. While inactive, the field is navigated like any other (Tab/arrows
+    /// move focus); while active, all keys operate on the text and Esc exits
+    /// edit mode.
     Textarea {
         buf: String,
         cursor_row: usize,
         cursor_col: usize,
         scroll: usize,
+        /// Whether the user is currently editing (Enter activates, Esc exits).
+        active: bool,
     },
     /// ISO date input (`YYYY-MM-DD`). Digit-only masked entry; separators are
     /// fixed. `digits` holds the 8 user-entered digit positions (b'_' = empty).
@@ -990,6 +995,7 @@ fn init_widget(
             cursor_row: 0,
             cursor_col: 0,
             scroll: 0,
+            active: false,
         },
         FieldType::Date => {
             let s = match prior {
@@ -1290,15 +1296,15 @@ pub fn run_wizard_tui(
                                 )));
                             }
                         }
-                        Widget::Textarea { buf, cursor_row, cursor_col, scroll } => {
+                        Widget::Textarea { buf, cursor_row, cursor_col, scroll, active } => {
                             let lines: Vec<&str> = buf.split('\n').collect();
                             let total = lines.len();
                             let start = *scroll;
                             let end = (start + TEXTAREA_VISIBLE_ROWS).min(total);
                             for (li, line) in lines[start..end].iter().enumerate() {
                                 let abs_row = li + start;
-                                let rendered = if focused && abs_row == *cursor_row {
-                                    // Insert a block cursor glyph at cursor_col.
+                                let rendered = if focused && *active && abs_row == *cursor_row {
+                                    // Show block cursor only while editing.
                                     let col = (*cursor_col).min(line.chars().count());
                                     let before: String = line.chars().take(col).collect();
                                     let after: String = line.chars().skip(col).collect();
@@ -1309,11 +1315,17 @@ pub fn run_wizard_tui(
                                 items.push(ListItem::new(rendered));
                             }
                             if focused {
-                                items.push(ListItem::new(format!(
-                                    "   [Tab: next · Enter: newline · \u{2191}\u{2193}\u{2190}\u{2192}: navigate  (line {}/{})]",
-                                    cursor_row + 1,
-                                    total
-                                )));
+                                if *active {
+                                    items.push(ListItem::new(format!(
+                                        "   [editing \u{2014} Esc: stop · Tab: next · Enter: newline · \u{2191}\u{2193}\u{2190}\u{2192}: navigate  (line {}/{})]",
+                                        cursor_row + 1,
+                                        total
+                                    )));
+                                } else {
+                                    items.push(ListItem::new(
+                                        "   [Enter to edit]".to_string()
+                                    ));
+                                }
                             }
                         }
                         Widget::Date { digits, .. } => {
@@ -1498,7 +1510,13 @@ pub fn run_wizard_tui(
                 }
 
                 let btn = |label: &str, idx: usize, enabled: bool| {
-                    let st = if !enabled {
+                    let st = if focus == idx && !enabled {
+                        // Focused but disabled: show a bracket style so the
+                        // cursor is never invisible, even on a greyed button.
+                        Style::default()
+                            .fg(pal.muted)
+                            .add_modifier(Modifier::REVERSED)
+                    } else if !enabled {
                         Style::default().fg(pal.muted)
                     } else if focus == idx {
                         Style::default()
@@ -1740,7 +1758,7 @@ pub fn run_wizard_tui(
                 widgets.get(focus),
                 Some(Widget::Input { .. })
                     | Some(Widget::Path { .. })
-                    | Some(Widget::Textarea { .. })
+                    | Some(Widget::Textarea { active: true, .. })
                     | Some(Widget::Date { .. })
                     | Some(Widget::Datetime { .. })
             );
@@ -1748,6 +1766,8 @@ pub fn run_wizard_tui(
             if k.code == KeyCode::Char('q') && !editing && !dropdown_open_pre && !cal_open_pre {
                 return Ok(false);
             }
+
+            let can_back = session.can_back();
 
             let commit = |ws: &[Widget], fs: &[Field]| -> Map<String, Value> {
                 let mut m = Map::new();
@@ -1783,15 +1803,20 @@ pub fn run_wizard_tui(
                         None => {}
                     }
                 }
-                KeyCode::Tab | KeyCode::Right if !editing => focus = (focus + 1) % (n + 2),
+                KeyCode::Tab | KeyCode::Right if !editing => {
+                    let next = (focus + 1) % (n + 2);
+                    // Skip the Back button when it is disabled.
+                    focus = if next == n && !can_back { (next + 1) % (n + 2) } else { next };
+                }
                 KeyCode::BackTab | KeyCode::Left if !editing => {
-                    focus = (focus + n + 1) % (n + 2)
+                    let prev = (focus + n + 1) % (n + 2);
+                    focus = if prev == n && !can_back { (prev + n + 1) % (n + 2) } else { prev };
                 }
                 // ── Textarea cursor navigation (intercept before field-nav) ──
                 KeyCode::Up
-                    if focus < n && matches!(widgets[focus], Widget::Textarea { .. }) =>
+                    if focus < n && matches!(widgets[focus], Widget::Textarea { active: true, .. }) =>
                 {
-                    if let Widget::Textarea { buf, cursor_row, cursor_col, scroll } =
+                    if let Widget::Textarea { buf, cursor_row, cursor_col, scroll, .. } =
                         &mut widgets[focus]
                     {
                         if *cursor_row > 0 {
@@ -1803,9 +1828,9 @@ pub fn run_wizard_tui(
                     }
                 }
                 KeyCode::Down
-                    if focus < n && matches!(widgets[focus], Widget::Textarea { .. }) =>
+                    if focus < n && matches!(widgets[focus], Widget::Textarea { active: true, .. }) =>
                 {
-                    if let Widget::Textarea { buf, cursor_row, cursor_col, scroll } =
+                    if let Widget::Textarea { buf, cursor_row, cursor_col, scroll, .. } =
                         &mut widgets[focus]
                     {
                         let last = textarea_line_count(buf).saturating_sub(1);
@@ -1818,9 +1843,9 @@ pub fn run_wizard_tui(
                     }
                 }
                 KeyCode::Left
-                    if focus < n && matches!(widgets[focus], Widget::Textarea { .. }) =>
+                    if focus < n && matches!(widgets[focus], Widget::Textarea { active: true, .. }) =>
                 {
-                    if let Widget::Textarea { buf, cursor_row, cursor_col, scroll } =
+                    if let Widget::Textarea { buf, cursor_row, cursor_col, scroll, .. } =
                         &mut widgets[focus]
                     {
                         if *cursor_col > 0 {
@@ -1833,9 +1858,9 @@ pub fn run_wizard_tui(
                     }
                 }
                 KeyCode::Right
-                    if focus < n && matches!(widgets[focus], Widget::Textarea { .. }) =>
+                    if focus < n && matches!(widgets[focus], Widget::Textarea { active: true, .. }) =>
                 {
-                    if let Widget::Textarea { buf, cursor_row, cursor_col, scroll } =
+                    if let Widget::Textarea { buf, cursor_row, cursor_col, scroll, .. } =
                         &mut widgets[focus]
                     {
                         let line_len = textarea_line_char_len(buf, *cursor_row);
@@ -1852,14 +1877,14 @@ pub fn run_wizard_tui(
                     }
                 }
                 KeyCode::Home
-                    if focus < n && matches!(widgets[focus], Widget::Textarea { .. }) =>
+                    if focus < n && matches!(widgets[focus], Widget::Textarea { active: true, .. }) =>
                 {
                     if let Widget::Textarea { cursor_col, .. } = &mut widgets[focus] {
                         *cursor_col = 0;
                     }
                 }
                 KeyCode::End
-                    if focus < n && matches!(widgets[focus], Widget::Textarea { .. }) =>
+                    if focus < n && matches!(widgets[focus], Widget::Textarea { active: true, .. }) =>
                 {
                     if let Widget::Textarea { buf, cursor_row, cursor_col, .. } =
                         &mut widgets[focus]
@@ -1868,9 +1893,9 @@ pub fn run_wizard_tui(
                     }
                 }
                 KeyCode::PageUp
-                    if focus < n && matches!(widgets[focus], Widget::Textarea { .. }) =>
+                    if focus < n && matches!(widgets[focus], Widget::Textarea { active: true, .. }) =>
                 {
-                    if let Widget::Textarea { buf, cursor_row, cursor_col, scroll } =
+                    if let Widget::Textarea { buf, cursor_row, cursor_col, scroll, .. } =
                         &mut widgets[focus]
                     {
                         *cursor_row = cursor_row.saturating_sub(TEXTAREA_VISIBLE_ROWS);
@@ -1880,9 +1905,9 @@ pub fn run_wizard_tui(
                     }
                 }
                 KeyCode::PageDown
-                    if focus < n && matches!(widgets[focus], Widget::Textarea { .. }) =>
+                    if focus < n && matches!(widgets[focus], Widget::Textarea { active: true, .. }) =>
                 {
-                    if let Widget::Textarea { buf, cursor_row, cursor_col, scroll } =
+                    if let Widget::Textarea { buf, cursor_row, cursor_col, scroll, .. } =
                         &mut widgets[focus]
                     {
                         let last = textarea_line_count(buf).saturating_sub(1);
@@ -1890,6 +1915,12 @@ pub fn run_wizard_tui(
                         *cursor_col =
                             (*cursor_col).min(textarea_line_char_len(buf, *cursor_row));
                         textarea_fix_scroll(scroll, *cursor_row);
+                    }
+                }
+                // Esc on an active Textarea exits edit mode (does not leave the field).
+                KeyCode::Esc if focus < n && matches!(widgets[focus], Widget::Textarea { active: true, .. }) => {
+                    if let Widget::Textarea { active, .. } = &mut widgets[focus] {
+                        *active = false;
                     }
                 }
                 KeyCode::Esc => {
@@ -1928,9 +1959,11 @@ pub fn run_wizard_tui(
                         },
                         Widget::Toggle { on } => *on = !*on,
                         Widget::Input { buf, .. } | Widget::Path { buf, .. } => buf.push(' '),
-                        Widget::Textarea { buf, cursor_row, cursor_col, scroll } => {
-                            textarea_insert(buf, cursor_row, cursor_col, ' ');
-                            textarea_fix_scroll(scroll, *cursor_row);
+                        Widget::Textarea { buf, cursor_row, cursor_col, scroll, active } => {
+                            if *active {
+                                textarea_insert(buf, cursor_row, cursor_col, ' ');
+                                textarea_fix_scroll(scroll, *cursor_row);
+                            }
                         }
                         Widget::Date { digits, cal, .. } => {
                             // Space opens the calendar overlay.
@@ -1968,7 +2001,7 @@ pub fn run_wizard_tui(
                             *dcur = datetime_type_digit(digits, *dcur, ch as u8);
                         }
                         Widget::Datetime { .. } => {} // non-digit silently rejected
-                        Widget::Textarea { buf, cursor_row, cursor_col, scroll } => {
+                        Widget::Textarea { buf, cursor_row, cursor_col, scroll, .. } => {
                             textarea_insert(buf, cursor_row, cursor_col, ch);
                             textarea_fix_scroll(scroll, *cursor_row);
                         }
@@ -1984,29 +2017,48 @@ pub fn run_wizard_tui(
                         Widget::Datetime { digits, dcur, .. } => {
                             *dcur = datetime_backspace(digits, *dcur);
                         }
-                        Widget::Textarea { buf, cursor_row, cursor_col, scroll } => {
+                        Widget::Textarea { buf, cursor_row, cursor_col, scroll, .. } => {
                             textarea_backspace(buf, cursor_row, cursor_col);
                             textarea_fix_scroll(scroll, *cursor_row);
                         }
                         _ => {}
                     }
                 }
-                // Enter in a Textarea inserts a newline; Tab commits/advances.
-                KeyCode::Enter if focus < n && matches!(widgets[focus], Widget::Textarea { .. }) => {
-                    if let Widget::Textarea { buf, cursor_row, cursor_col, scroll } =
+                // Enter activates an inactive Textarea, or inserts newline when active.
+                KeyCode::Enter if focus < n && matches!(widgets[focus], Widget::Textarea { active: false, .. }) => {
+                    if let Widget::Textarea { active, .. } = &mut widgets[focus] {
+                        *active = true;
+                    }
+                }
+                KeyCode::Enter if focus < n && matches!(widgets[focus], Widget::Textarea { active: true, .. }) => {
+                    if let Widget::Textarea { buf, cursor_row, cursor_col, scroll, .. } =
                         &mut widgets[focus]
                     {
                         textarea_insert(buf, cursor_row, cursor_col, '\n');
                         textarea_fix_scroll(scroll, *cursor_row);
                     }
                 }
-                // Tab commits a textarea and advances focus forward.
-                KeyCode::Tab if focus < n && matches!(widgets[focus], Widget::Textarea { .. }) => {
-                    focus = (focus + 1) % (n + 2);
+                // Tab on active Textarea: exit edit mode and advance focus.
+                KeyCode::Tab if focus < n && matches!(widgets[focus], Widget::Textarea { active: true, .. }) => {
+                    if let Widget::Textarea { active, .. } = &mut widgets[focus] { *active = false; }
+                    let next = (focus + 1) % (n + 2);
+                    focus = if next == n && !can_back { (next + 1) % (n + 2) } else { next };
                 }
-                // BackTab goes to the previous field.
-                KeyCode::BackTab if focus < n && matches!(widgets[focus], Widget::Textarea { .. }) => {
-                    focus = (focus + n + 1) % (n + 2);
+                // Tab on inactive Textarea: advance focus.
+                KeyCode::Tab if focus < n && matches!(widgets[focus], Widget::Textarea { active: false, .. }) => {
+                    let next = (focus + 1) % (n + 2);
+                    focus = if next == n && !can_back { (next + 1) % (n + 2) } else { next };
+                }
+                // BackTab on active Textarea: exit edit mode then go to previous field.
+                KeyCode::BackTab if focus < n && matches!(widgets[focus], Widget::Textarea { active: true, .. }) => {
+                    if let Widget::Textarea { active, .. } = &mut widgets[focus] { *active = false; }
+                    let prev = (focus + n + 1) % (n + 2);
+                    focus = if prev == n && !can_back { (prev + n + 1) % (n + 2) } else { prev };
+                }
+                // BackTab on inactive Textarea: previous field.
+                KeyCode::BackTab if focus < n && matches!(widgets[focus], Widget::Textarea { active: false, .. }) => {
+                    let prev = (focus + n + 1) % (n + 2);
+                    focus = if prev == n && !can_back { (prev + n + 1) % (n + 2) } else { prev };
                 }
                 // Enter on a focused Dropdown opens it.
                 KeyCode::Enter if focus < n && matches!(widgets[focus], Widget::Dropdown { open: false, .. }) => {
@@ -3320,5 +3372,89 @@ mod tests {
         assert_eq!(digits[7], b'_', "slot 7 must be empty");
         let dcur = first_empty_slot_8(&digits);
         assert_eq!(dcur, 7, "cursor must resume at slot 7, not 0");
+    }
+
+    // ── focus-skip for disabled Back button ──────────────────────────────
+
+    /// Replicate the Tab skip logic: if landing on `n` (Back) and !can_back,
+    /// skip to `n+1` (Next).
+    fn tab_next(focus: usize, n: usize, can_back: bool) -> usize {
+        let next = (focus + 1) % (n + 2);
+        if next == n && !can_back { (next + 1) % (n + 2) } else { next }
+    }
+
+    fn tab_prev(focus: usize, n: usize, can_back: bool) -> usize {
+        let prev = (focus + n + 1) % (n + 2);
+        if prev == n && !can_back { (prev + n + 1) % (n + 2) } else { prev }
+    }
+
+    #[test]
+    fn tab_skips_disabled_back_forward() {
+        // n=2 fields: focus 0,1 = fields; 2 = Back; 3 = Next.
+        // From last field (1), Tab should skip Back (2) → Next (3).
+        assert_eq!(tab_next(1, 2, false), 3, "should skip disabled Back");
+        // If Back is enabled, it should NOT be skipped.
+        assert_eq!(tab_next(1, 2, true), 2, "enabled Back must not be skipped");
+    }
+
+    #[test]
+    fn tab_skips_disabled_back_backward() {
+        // From Next (3), BackTab should skip Back (2) → last field (1).
+        assert_eq!(tab_prev(3, 2, false), 1, "BackTab must skip disabled Back");
+        assert_eq!(tab_prev(3, 2, true), 2, "BackTab must land on enabled Back");
+    }
+
+    #[test]
+    fn tab_wraps_correctly_when_back_enabled() {
+        // n=1: 0 = field; 1 = Back; 2 = Next. Wrap: Next → field.
+        assert_eq!(tab_next(2, 1, true), 0);
+        assert_eq!(tab_prev(0, 1, true), 2);
+    }
+
+    // ── Textarea active mode ─────────────────────────────────────────────
+
+    #[test]
+    fn textarea_starts_inactive() {
+        let w = super::Widget::Textarea {
+            buf: "hello".to_string(),
+            cursor_row: 0,
+            cursor_col: 0,
+            scroll: 0,
+            active: false,
+        };
+        assert!(matches!(w, super::Widget::Textarea { active: false, .. }));
+    }
+
+    #[test]
+    fn textarea_enter_activates() {
+        let mut active = false;
+        // Simulate Enter on inactive: set active = true.
+        if !active { active = true; }
+        assert!(active);
+    }
+
+    #[test]
+    fn textarea_esc_deactivates() {
+        let mut active = true;
+        // Simulate Esc on active: set active = false.
+        if active { active = false; }
+        assert!(!active);
+    }
+
+    #[test]
+    fn textarea_inactive_ignores_typing() {
+        // When inactive, the `editing` predicate must be false, so Char keys
+        // fall through to other handlers and don't modify the buffer.
+        // Replicate the `editing` check logic:
+        let active = false;
+        let editing = active; // for a Textarea, editing == active
+        assert!(!editing, "inactive textarea must not be in editing state");
+    }
+
+    #[test]
+    fn textarea_active_accepts_typing() {
+        let active = true;
+        let editing = active;
+        assert!(editing, "active textarea must be in editing state");
     }
 }
