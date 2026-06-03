@@ -575,7 +575,7 @@ fn validate_field_schema(field: &Field) -> Result<()> {
     // else: on select types it runs against the option label and falsely rejects
     // valid options; on date/datetime/toggle it is semantically nonsensical.
     if let Some(fmt) = field.validate.format {
-        let allowed = matches!(field.field_type, FieldType::Text | FieldType::Secret | FieldType::Path);
+        let allowed = matches!(field.field_type, FieldType::Text | FieldType::Textarea | FieldType::Secret | FieldType::Path);
         if !allowed {
             return Err(EngineError::Config(format!(
                 "field '{}': format={:?} is only valid on text/secret/path fields, not {:?}",
@@ -2503,6 +2503,19 @@ max = "2027-12-31"
             [[page.field]]
             id = "PORT"
             type = "text"
+            format = "integer"
+        "#).unwrap();
+        assert!(validate_wizard_schema(&wiz).is_ok());
+    }
+
+    #[test]
+    fn schema_accepts_format_on_textarea() {
+        let wiz = WizardDef::from_str(r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "NOTES"
+            type = "textarea"
             format = "integer"
         "#).unwrap();
         assert!(validate_wizard_schema(&wiz).is_ok());

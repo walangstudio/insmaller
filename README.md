@@ -3,7 +3,7 @@
 ![version](https://img.shields.io/github/v/release/walangstudio/insmaller?sort=semver&color=blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![rust](https://img.shields.io/badge/rust-1.95-orange)
-![tests](https://img.shields.io/badge/tests-402%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-496%20passing-brightgreen)
 
 <sub>*(it's "insmaller" — "inshorter" just didn't sound right.)*</sub>
 
@@ -124,16 +124,29 @@ interactive wizard so you can see it.
 |------|-------|-------|
 | `text` | string | free text |
 | `secret` | string | masked in the TUI |
-| `path` | string | `Ctrl+B` opens a file/dir browser |
+| `path` | string | `Ctrl+B` opens a file/dir browser; parent dir must exist |
 | `single_select` | string | expanded radio list |
-| `dropdown` | string | collapsed type-to-search select |
+| `dropdown` | string | collapsed type-to-search select; popup has a `Search:` box |
 | `multiselect` | string[] | many choices; `[x]/[~]/[ ]` group headers |
 | `toggle` | bool | on/off |
-| `textarea` | string | multi-line text |
-| `date` | string | ISO `YYYY-MM-DD`; `min`/`max` accept ISO date strings |
-| `datetime` | string | ISO `YYYY-MM-DDTHH:MM:SS`; `min`/`max` accept ISO date strings |
+| `textarea` | string | Enter to edit, Esc to stop; ↑↓←→/Home/End/PgUp/PgDn navigate |
+| `date` | string | ISO `YYYY-MM-DD`; digit-only masked entry; Space opens calendar |
+| `datetime` | string | ISO `YYYY-MM-DDTHH:MM:SS`; same mask/calendar as `date` |
 
 Configs using `dropdown`, `textarea`, `date`, or `datetime` require insmaller >= 0.7.0.
+
+**Date/datetime details.** The `-`, `T`, `:` separators are pre-placed; only
+digits are typed; empty slots show as `_`. Press Space on a focused date field
+for a month calendar: ←/→ = ±1 day, ↑/↓ = ±1 week, PgUp/PgDn = ±1 month,
+Enter commits, Esc cancels. A partially-typed date is rejected with an
+"incomplete date" error rather than silently submitted empty.
+
+**Path validation.** The typed value is trimmed and rejected if neither the path
+nor its parent directory exists on disk (catches case errors on Linux). A new
+leaf under an existing parent is accepted.
+
+**Dropdown search.** The popup opens with a `Search:` line; typing filters the
+list in real time; `[no matches]` shown when nothing matches.
 
 ### `[page.field.api]` — field-level API validation
 
@@ -159,6 +172,19 @@ error          = "GitHub user not found"
 Keys: `url` (required), `method` (`GET`/`POST`/`HEAD`; default `GET`), `headers`
 (array of `[name, value]` pairs), `body`, `expect_status`, `expect_json_path`
 (JSONPath expression; must resolve truthy), `timeout_ms`, `error`.
+
+**Try the demo.** `examples/wizard-widgets.toml` exercises every new field type.
+`examples/serve-validate.py` is a dependency-free local validator (Python stdlib
+only, no signup, no egress) that accepts keys starting with `demo-`. Run it once,
+then run the wizard in a second terminal:
+
+```sh
+python examples/serve-validate.py
+insmaller setup --wizard examples/wizard-widgets.toml --config examples/demo.installer.toml
+```
+
+This exercises the `[page.field.api]` path against `127.0.0.1:8787` so nothing
+leaves the machine. Pass `--no-api-validate` to skip the API call entirely.
 
 ## How it is put together
 

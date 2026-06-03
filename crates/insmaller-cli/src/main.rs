@@ -634,13 +634,20 @@ async fn cmd_setup(a: &[String], name: &str) -> ExitCode {
     };
 
     // Collect secret field ids so we can mask their values in the summary.
-    let secret_ids: std::collections::HashSet<String> = wiz
+    // Cover both static wizard fields AND catalog requires_input declarations
+    // (selected.inputs expansion path), which are not in wiz.pages.
+    let mut secret_ids: std::collections::HashSet<String> = wiz
         .pages
         .iter()
         .flat_map(|p| p.fields.iter())
         .filter(|f| f.field_type == FieldType::Secret)
         .map(|f| f.id.clone())
         .collect();
+    for decl in cat.required_inputs(&outcome.selected_keys) {
+        if decl.r#type == FieldType::Secret {
+            secret_ids.insert(decl.id.clone());
+        }
+    }
 
     if !outcome.vars.is_empty() {
         println!("Answers:");
@@ -1293,5 +1300,66 @@ mod tests {
         // Even an array in a secret field is fully masked.
         let v = Value::Array(vec![Value::String("tok1".to_string())]);
         assert_eq!(format_answer_value(&v, true), "***");
+    }
+
+    // ── requires_input secret masking ─────────────────────────────────────
+
+    #[test]
+    fn requires_input_secret_is_masked() {
+        // Build a catalog with a CLI entry whose requires_input declares a
+        // Secret token. Confirm that required_inputs returns it and that the
+        // token's value is masked (is_secret = true).
+        let cat = insmaller_core::Catalog::from_json_str(
+            r#"{"clis":[{
+                "key":"myapp","install":"npm:myapp",
+                "requires_input":[{"id":"MYAPP_TOKEN","type":"secret","required":true}]
+            }]}"#,
+        )
+        .unwrap();
+
+        let selected = vec!["myapp".to_string()];
+        let decls = cat.required_inputs(&selected);
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].id, "MYAPP_TOKEN");
+        assert_eq!(decls[0].r#type, insmaller_core::FieldType::Secret);
+
+        // Simulate what cmd_setup does: check r#type == Secret → add to set.
+        let mut secret_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for decl in &decls {
+            if decl.r#type == insmaller_core::FieldType::Secret {
+                secret_ids.insert(decl.id.clone());
+            }
+        }
+        assert!(secret_ids.contains("MYAPP_TOKEN"),
+            "requires_input secret must be in secret_ids");
+
+        // Confirm the value is masked via format_answer_value.
+        let token_val = Value::String("sk-supersecret".to_string());
+        let is_secret = secret_ids.contains("MYAPP_TOKEN");
+        assert_eq!(format_answer_value(&token_val, is_secret), "***",
+            "requires_input secret value must be masked, not printed");
+    }
+
+    #[test]
+    fn requires_input_non_secret_is_not_masked() {
+        // A requires_input of type "text" must NOT be in secret_ids.
+        let cat = insmaller_core::Catalog::from_json_str(
+            r#"{"clis":[{
+                "key":"tool","install":"npm:tool",
+                "requires_input":[{"id":"AUTHOR","type":"text","required":true}]
+            }]}"#,
+        )
+        .unwrap();
+        let decls = cat.required_inputs(&["tool".to_string()]);
+        let mut secret_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for decl in &decls {
+            if decl.r#type == insmaller_core::FieldType::Secret {
+                secret_ids.insert(decl.id.clone());
+            }
+        }
+        assert!(!secret_ids.contains("AUTHOR"),
+            "non-secret requires_input must not be masked");
+        let val = Value::String("Alice".to_string());
+        assert_eq!(format_answer_value(&val, false), "Alice");
     }
 }

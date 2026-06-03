@@ -2044,19 +2044,11 @@ pub fn run_wizard_tui(
                     let next = (focus + 1) % (n + 2);
                     focus = if next == n && !can_back { (next + 1) % (n + 2) } else { next };
                 }
-                // Tab on inactive Textarea: advance focus.
-                KeyCode::Tab if focus < n && matches!(widgets[focus], Widget::Textarea { active: false, .. }) => {
-                    let next = (focus + 1) % (n + 2);
-                    focus = if next == n && !can_back { (next + 1) % (n + 2) } else { next };
-                }
                 // BackTab on active Textarea: exit edit mode then go to previous field.
+                // (Inactive-Textarea Tab/BackTab fall through to the generic arms below,
+                // which already skip a disabled Back button.)
                 KeyCode::BackTab if focus < n && matches!(widgets[focus], Widget::Textarea { active: true, .. }) => {
                     if let Widget::Textarea { active, .. } = &mut widgets[focus] { *active = false; }
-                    let prev = (focus + n + 1) % (n + 2);
-                    focus = if prev == n && !can_back { (prev + n + 1) % (n + 2) } else { prev };
-                }
-                // BackTab on inactive Textarea: previous field.
-                KeyCode::BackTab if focus < n && matches!(widgets[focus], Widget::Textarea { active: false, .. }) => {
                     let prev = (focus + n + 1) % (n + 2);
                     focus = if prev == n && !can_back { (prev + n + 1) % (n + 2) } else { prev };
                 }
@@ -2079,7 +2071,7 @@ pub fn run_wizard_tui(
                     } else {
                         // Next (or any field) → partial-date, path, API validation, submit.
                         let m = commit(&widgets, &fields);
-                        // Partial date/datetime check (before commit so digits are still live).
+                        // Partial date/datetime check (reads live widget digits, not the committed map).
                         if let Some((fail_idx, date_err)) = check_partial_dates(&fields, &widgets) {
                             err = Some(date_err);
                             focus = fail_idx;
