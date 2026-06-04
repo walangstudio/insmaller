@@ -4,6 +4,42 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.0] - 2026-06-03
+
+### Added
+- **Cross-field assert validation.** A `[[page.field]]` entry can now carry
+  `assert` and `assert_error` keys. `assert` is a comparison expression of the
+  form `${VAR} OP ${VAR}` (or a literal on either side) where `OP` is one of
+  `>= <= == != > <`. Both `${VAR}` operands are resolved from the accumulated
+  vars map — meaning they can reference fields on the *current* page or on any
+  prior page. The comparison is date/datetime-aware (ISO `YYYY-MM-DD` and
+  `YYYY-MM-DDTHH:MM:SS`), version-string-aware, and falls back to numeric then
+  string comparison. Example:
+  ```toml
+  [[page.field]]
+  id = "go_live_end"
+  type = "date"
+  required = false
+  assert = "${go_live_end} >= ${go_live_date}"
+  assert_error = "End date must be on or after the go-live date."
+  ```
+  When `assert` fails, the field stays focused and the `assert_error` message
+  (or a default "does not satisfy: …" message) is shown in the footer.
+- **Assert gate in the interactive TUI.** In the `KeyCode::Enter` submit path,
+  cross-field asserts run after partial-date, path, and API validation. The gate
+  builds candidate vars from prior-page answers plus the current page's
+  just-committed values, so forward and backward references both resolve.
+  Optional fields with no value skip their own assert (consistent with how
+  per-field validators skip empty optional values).
+- **Assert enforcement in `--answers` / unattended runs.** `run_wizard` already
+  evaluates asserts as a final pass, so headless runs enforce the same rules as
+  the interactive TUI.
+- **Schema validation for assert.** `validate_wizard_schema` rejects a malformed
+  `assert` expression (no recognised operator), an empty `assert`, and
+  `assert_error` without a matching `assert`.
+- **Demo.** `examples/wizard-widgets.toml` now includes a `go_live_end` field on
+  the Schedule page that demonstrates the cross-field assert against `go_live_date`.
+
 ## [0.7.0] - 2026-06-01
 
 ### Added

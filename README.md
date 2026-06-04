@@ -148,6 +148,27 @@ leaf under an existing parent is accepted.
 **Dropdown search.** The popup opens with a `Search:` line; typing filters the
 list in real time; `[no matches]` shown when nothing matches.
 
+### Cross-field validation
+
+Any field can carry `assert` and `assert_error` to compare its value against
+another field's value (or a literal). Both operands resolve `${VAR}` references
+from the accumulated answers map, so the assertion can span multiple pages.
+
+```toml
+[[page.field]]
+id = "go_live_end"
+type = "date"
+required = false
+assert = "${go_live_end} >= ${go_live_date}"
+assert_error = "End date must be on or after the go-live date."
+```
+
+Supported operators: `>= <= == != > <`. Comparison is date/datetime-aware
+(`YYYY-MM-DD`, `YYYY-MM-DDTHH:MM:SS`), then version-string-aware, then numeric,
+then string. The assert runs in both the interactive TUI (as a page-submit gate)
+and the `--answers` / unattended path. It complements, but does not replace,
+per-field `min`/`max`/`pattern`/`format` validators.
+
 ### `[page.field.api]` — field-level API validation
 
 After local validators pass, the engine fires an HTTP request with `{{value}}`
