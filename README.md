@@ -3,7 +3,7 @@
 ![version](https://img.shields.io/github/v/release/walangstudio/insmaller?sort=semver&color=blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![rust](https://img.shields.io/badge/rust-1.95-orange)
-![tests](https://img.shields.io/badge/tests-496%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-534%20passing-brightgreen)
 
 <sub>*(it's "insmaller" — "inshorter" just didn't sound right.)*</sub>
 
@@ -164,10 +164,13 @@ assert_error = "End date must be on or after the go-live date."
 ```
 
 Supported operators: `>= <= == != > <`. Comparison is date/datetime-aware
-(`YYYY-MM-DD`, `YYYY-MM-DDTHH:MM:SS`), then version-string-aware, then numeric,
-then string. The assert runs in both the interactive TUI (as a page-submit gate)
-and the `--answers` / unattended path. It complements, but does not replace,
-per-field `min`/`max`/`pattern`/`format` validators.
+(`YYYY-MM-DD`, `YYYY-MM-DDTHH:MM:SS`), then numeric, then version-string-aware,
+then lexicographic string. The assert is skipped whenever any referenced field
+is blank or absent, so optional fields and forward references don't spuriously
+fail. It runs in both the interactive TUI (as a page-submit gate that focuses
+the offending field) and the `--answers` / unattended path, and complements —
+does not replace — the per-field `min`/`max`/`pattern`/`format` validators.
+`assert` / `assert_error` require insmaller >= 0.8.0.
 
 ### `[page.field.api]` — field-level API validation
 

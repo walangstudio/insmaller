@@ -13,8 +13,8 @@ All notable changes to this project are documented here. The format follows
   `>= <= == != > <`. Both `${VAR}` operands are resolved from the accumulated
   vars map — meaning they can reference fields on the *current* page or on any
   prior page. The comparison is date/datetime-aware (ISO `YYYY-MM-DD` and
-  `YYYY-MM-DDTHH:MM:SS`), version-string-aware, and falls back to numeric then
-  string comparison. Example:
+  `YYYY-MM-DDTHH:MM:SS`), then numeric, then version-string-aware, then
+  lexicographic string. Example:
   ```toml
   [[page.field]]
   id = "go_live_end"
@@ -39,6 +39,16 @@ All notable changes to this project are documented here. The format follows
   `assert_error` without a matching `assert`.
 - **Demo.** `examples/wizard-widgets.toml` now includes a `go_live_end` field on
   the Schedule page that demonstrates the cross-field assert against `go_live_date`.
+
+### Changed
+- An `assert` is skipped whenever any referenced `${VAR}` is blank or absent, so
+  optional fields and forward references never fail spuriously — enforced
+  identically in the TUI and the `--answers` path.
+
+### Internal
+- The release workflow now publishes both crates to crates.io (`insmaller-core`
+  then `insmaller`, with an index-wait retry) after the platform builds succeed.
+  It no-ops when `CARGO_REGISTRY_TOKEN` is not set.
 
 ## [0.7.0] - 2026-06-01
 
