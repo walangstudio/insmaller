@@ -44,9 +44,10 @@ pub use input::{
 };
 pub use json_catalog::{Catalog, CatalogOption};
 pub use wizard::{
-    choices_for_vars, collect_outcome, eval_condition, run_wizard, validate_wizard_schema,
-    Answerer, Bound, Choice, Field, FieldType, InputDecl, Page, StaticAnswerer, Validate,
-    ValidateApi, WizValue, WizardDef, WizardOutcome, WizardSession, SELECTED_INPUTS,
+    check_field_assert, choices_for_vars, collect_outcome, compare_values, eval_assert,
+    eval_condition, run_wizard, validate_wizard_schema, Answerer, Bound, Choice, Field, FieldType,
+    InputDecl, Page, StaticAnswerer, Validate, ValidateApi, WizValue, WizardDef, WizardOutcome,
+    WizardSession, SELECTED_INPUTS,
 };
 pub use orchestrator::{
     install_many, install_many_with, run_step_pipeline, uninstall_many, uninstall_many_with,

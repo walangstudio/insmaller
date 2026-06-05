@@ -60,6 +60,18 @@ min = "2026-06-01"
 max = "2027-12-31"
 
 [[page.field]]
+id = "go_live_end"
+type = "date"
+prompt = "Go-live end date (optional; must be >= go-live date)"
+required = false
+# Cross-field assert: end must be on or after the start date.
+# Because this field is optional (required = false), leaving it blank skips
+# the assert entirely — the TUI and --answers path both skip cross-field
+# asserts for optional fields with no value.
+assert = "${go_live_end} >= ${go_live_date}"
+assert_error = "End date must be on or after the go-live date."
+
+[[page.field]]
 id = "go_live_time"
 type = "datetime"
 prompt = "Go-live datetime (e.g. 2026-09-01T09:00:00)"

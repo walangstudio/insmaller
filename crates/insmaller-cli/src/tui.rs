@@ -11,7 +11,7 @@ use crossterm::{
     ExecutableCommand,
 };
 use indicatif::{ProgressBar, ProgressStyle};
-use insmaller_core::{Field, FieldType, Reporter, WizardSession};
+use insmaller_core::{check_field_assert, Field, FieldType, Reporter, WizardSession};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
@@ -857,6 +857,29 @@ fn run_path_validation(fields: &[Field], answers: &Map<String, Value>) -> Option
             |p| p.is_dir(),
         ) {
             return Some((idx, msg));
+        }
+    }
+    None
+}
+
+/// Run cross-field assert validation for all fields on the current page that
+/// have `field.assert` set. `candidate_vars` is the union of prior-page vars and
+/// the current page's just-committed values. Returns the index of the first
+/// failing field and its error message, or `None` if all pass (or no asserts set).
+///
+/// Optional fields (not required) whose own value is absent or empty are skipped:
+/// a blank optional field opts out of its own cross-field assert (consistent with
+/// how per-field validators are bypassed for empty optional values).
+fn run_assert_validation(
+    fields: &[Field],
+    candidate_vars: &Map<String, Value>,
+) -> Option<(usize, String)> {
+    for (idx, field) in fields.iter().enumerate() {
+        if field.assert.is_none() {
+            continue;
+        }
+        if let Err(e) = check_field_assert(field, candidate_vars) {
+            return Some((idx, format!("{e}")));
         }
     }
     None
@@ -2091,6 +2114,19 @@ pub fn run_wizard_tui(
                                 continue;
                             }
                         }
+                        // Cross-field assert validation: build candidate vars
+                        // = prior-page vars + this page's just-committed values,
+                        // so asserts can reference both current and prior fields.
+                        let candidate_vars: Map<String, Value> = {
+                            let mut cv = session.vars_snapshot();
+                            cv.extend(m.clone());
+                            cv
+                        };
+                        if let Some((fail_idx, assert_err)) = run_assert_validation(&fields, &candidate_vars) {
+                            err = Some(assert_err);
+                            focus = fail_idx;
+                            continue;
+                        }
                         match session.submit(m) {
                             Ok(()) => break,
                             Err(e) => err = Some(format!("{e}")),
@@ -2164,7 +2200,7 @@ mod tests {
         parse_datetime_digits, render_calendar, render_date_mask, render_datetime_mask,
         textarea_backspace, textarea_byte_pos, textarea_insert, textarea_line_char_len,
         textarea_line_count, validate_path_value, vert_nav, visible_rows, GroupDefaults,
-        Picker, Row,
+        Picker, Row, run_assert_validation,
     };
     use chrono::{Datelike, NaiveDate};
     use insmaller_core::Choice;
@@ -3275,6 +3311,7 @@ mod tests {
             prompt: Some("Go-live date".to_string()),
             default: None, required: true, source: None,
             options: vec![], condition: None,
+            assert: None, assert_error: None,
             validate: Validate::default(),
         };
         let widget = Widget::Date { digits, dcur: 7, cal: None };
@@ -3293,7 +3330,8 @@ mod tests {
         let field = Field {
             id: "dt".to_string(), field_type: FieldType::Date,
             prompt: None, default: None, required: false, source: None,
-            options: vec![], condition: None, validate: Validate::default(),
+            options: vec![], condition: None, assert: None, assert_error: None,
+            validate: Validate::default(),
         };
         let widget = Widget::Date { digits: [b'_'; 8], dcur: 0, cal: None };
         assert!(check_partial_dates(&[field], &[widget]).is_none(),
@@ -3308,7 +3346,8 @@ mod tests {
         let field = Field {
             id: "dt".to_string(), field_type: FieldType::Date,
             prompt: None, default: None, required: true, source: None,
-            options: vec![], condition: None, validate: Validate::default(),
+            options: vec![], condition: None, assert: None, assert_error: None,
+            validate: Validate::default(),
         };
         let widget = Widget::Date { digits, dcur: 8, cal: None };
         assert!(check_partial_dates(&[field], &[widget]).is_none(),
@@ -3448,5 +3487,70 @@ mod tests {
         let active = true;
         let editing = active;
         assert!(editing, "active textarea must be in editing state");
+    }
+
+    // ── run_assert_validation unit tests ────────────────────────────────
+
+    fn assert_field(id: &str, assert: &str, assert_error: Option<&str>) -> insmaller_core::Field {
+        insmaller_core::Field {
+            id: id.to_string(),
+            field_type: insmaller_core::FieldType::Date,
+            prompt: Some(id.to_string()),
+            default: None,
+            required: false,
+            source: None,
+            options: vec![],
+            condition: None,
+            assert: Some(assert.to_string()),
+            assert_error: assert_error.map(str::to_string),
+            validate: insmaller_core::Validate::default(),
+        }
+    }
+
+    #[test]
+    fn assert_gate_passes_when_condition_true() {
+        let field = assert_field("end_date", "${end_date} >= ${start_date}", None);
+        let mut vars = serde_json::Map::new();
+        vars.insert("start_date".to_string(), serde_json::Value::String("2026-09-01".into()));
+        vars.insert("end_date".to_string(), serde_json::Value::String("2026-09-15".into()));
+        let result = run_assert_validation(&[field], &vars);
+        assert!(result.is_none(), "assert must pass when end >= start");
+    }
+
+    #[test]
+    fn assert_gate_fails_when_condition_false() {
+        let field = assert_field(
+            "end_date",
+            "${end_date} >= ${start_date}",
+            Some("End date must be on or after start date."),
+        );
+        let mut vars = serde_json::Map::new();
+        vars.insert("start_date".to_string(), serde_json::Value::String("2026-09-15".into()));
+        vars.insert("end_date".to_string(), serde_json::Value::String("2026-09-01".into()));
+        let result = run_assert_validation(&[field], &vars);
+        assert!(result.is_some(), "assert must fail when end < start");
+        let (idx, msg) = result.unwrap();
+        assert_eq!(idx, 0);
+        assert!(msg.contains("End date must be on or after start date."), "custom error in message: {msg}");
+    }
+
+    #[test]
+    fn assert_gate_skips_fields_without_assert() {
+        use insmaller_core::{Field, FieldType, Validate};
+        let plain = Field {
+            id: "name".to_string(),
+            field_type: FieldType::Text,
+            prompt: None,
+            default: None,
+            required: false,
+            source: None,
+            options: vec![],
+            condition: None,
+            assert: None,
+            assert_error: None,
+            validate: Validate::default(),
+        };
+        let result = run_assert_validation(&[plain], &serde_json::Map::new());
+        assert!(result.is_none(), "no assert set → must always pass");
     }
 }
