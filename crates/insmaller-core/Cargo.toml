@@ -1,6 +1,6 @@
 [package]
 name = "insmaller-core"
-version = "0.7.0"
+version = "0.8.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -33,7 +33,7 @@ regex = "1"
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 
 # P1 processors: download (http+hash) + extract (archive formats).
-# ureq (sync, rustls, no wasm subtree) — avoids reqwest's js-sys/web-sys
+# ureq (sync, rustls, no wasm subtree) â€” avoids reqwest's js-sys/web-sys
 # offline-resolution conflict on this network-restricted box.
 ureq = "3"
 sha2 = "0.10"
@@ -44,12 +44,12 @@ bzip2 = "0.5"
 xz2 = "0.1"
 
 # P5 cdylib transport (optional; default build stays dep-light + offline).
-# libloading is cached → `--features cdylib` builds offline.
+# libloading is cached â†’ `--features cdylib` builds offline.
 # WASM (extism) is intentionally NOT declared: extism is absent from this
 # box's offline cargo cache, and an optional dep cargo can't resolve offline
-# breaks even the default build. WASM is delivered as documented-deferred —
+# breaks even the default build. WASM is delivered as documented-deferred â€”
 # add `extism` + the WasmTransport (sketch in plans/iteration-2-plan.md) when
-# building online. One JSON protocol → drop-in when enabled.
+# building online. One JSON protocol â†’ drop-in when enabled.
 libloading = { version = "0.8", optional = true }
 
 [features]

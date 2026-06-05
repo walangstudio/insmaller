@@ -160,3 +160,59 @@ jobs:
           generate_release_notes: true
           files: dist/*
           fail_on_unmatched_files: true
+
+  publish-crates:
+    # Publish both crates to crates.io after every platform build succeeds.
+    # No-ops gracefully when CARGO_REGISTRY_TOKEN is not configured.
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+
+      - name: Set crate versions from tag
+        shell: bash
+        run: |
+          python - "${{ needs.prepare.outputs.version }}" <<'PY'
+          import re, sys
+          ver = sys.argv[1]
+          for f in ("crates/insmaller-core/Cargo.toml", "crates/insmaller-cli/Cargo.toml"):
+              s = open(f, encoding="utf-8").read()
+              s = re.sub(r'(?m)^version = ".*"$', f'version = "{ver}"', s, count=1)
+              # keep the cli's path-dep pin on insmaller-core in lockstep
+              s = re.sub(
+                  r'(insmaller-core = \{ path = "\.\./insmaller-core", version = ")[^"]*(" \})',
+                  rf'\g<1>{ver}\g<2>', s)
+              open(f, "w", encoding="utf-8").write(s)
+          PY
+
+      - name: Publish to crates.io (core, then cli)
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "CARGO_REGISTRY_TOKEN not set — skipping crates.io publish."
+            exit 0
+          fi
+          # insmaller-core must be published and indexed before the dependent
+          # cli can resolve it. Publish core, then retry the cli until it lands.
+          cargo publish -p insmaller-core
+          for i in $(seq 1 12); do
+            if cargo publish -p insmaller; then
+              echo "Published insmaller to crates.io."
+              exit 0
+            fi
+            echo "insmaller-core not indexed yet (attempt ${i}/12); waiting 20s…"
+            sleep 20
+          done
+          echo "cli publish failed after retries." >&2
+          exit 1

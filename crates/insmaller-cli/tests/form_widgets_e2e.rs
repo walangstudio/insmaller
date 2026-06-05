@@ -527,6 +527,7 @@ fn example_wizard_widgets_headless() {
         "country = \"PH\"\n",
         "release_notes = \"This is a release note that is long enough.\"\n",
         "go_live_date = \"2026-09-01\"\n",
+        "go_live_end = \"2026-09-15\"\n",
         "go_live_time = \"2026-09-01T09:00:00\"\n",
         "DEMO_API_KEY = \"demo-key-value\"\n",
     );
@@ -662,6 +663,94 @@ url = "https://example.com/validate?key={{value}}"
     );
 }
 
+// ── cross-field assert e2e tests ─────────────────────────────────────────────
+
+/// Wizard with a date range assert: go_live_end >= go_live_date.
+fn cross_field_wizard_toml() -> &'static str {
+    r#"[[page]]
+id = "schedule"
+title = "Schedule"
+
+[[page.field]]
+id = "go_live_date"
+type = "date"
+required = true
+
+[[page.field]]
+id = "go_live_end"
+type = "date"
+required = false
+assert = "${go_live_end} >= ${go_live_date}"
+assert_error = "End date must be on or after the go-live date."
+"#
+}
+
+#[test]
+fn cross_field_assert_rejected_when_end_before_start() {
+    let dir = tempfile::tempdir().unwrap();
+    write_base_config(dir.path());
+    fs::write(dir.path().join("wizard.toml"), cross_field_wizard_toml()).unwrap();
+    // end < start → should be rejected
+    fs::write(
+        dir.path().join("answers.toml"),
+        "go_live_date = \"2026-09-15\"\ngo_live_end = \"2026-09-01\"\n",
+    )
+    .unwrap();
+
+    let out = run_setup(dir.path(), "answers.toml", &[]);
+    assert!(
+        !out.status.success(),
+        "end < start must be rejected by cross-field assert\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("End date must be on or after the go-live date."),
+        "expected assert_error message in stderr; got: {stderr}"
+    );
+}
+
+#[test]
+fn cross_field_assert_accepted_when_end_on_or_after_start() {
+    let dir = tempfile::tempdir().unwrap();
+    write_base_config(dir.path());
+    fs::write(dir.path().join("wizard.toml"), cross_field_wizard_toml()).unwrap();
+    // end == start → valid
+    fs::write(
+        dir.path().join("answers.toml"),
+        "go_live_date = \"2026-09-15\"\ngo_live_end = \"2026-09-15\"\n",
+    )
+    .unwrap();
+
+    let out = run_setup(dir.path(), "answers.toml", &[]);
+    assert!(
+        out.status.success(),
+        "end == start must be accepted\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn cross_field_assert_optional_field_omitted_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    write_base_config(dir.path());
+    fs::write(dir.path().join("wizard.toml"), cross_field_wizard_toml()).unwrap();
+    // go_live_end is optional; omitting it entirely must succeed (core skips the
+    // assert when the referenced var is absent).
+    fs::write(
+        dir.path().join("answers.toml"),
+        "go_live_date = \"2026-09-15\"\n",
+    )
+    .unwrap();
+
+    let out = run_setup(dir.path(), "answers.toml", &[]);
+    assert!(
+        out.status.success(),
+        "omitting optional asserted field must succeed\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 // ── TUI unit tests (no terminal) ─────────────────────────────────────────────
 
 #[cfg(test)]
@@ -680,6 +769,8 @@ mod tui_unit {
             source: None,
             options: Vec::new(),
             condition: None,
+            assert: None,
+            assert_error: None,
             validate: Validate::default(),
         }
     }
@@ -701,6 +792,8 @@ mod tui_unit {
             source: None,
             options: vec!["US".to_string(), "PH".to_string(), "DE".to_string()],
             condition: None,
+            assert: None,
+            assert_error: None,
             validate: Validate::default(),
         };
         assert_eq!(f.field_type, FieldType::Dropdown);

@@ -672,6 +672,37 @@ fn validate_field_schema(field: &Field) -> Result<()> {
         }
     }
 
+    // `assert_error` without `assert` is always a config mistake.
+    if field.assert.is_none() && field.assert_error.is_some() {
+        return Err(EngineError::Config(format!(
+            "field '{}': assert_error is set but assert is not",
+            field.id
+        )));
+    }
+
+    // assert must be non-empty and contain at least one supported operator.
+    if let Some(expr) = &field.assert {
+        if expr.trim().is_empty() {
+            return Err(EngineError::Config(format!(
+                "field '{}': assert must not be empty",
+                field.id
+            )));
+        }
+        let has_op = expr.contains(">=")
+            || expr.contains("<=")
+            || expr.contains("==")
+            || expr.contains("!=")
+            || expr.contains('>')
+            || expr.contains('<');
+        if !has_op {
+            return Err(EngineError::Config(format!(
+                "field '{}': assert expression contains no supported operator \
+                 (>= <= == != > <): {expr}",
+                field.id
+            )));
+        }
+    }
+
     Ok(())
 }
 
@@ -695,6 +726,14 @@ pub struct Field {
     pub options: Vec<String>,
     #[serde(default)]
     pub condition: Option<String>,
+    /// Cross-field assertion expression, e.g. `${end} >= ${start}`. Both
+    /// operands are resolved from the accumulated vars map. Evaluated after all
+    /// pages are collected (so forward references work). Supports `>= <= == != > <`.
+    #[serde(default)]
+    pub assert: Option<String>,
+    /// Error message shown when `assert` fails. Defaults to a generated message.
+    #[serde(default)]
+    pub assert_error: Option<String>,
     /// Value validators (text/secret/path fields). Flattened: all Validate
     /// fields appear as direct keys on `[[page.field]]`.
     #[serde(flatten)]
@@ -725,6 +764,10 @@ pub struct InputDecl {
     pub default: Option<String>,
     #[serde(default)]
     pub condition: Option<String>,
+    #[serde(default)]
+    pub assert: Option<String>,
+    #[serde(default)]
+    pub assert_error: Option<String>,
     #[serde(flatten)]
     pub validate: Validate,
 }
@@ -742,6 +785,8 @@ impl InputDecl {
             source: None,
             options: Vec::new(),
             condition: None,
+            assert: self.assert.clone(),
+            assert_error: self.assert_error.clone(),
             validate: self.validate.clone(),
         }
     }
@@ -956,6 +1001,160 @@ pub fn eval_condition(expr: &str, vars: &Map<String, Value>) -> bool {
     !(v.is_empty() || v == "false" || v == "0")
 }
 
+/// Richer comparator for cross-field assert expressions.
+///
+/// Order of attempts:
+/// 1. Both parse as `NaiveDate` (`%Y-%m-%d`) → compare. Must come before
+///    `version_cmp` because `version_cmp("2026-09-01", "2026-12-31")` strips
+///    everything past the first component and returns `Equal` — wrong.
+/// 2. Both parse as `NaiveDateTime` (`%Y-%m-%dT%H:%M:%S`) → compare.
+/// 3. Both parse as finite `f64` → compare. Must come before `version_cmp`
+///    because `version_cmp("3.14", "3.2")` treats components as integers
+///    ([3,14] vs [3,2]) and returns `Greater`, when `3.14 < 3.2` as numbers.
+///    Multi-segment version strings (`1.2.3`) don't parse as `f64` so they
+///    still fall through to step 4.
+/// 4. `version_cmp` returns `Some` → use it (dotted-numeric version strings).
+/// 5. `None` — caller falls back to string comparison for all operators.
+pub fn compare_values(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    use chrono::{NaiveDate, NaiveDateTime};
+    // 1. ISO date
+    if let (Ok(da), Ok(db)) = (
+        NaiveDate::parse_from_str(a, "%Y-%m-%d"),
+        NaiveDate::parse_from_str(b, "%Y-%m-%d"),
+    ) {
+        return Some(da.cmp(&db));
+    }
+    // 2. ISO datetime
+    if let (Ok(dta), Ok(dtb)) = (
+        NaiveDateTime::parse_from_str(a, "%Y-%m-%dT%H:%M:%S"),
+        NaiveDateTime::parse_from_str(b, "%Y-%m-%dT%H:%M:%S"),
+    ) {
+        return Some(dta.cmp(&dtb));
+    }
+    // 3. Floating-point numbers (finite only; NaN excluded). Before version_cmp
+    // so that decimal literals like "3.14" compare numerically, not
+    // component-by-component.
+    if let (Ok(fa), Ok(fb)) = (a.parse::<f64>(), b.parse::<f64>()) {
+        if fa.is_finite() && fb.is_finite() {
+            return fa.partial_cmp(&fb);
+        }
+    }
+    // 4. Dotted-numeric version strings (multi-segment; won't parse as f64).
+    if let Some(o) = version_cmp(a, b) {
+        return Some(o);
+    }
+    None
+}
+
+/// Evaluate a cross-field assert expression against collected `vars`.
+///
+/// Both operands resolve `${VAR}` references from `vars`; bare/quoted tokens
+/// are treated as literals. Supports `>= <= == != > <`. For `==`/`!=` when
+/// `compare_values` returns `None`, falls back to string equality.
+///
+/// Returns `false` for malformed expressions (no recognised operator) so a
+/// misconfigured assert always fails — `validate_field_schema` catches these
+/// at load time and rejects them before the wizard runs.
+pub fn eval_assert(expr: &str, vars: &Map<String, Value>) -> bool {
+    use std::cmp::Ordering;
+    let s = expr.trim();
+    let resolve = |token: &str| -> String {
+        let t = token.trim();
+        if t.starts_with("${") {
+            let name = t.trim_start_matches("${").trim_end_matches('}').trim();
+            vars.get(name).map(var_as_str).unwrap_or_default()
+        } else {
+            t.trim_matches('\'').trim_matches('"').to_string()
+        }
+    };
+
+    if let Some((l, r)) = s.split_once(">=") {
+        let (lv, rv) = (resolve(l), resolve(r));
+        let ord = compare_values(&lv, &rv).unwrap_or_else(|| lv.cmp(&rv));
+        return matches!(ord, Ordering::Greater | Ordering::Equal);
+    }
+    if let Some((l, r)) = s.split_once("<=") {
+        let (lv, rv) = (resolve(l), resolve(r));
+        let ord = compare_values(&lv, &rv).unwrap_or_else(|| lv.cmp(&rv));
+        return matches!(ord, Ordering::Less | Ordering::Equal);
+    }
+    if let Some((l, r)) = s.split_once("==") {
+        let (lv, rv) = (resolve(l), resolve(r));
+        return match compare_values(&lv, &rv) {
+            Some(o) => o == Ordering::Equal,
+            None => lv == rv,
+        };
+    }
+    if let Some((l, r)) = s.split_once("!=") {
+        let (lv, rv) = (resolve(l), resolve(r));
+        return match compare_values(&lv, &rv) {
+            Some(o) => o != Ordering::Equal,
+            None => lv != rv,
+        };
+    }
+    if let Some((l, r)) = s.split_once('>') {
+        let (lv, rv) = (resolve(l), resolve(r));
+        let ord = compare_values(&lv, &rv).unwrap_or_else(|| lv.cmp(&rv));
+        return ord == Ordering::Greater;
+    }
+    if let Some((l, r)) = s.split_once('<') {
+        let (lv, rv) = (resolve(l), resolve(r));
+        let ord = compare_values(&lv, &rv).unwrap_or_else(|| lv.cmp(&rv));
+        return ord == Ordering::Less;
+    }
+    false
+}
+
+/// Check a field's `assert` expression against the accumulated `vars`.
+///
+/// Returns `Ok(())` when:
+/// - `field.assert` is `None`, or
+/// - any `${VAR}` referenced in the expression is absent or empty in `vars`
+///   (the relation is only meaningful when all inputs exist), or
+/// - the assertion evaluates to `true`.
+///
+/// Returns `Err(EngineError::InvalidInput)` when the assertion fails, using
+/// `field.assert_error` as the message when set.
+pub fn check_field_assert(field: &Field, vars: &Map<String, Value>) -> Result<()> {
+    let Some(expr) = &field.assert else {
+        return Ok(());
+    };
+    // Skip if any referenced var is absent or blank — cross-field assertions
+    // are only meaningful when all referenced values have been supplied.
+    // This also handles forward references and skipped optional fields.
+    let any_blank = extract_var_names(expr)
+        .any(|name| vars.get(name).map(var_as_str).unwrap_or_default().is_empty());
+    if any_blank {
+        return Ok(());
+    }
+    if eval_assert(expr, vars) {
+        return Ok(());
+    }
+    let label = field.prompt.as_deref().unwrap_or(&field.id);
+    let message = field
+        .assert_error
+        .clone()
+        .unwrap_or_else(|| format!("does not satisfy: {expr}"));
+    Err(EngineError::InvalidInput {
+        field: label.to_string(),
+        message,
+    })
+}
+
+/// Iterate the `${VAR}` names referenced in an assert expression.
+fn extract_var_names(expr: &str) -> impl Iterator<Item = &str> {
+    // Find every `${...}` token and yield the name between the braces.
+    let mut rest = expr;
+    std::iter::from_fn(move || {
+        let start = rest.find("${")?;
+        rest = &rest[start + 2..];
+        let end = rest.find('}')?;
+        let name = rest[..end].trim();
+        rest = &rest[end + 1..];
+        Some(name)
+    })
+}
+
 #[cfg(test)]
 fn choices_for(field: &Field, catalog: &Catalog) -> Vec<Choice> {
     choices_for_vars(field, catalog, &Map::new(), &[])
@@ -1095,6 +1294,39 @@ pub fn run_wizard(
     // De-dup selected keys, preserve order.
     let mut seen = std::collections::HashSet::new();
     out.selected_keys.retain(|k| seen.insert(k.clone()));
+
+    // Final pass: evaluate cross-field asserts on every visible field.
+    // Done after all pages so forward references resolve correctly.
+    for page in &def.pages {
+        if let Some(c) = &page.condition {
+            if !eval_condition(c, &out.vars) {
+                continue;
+            }
+        }
+        for field in &page.fields {
+            if let Some(c) = &field.condition {
+                if !eval_condition(c, &out.vars) {
+                    continue;
+                }
+            }
+            if field.source.as_deref() == Some(SELECTED_INPUTS) {
+                for decl in catalog.required_inputs(&out.selected_keys) {
+                    if decl
+                        .condition
+                        .as_deref()
+                        .is_some_and(|c| !eval_condition(c, &out.vars))
+                    {
+                        continue;
+                    }
+                    let synthetic = decl.to_field();
+                    check_field_assert(&synthetic, &out.vars)?;
+                }
+                continue;
+            }
+            check_field_assert(field, &out.vars)?;
+        }
+    }
+
     Ok(out)
 }
 
@@ -1235,6 +1467,12 @@ impl<'a> WizardSession<'a> {
     /// Prior answer for a field (so back-nav re-renders with it selected).
     pub fn answer_for(&self, id: &str) -> Option<&Value> {
         self.vars.get(id)
+    }
+
+    /// Snapshot of all accumulated answers so far (across completed pages).
+    /// Used by the TUI to build cross-field assert candidate vars.
+    pub fn vars_snapshot(&self) -> Map<String, Value> {
+        self.vars.clone()
     }
     pub fn can_back(&self) -> bool {
         self.prev_active_before(self.idx).is_some()
@@ -1587,6 +1825,8 @@ mod tests {
             source: Some("catalog.clis".into()),
             options: vec![],
             condition: None,
+            assert: None,
+            assert_error: None,
             validate: Validate::default(),
         };
         let mut vars = Map::new();
@@ -1608,6 +1848,8 @@ mod tests {
             source: Some("catalog.clis".into()),
             options: vec![],
             condition: None,
+            assert: None,
+            assert_error: None,
             validate: Validate::default(),
         };
         let mut vars = Map::new();
@@ -2615,5 +2857,477 @@ max = "2027-12-31"
             api.call("field", "val"),
             Err(EngineError::InvalidInput { .. })
         ));
+    }
+
+    // ── compare_values ───────────────────────────────────────────────────────
+
+    #[test]
+    fn compare_values_dates_ordered_correctly() {
+        use std::cmp::Ordering;
+        // Key regression: version_cmp("2026-09-01","2026-12-31") parses only
+        // "2026" from each and returns Equal — compare_values must return Less.
+        assert_eq!(
+            compare_values("2026-09-01", "2026-12-31"),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare_values("2026-12-31", "2026-09-01"),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            compare_values("2026-06-15", "2026-06-15"),
+            Some(Ordering::Equal)
+        );
+    }
+
+    #[test]
+    fn compare_values_datetimes_ordered_correctly() {
+        use std::cmp::Ordering;
+        assert_eq!(
+            compare_values("2026-06-01T08:00:00", "2026-06-01T09:00:00"),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare_values("2026-06-01T10:00:00", "2026-06-01T09:00:00"),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            compare_values("2026-06-01T09:00:00", "2026-06-01T09:00:00"),
+            Some(Ordering::Equal)
+        );
+    }
+
+    #[test]
+    fn compare_values_numbers_ordered_correctly() {
+        use std::cmp::Ordering;
+        assert_eq!(compare_values("3.14", "2.71"), Some(Ordering::Greater));
+        assert_eq!(compare_values("0", "1"), Some(Ordering::Less));
+        assert_eq!(compare_values("5.0", "5"), Some(Ordering::Equal));
+    }
+
+    #[test]
+    fn compare_values_versions_ordered_correctly() {
+        use std::cmp::Ordering;
+        assert_eq!(compare_values("1.10.0", "1.9.0"), Some(Ordering::Greater));
+        assert_eq!(compare_values("2.0", "3.1"), Some(Ordering::Less));
+    }
+
+    // Fix A: f64 must come before version_cmp so decimals compare numerically.
+    #[test]
+    fn compare_values_decimal_numeric_not_version_wise() {
+        use std::cmp::Ordering;
+        // 3.14 < 3.2 numerically; version_cmp would give Greater ([3,14]>[3,2]).
+        assert_eq!(compare_values("3.14", "3.2"), Some(Ordering::Less));
+        assert_eq!(compare_values("3.2", "3.14"), Some(Ordering::Greater));
+        assert_eq!(compare_values("1.0", "1.0"), Some(Ordering::Equal));
+    }
+
+    #[test]
+    fn compare_values_multi_segment_version_still_works() {
+        use std::cmp::Ordering;
+        // Multi-segment strings don't parse as f64, so they reach version_cmp.
+        assert_eq!(compare_values("1.10.0", "1.9.0"), Some(Ordering::Greater));
+        assert_eq!(compare_values("2.0.1", "2.1.0"), Some(Ordering::Less));
+    }
+
+    #[test]
+    fn compare_values_incompatible_returns_none() {
+        assert_eq!(compare_values("hello", "world"), None);
+    }
+
+    // ── eval_assert ──────────────────────────────────────────────────────────
+
+    fn vars2(k1: &str, v1: &str, k2: &str, v2: &str) -> Map<String, Value> {
+        let mut m = Map::new();
+        m.insert(k1.into(), Value::String(v1.into()));
+        m.insert(k2.into(), Value::String(v2.into()));
+        m
+    }
+
+    #[test]
+    fn eval_assert_date_end_ge_start_pass() {
+        let vars = vars2("start", "2026-09-01", "end", "2026-12-31");
+        assert!(eval_assert("${end} >= ${start}", &vars));
+    }
+
+    #[test]
+    fn eval_assert_date_end_ge_start_fail_when_earlier() {
+        let vars = vars2("start", "2026-12-31", "end", "2026-09-01");
+        assert!(!eval_assert("${end} >= ${start}", &vars));
+    }
+
+    #[test]
+    fn eval_assert_date_equal_passes_ge() {
+        let vars = vars2("start", "2026-06-15", "end", "2026-06-15");
+        assert!(eval_assert("${end} >= ${start}", &vars));
+    }
+
+    #[test]
+    fn eval_assert_datetime_ordered() {
+        let vars = vars2("from", "2026-06-01T08:00:00", "to", "2026-06-01T10:00:00");
+        assert!(eval_assert("${to} > ${from}", &vars));
+        assert!(!eval_assert("${from} > ${to}", &vars));
+    }
+
+    #[test]
+    fn eval_assert_numbers_max_ge_min() {
+        let vars = vars2("min", "5", "max", "10");
+        assert!(eval_assert("${max} >= ${min}", &vars));
+        assert!(!eval_assert("${min} > ${max}", &vars));
+    }
+
+    #[test]
+    fn eval_assert_version_strings() {
+        let vars = vars2("required", "1.8.0", "installed", "2.0.0");
+        assert!(eval_assert("${installed} >= ${required}", &vars));
+        assert!(!eval_assert("${installed} < ${required}", &vars));
+    }
+
+    #[test]
+    fn eval_assert_string_equality_var_vs_var() {
+        let vars = vars2("a", "hello", "b", "hello");
+        assert!(eval_assert("${a} == ${b}", &vars));
+        let vars2 = vars2("a", "hello", "b", "world");
+        assert!(!eval_assert("${a} == ${b}", &vars2));
+        assert!(eval_assert("${a} != ${b}", &vars2));
+    }
+
+    #[test]
+    fn eval_assert_string_equality_var_vs_literal() {
+        let mut vars = Map::new();
+        vars.insert("MODE".into(), Value::String("fast".into()));
+        assert!(eval_assert("${MODE} == 'fast'", &vars));
+        assert!(!eval_assert("${MODE} == 'slow'", &vars));
+        assert!(eval_assert("${MODE} != 'slow'", &vars));
+    }
+
+    #[test]
+    fn eval_assert_no_operator_returns_false() {
+        let vars = Map::new();
+        assert!(!eval_assert("no_operator_here", &vars));
+    }
+
+    // Fix B: ordering ops must fall back to lexicographic when compare_values
+    // returns None (i.e. both sides are plain strings, not dates/numbers/semver).
+    #[test]
+    fn eval_assert_string_lexicographic_ordering() {
+        let mut vars = Map::new();
+        vars.insert("env".into(), Value::String("production".into()));
+        // "production" >= "a" lexicographically
+        assert!(eval_assert("${env} >= 'a'", &vars));
+        // "a" > "production" is false
+        assert!(!eval_assert("${env} < 'a'", &vars));
+        // "production" <= "z"
+        assert!(eval_assert("${env} <= 'z'", &vars));
+        // "production" > "aaa"
+        assert!(eval_assert("${env} > 'aaa'", &vars));
+    }
+
+    // ── eval_condition REGRESSION ────────────────────────────────────────────
+
+    #[test]
+    fn eval_condition_literal_rhs_unchanged() {
+        let v = |k: &str, val: &str| {
+            let mut m = Map::new();
+            m.insert(k.into(), Value::String(val.into()));
+            m
+        };
+        // string equality
+        assert!(eval_condition("${MODE} == 'fast'", &v("MODE", "fast")));
+        assert!(!eval_condition("${MODE} == 'fast'", &v("MODE", "slow")));
+        // version comparison with literal RHS
+        assert!(eval_condition("${V} >= '20'", &v("V", "22.3.1")));
+        assert!(!eval_condition("${V} >= '20'", &v("V", "18.9")));
+        // in membership
+        assert!(eval_condition(
+            "${MODE} in 'fast,slow'",
+            &v("MODE", "fast")
+        ));
+        assert!(!eval_condition(
+            "${MODE} in 'fast,slow'",
+            &v("MODE", "turbo")
+        ));
+        // 'item' in ${VAR}
+        let mut m = Map::new();
+        m.insert(
+            "TOOLS".into(),
+            Value::Array(vec![
+                Value::String("ripgrep".into()),
+                Value::String("node".into()),
+            ]),
+        );
+        assert!(eval_condition("'ripgrep' in ${TOOLS}", &m));
+        assert!(!eval_condition("'claude' in ${TOOLS}", &m));
+    }
+
+    // ── check_field_assert ───────────────────────────────────────────────────
+
+    fn make_field_with_assert(id: &str, prompt: &str, expr: &str, err: Option<&str>) -> Field {
+        Field {
+            id: id.into(),
+            field_type: FieldType::Text,
+            prompt: Some(prompt.into()),
+            default: None,
+            required: false,
+            source: None,
+            options: vec![],
+            condition: None,
+            assert: Some(expr.into()),
+            assert_error: err.map(String::from),
+            validate: Validate::default(),
+        }
+    }
+
+    #[test]
+    fn check_field_assert_passes_when_true() {
+        let vars = vars2("start", "2026-01-01", "end", "2026-12-31");
+        let f = make_field_with_assert("end", "End Date", "${end} >= ${start}", None);
+        assert!(check_field_assert(&f, &vars).is_ok());
+    }
+
+    #[test]
+    fn check_field_assert_fails_with_label_and_default_message() {
+        let vars = vars2("start", "2026-12-31", "end", "2026-01-01");
+        let f = make_field_with_assert("end", "End Date", "${end} >= ${start}", None);
+        let err = check_field_assert(&f, &vars).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("End Date"), "error must use the field prompt as label");
+        assert!(
+            msg.contains("does not satisfy"),
+            "default message must say 'does not satisfy'"
+        );
+    }
+
+    #[test]
+    fn check_field_assert_fails_with_custom_assert_error() {
+        let vars = vars2("start", "2026-12-31", "end", "2026-01-01");
+        let f = make_field_with_assert(
+            "end",
+            "End Date",
+            "${end} >= ${start}",
+            Some("end must be after start"),
+        );
+        let err = check_field_assert(&f, &vars).unwrap_err();
+        assert!(
+            err.to_string().contains("end must be after start"),
+            "custom assert_error message must appear verbatim"
+        );
+    }
+
+    #[test]
+    fn check_field_assert_no_assert_always_ok() {
+        let f = Field {
+            id: "x".into(),
+            field_type: FieldType::Text,
+            prompt: None,
+            default: None,
+            required: false,
+            source: None,
+            options: vec![],
+            condition: None,
+            assert: None,
+            assert_error: None,
+            validate: Validate::default(),
+        };
+        assert!(check_field_assert(&f, &Map::new()).is_ok());
+    }
+
+    // ── run_wizard end-to-end with assert ────────────────────────────────────
+
+    #[test]
+    fn run_wizard_assert_fails_when_end_before_start() {
+        let wiz = WizardDef::from_str(r#"
+            [[page]]
+            id = "dates"
+            [[page.field]]
+            id = "start"
+            type = "date"
+            required = false
+            [[page.field]]
+            id = "end"
+            type = "date"
+            required = false
+            assert = "${end} >= ${start}"
+            assert_error = "end must be on or after start"
+        "#).unwrap();
+        let mut a = Map::new();
+        a.insert("start".into(), Value::String("2026-12-31".into()));
+        a.insert("end".into(), Value::String("2026-01-01".into()));
+        let r = run_wizard(&wiz, &Catalog::default(), &StaticAnswerer(a), &[]);
+        assert!(
+            matches!(r, Err(EngineError::InvalidInput { .. })),
+            "expected InvalidInput, got: {r:?}"
+        );
+        let msg = r.unwrap_err().to_string();
+        assert!(msg.contains("end must be on or after start"));
+    }
+
+    #[test]
+    fn run_wizard_assert_passes_when_end_after_start() {
+        let wiz = WizardDef::from_str(r#"
+            [[page]]
+            id = "dates"
+            [[page.field]]
+            id = "start"
+            type = "date"
+            required = false
+            [[page.field]]
+            id = "end"
+            type = "date"
+            required = false
+            assert = "${end} >= ${start}"
+            assert_error = "end must be on or after start"
+        "#).unwrap();
+        let mut a = Map::new();
+        a.insert("start".into(), Value::String("2026-01-01".into()));
+        a.insert("end".into(), Value::String("2026-12-31".into()));
+        let r = run_wizard(&wiz, &Catalog::default(), &StaticAnswerer(a), &[]);
+        assert!(r.is_ok(), "expected Ok, got: {r:?}");
+    }
+
+    #[test]
+    fn run_wizard_assert_passes_when_dates_equal() {
+        let wiz = WizardDef::from_str(r#"
+            [[page]]
+            id = "dates"
+            [[page.field]]
+            id = "start"
+            type = "date"
+            required = false
+            [[page.field]]
+            id = "end"
+            type = "date"
+            required = false
+            assert = "${end} >= ${start}"
+        "#).unwrap();
+        let mut a = Map::new();
+        a.insert("start".into(), Value::String("2026-06-15".into()));
+        a.insert("end".into(), Value::String("2026-06-15".into()));
+        assert!(
+            run_wizard(&wiz, &Catalog::default(), &StaticAnswerer(a), &[]).is_ok()
+        );
+    }
+
+    // ── Fix C: blank / missing var skips assert ──────────────────────────────
+
+    const WIZ_DATE_ASSERT: &str = r#"
+        [[page]]
+        id = "dates"
+        [[page.field]]
+        id = "start"
+        type = "date"
+        required = false
+        [[page.field]]
+        id = "end"
+        type = "date"
+        required = false
+        assert = "${end} >= ${start}"
+        assert_error = "end must be on or after start"
+    "#;
+
+    // Bug: omitting the asserted optional field used to spuriously fail headless.
+    #[test]
+    fn run_wizard_omitted_optional_assert_field_succeeds() {
+        let wiz = WizardDef::from_str(WIZ_DATE_ASSERT).unwrap();
+        // Only start provided; end is absent — assert must be skipped.
+        let mut a = Map::new();
+        a.insert("start".into(), Value::String("2026-01-01".into()));
+        let r = run_wizard(&wiz, &Catalog::default(), &StaticAnswerer(a), &[]);
+        assert!(r.is_ok(), "omitted optional field should skip assert: {r:?}");
+    }
+
+    #[test]
+    fn run_wizard_both_present_and_failing_still_errors() {
+        let wiz = WizardDef::from_str(WIZ_DATE_ASSERT).unwrap();
+        let mut a = Map::new();
+        a.insert("start".into(), Value::String("2026-12-31".into()));
+        a.insert("end".into(), Value::String("2026-01-01".into()));
+        let r = run_wizard(&wiz, &Catalog::default(), &StaticAnswerer(a), &[]);
+        assert!(
+            matches!(r, Err(EngineError::InvalidInput { .. })),
+            "both present + relation violated must still error: {r:?}"
+        );
+    }
+
+    #[test]
+    fn check_field_assert_forward_ref_absent_var_is_skipped() {
+        // An assert that references a var not yet in the map should be skipped.
+        let f = make_field_with_assert("end", "End Date", "${end} >= ${start}", None);
+        // `start` is absent — skip.
+        let mut vars = Map::new();
+        vars.insert("end".into(), Value::String("2026-06-01".into()));
+        assert!(
+            check_field_assert(&f, &vars).is_ok(),
+            "forward reference (absent var) must skip the assert"
+        );
+    }
+
+    // ── schema validator: assert ─────────────────────────────────────────────
+
+    #[test]
+    fn schema_rejects_malformed_assert_no_operator() {
+        let wiz = WizardDef::from_str(r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "end"
+            type = "date"
+            assert = "no_operator_here"
+        "#).unwrap();
+        assert!(matches!(
+            validate_wizard_schema(&wiz),
+            Err(EngineError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn schema_rejects_empty_assert() {
+        let wiz = WizardDef::from_str(r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "end"
+            type = "date"
+            assert = "   "
+        "#).unwrap();
+        assert!(matches!(
+            validate_wizard_schema(&wiz),
+            Err(EngineError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn schema_rejects_assert_error_without_assert() {
+        let wiz = WizardDef::from_str(r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "end"
+            type = "date"
+            assert_error = "orphaned message"
+        "#).unwrap();
+        assert!(matches!(
+            validate_wizard_schema(&wiz),
+            Err(EngineError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn schema_accepts_valid_assert() {
+        let wiz = WizardDef::from_str(r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "start"
+            type = "date"
+            required = false
+            [[page.field]]
+            id = "end"
+            type = "date"
+            required = false
+            assert = "${end} >= ${start}"
+            assert_error = "end must be after start"
+        "#).unwrap();
+        assert!(validate_wizard_schema(&wiz).is_ok());
     }
 }
