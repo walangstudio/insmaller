@@ -218,6 +218,16 @@ pub struct Settings {
     /// always honored, and non-`parallel` tasks always run exclusively.
     #[serde(default)]
     pub max_parallel_tasks: usize,
+    /// After `setup` finishes, prompt (default-yes) to run this `[task.*]`, and
+    /// on yes run it in-process with the wizard's collected answers. Absent ⇒
+    /// no prompt. Skipped on non-TTY / `--answers` runs unless `--run` forces
+    /// it; `--no-run` always skips. The named task must exist in `[task.*]`.
+    #[serde(default)]
+    pub setup_then_task: Option<String>,
+    /// Override the prompt shown for `setup_then_task`. `{product}` expands to
+    /// the project name (or `setup_then_task`). Default: `"Run {product} now?"`.
+    #[serde(default)]
+    pub setup_then_task_prompt: Option<String>,
 }
 
 /// Sentinel base resolution. `global` keeps the historical per-user location;
@@ -312,6 +322,8 @@ impl Default for Settings {
             default_args: vec![],
             interactive_tasks: None,
             max_parallel_tasks: 0,
+            setup_then_task: None,
+            setup_then_task_prompt: None,
         }
     }
 }
@@ -593,6 +605,13 @@ impl LoadedConfig {
         Self::validate_desugar(&raw.desugar, &recipes)?;
         let core_prefixes = raw.desugar.iter().map(|d| d.prefix.clone()).collect();
         let tasks = compile_tasks(raw.tasks_raw)?;
+        if let Some(t) = &raw.settings.setup_then_task {
+            if !tasks.contains_key(t) {
+                return Err(EngineError::Config(format!(
+                    "settings.setup_then_task references unknown task '{t}'"
+                )));
+            }
+        }
         Ok(Self {
             settings: raw.settings,
             desugar: raw.desugar,
@@ -784,6 +803,24 @@ mod tests {
         .unwrap();
         assert!(cfg.tasks["a"].parallel);
         assert!(!cfg.tasks["b"].parallel, "default is exclusive");
+    }
+
+    #[test]
+    fn setup_then_task_round_trip_and_validation() {
+        let def = LoadedConfig::from_str("").unwrap();
+        assert!(def.settings.setup_then_task.is_none());
+        // Valid: names a real task.
+        let cfg = LoadedConfig::from_str(
+            "[settings]\nsetup_then_task = \"run\"\n[task.run]\n[[task.run.steps]]\ntype = \"shell\"\nscript = \"x\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.settings.setup_then_task.as_deref(), Some("run"));
+        // Invalid: names a task that doesn't exist → load error.
+        let err = LoadedConfig::from_str("[settings]\nsetup_then_task = \"nope\"\n").unwrap_err();
+        assert!(
+            err.to_string().contains("unknown task 'nope'"),
+            "got: {err}"
+        );
     }
 
     #[test]

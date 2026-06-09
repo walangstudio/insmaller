@@ -3,7 +3,7 @@
 //!   insmaller <key…>            [--config F] [--catalog F] [--dry-run] [--json]
 //!   insmaller install   <key…> [--config F] [--catalog F] [--dry-run] [--json]
 //!   insmaller uninstall <key…> [--config F] [--catalog F] [--dry-run] [--json]
-//!   insmaller setup [--wizard F] [--catalog F] [--config F] [--answers F] [--dry-run]
+//!   insmaller setup [--wizard F] [--catalog F] [--config F] [--answers F] [--dry-run] [--run|--no-run]
 //!   insmaller status [<key>] [--config F] [--json]
 //!
 //! insmaller is an installer: a bare `insmaller <key…>` (no recognized
@@ -23,7 +23,7 @@ use insmaller_core::{
     WizardDef, WizardOutcome, WizardSession,
 };
 use serde_json::{Map, Value};
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -249,7 +249,7 @@ fn resolve_sibling(
 /// assert the basename leaks through to every line.
 fn usage_text(name: &str) -> String {
     format!(
-        "usage:\n  {name} <key…>            [--config F] [--catalog F] [--dry-run] [--json]   (defaults to install)\n  {name} install   <key…> [--config F] [--catalog F] [--dry-run] [--json]\n  {name} uninstall <key…> [--config F] [--catalog F] [--dry-run] [--json] [--force]\n  {name} setup [--wizard F] [--catalog F] [--config F] [--answers F] [--dry-run]\n  {name} task <name…>     [--config F]   (alias: {name} run <name…>)\n  {name} status [<key>]   [--config F] [--json]   (alias: {name} query)\n\n--config: if omitted, the first of insmaller.toml/.insmaller.toml/\ninstaller.toml found in the cwd or any parent dir; failing that, an\ninstaller.toml sitting next to the binary (so an extracted bundle finds its\nown recipe from any cwd); failing that, an app-home location derived from the\nprogram name (e.g. ~/.{name}/installer.toml on POSIX,\n%APPDATA%\\{name}\\installer.toml on Windows).\n--catalog/--wizard default to the config's `[settings] catalog`/`wizard`\n(relative to the config file) if set, else catalog.json/wizard.toml in cwd.\n--force: uninstall even if another installed key still depends on it.\ntask: runs a `[task.<name>]` pipeline (needs first, per-OS, fail-fast)."
+        "usage:\n  {name} <key…>            [--config F] [--catalog F] [--dry-run] [--json]   (defaults to install)\n  {name} install   <key…> [--config F] [--catalog F] [--dry-run] [--json]\n  {name} uninstall <key…> [--config F] [--catalog F] [--dry-run] [--json] [--force]\n  {name} setup [--wizard F] [--catalog F] [--config F] [--answers F] [--dry-run] [--run|--no-run]\n  {name} task <name…>     [--config F]   (alias: {name} run <name…>)\n  {name} status [<key>]   [--config F] [--json]   (alias: {name} query)\n\n--config: if omitted, the first of insmaller.toml/.insmaller.toml/\ninstaller.toml found in the cwd or any parent dir; failing that, an\ninstaller.toml sitting next to the binary (so an extracted bundle finds its\nown recipe from any cwd); failing that, an app-home location derived from the\nprogram name (e.g. ~/.{name}/installer.toml on POSIX,\n%APPDATA%\\{name}\\installer.toml on Windows).\n--catalog/--wizard default to the config's `[settings] catalog`/`wizard`\n(relative to the config file) if set, else catalog.json/wizard.toml in cwd.\n--force: uninstall even if another installed key still depends on it.\ntask: runs a `[task.<name>]` pipeline (needs first, per-OS, fail-fast)."
     )
 }
 
@@ -508,6 +508,96 @@ async fn cmd_op(a: &[String], op: Op, name: &str) -> ExitCode {
     }
 }
 
+/// `setup_then_task`: after `setup` finishes, optionally prompt (default-yes)
+/// and run a lifecycle task in-process with the wizard's collected answers.
+/// `interactive` is the TTY context (the wizard TUI ran); on a non-TTY run we
+/// only proceed if `--run` was passed. `--no-run` always skips. Returns the
+/// task's exit code (so a failed run surfaces), or SUCCESS when nothing ran.
+async fn maybe_run_then_task(
+    a: &[String],
+    cfg: &LoadedConfig,
+    vars: &Map<String, Value>,
+    interactive: bool,
+) -> ExitCode {
+    let Some(task) = cfg.settings.setup_then_task.clone() else {
+        return ExitCode::SUCCESS;
+    };
+    if has(a, "--no-run") {
+        return ExitCode::SUCCESS;
+    }
+    let forced = has(a, "--run");
+    // Non-interactive (e.g. --answers / piped) only auto-runs when forced.
+    if !interactive && !forced {
+        return ExitCode::SUCCESS;
+    }
+    if !cfg.tasks.contains_key(&task) {
+        // setup itself succeeded; a misconfigured hook shouldn't fail it.
+        eprintln!("setup_then_task: no such task '{task}' — skipping");
+        return ExitCode::SUCCESS;
+    }
+    if !forced {
+        let product = cfg
+            .project
+            .as_ref()
+            .and_then(|p| p.name.clone())
+            .unwrap_or_else(|| task.clone());
+        let prompt = cfg
+            .settings
+            .setup_then_task_prompt
+            .clone()
+            .unwrap_or_else(|| "Run {product} now?".to_string())
+            .replace("{product}", &product);
+        print!("{prompt} [Y/n] ");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            return ExitCode::SUCCESS;
+        }
+        match line.trim().to_lowercase().as_str() {
+            "n" | "no" => return ExitCode::SUCCESS,
+            _ => {}
+        }
+    }
+    // run_vars: wizard answers win, then project.extra, then env, then exe vars
+    // (mirrors cmd_task so the task templates resolve identically).
+    let mut run_vars: Map<String, Value> = Map::new();
+    for (k, v) in vars {
+        run_vars.insert(k.clone(), v.clone());
+    }
+    if let Some(proj) = cfg.project.as_ref() {
+        for (k, v) in &proj.extra {
+            run_vars
+                .entry(k.clone())
+                .or_insert_with(|| Value::String(v.clone()));
+        }
+    }
+    for (k, v) in std::env::vars() {
+        run_vars.entry(k).or_insert(Value::String(v));
+    }
+    inject_exe_vars(&mut run_vars, std::env::current_exe().ok());
+    let mut reg = builtins(&cfg.settings);
+    insmaller_core::register_external(&mut reg, &cfg.plugins);
+    let resolver = make_resolver(&cfg.settings, ResolverPurpose::Task);
+    match insmaller_core::run_tasks(
+        &[task],
+        cfg,
+        &reg,
+        &StdoutReporter,
+        resolver.as_ref(),
+        &run_vars,
+        cfg.settings.max_parallel_tasks,
+        false,
+    )
+    .await
+    {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("task failed: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 async fn cmd_setup(a: &[String], name: &str) -> ExitCode {
     let cfg_p = discover_config(opt_opt(a, "--config"), name);
     let wiz_flag = opt_opt(a, "--wizard");
@@ -669,13 +759,13 @@ async fn cmd_setup(a: &[String], name: &str) -> ExitCode {
             println!("No packages to install (answers recorded above).");
         }
         render_outro();
-        return ExitCode::SUCCESS;
+        return maybe_run_then_task(a, &cfg, &outcome.vars, tui_used).await;
     }
     // config-only consumers (install runs in their container/target): stop after
     // setup_output + outro, run zero host install scripts.
     if cfg.settings.setup_writes_config_only {
         render_outro();
-        return ExitCode::SUCCESS;
+        return maybe_run_then_task(a, &cfg, &outcome.vars, tui_used).await;
     }
     let dry_run = has(a, "--dry-run");
     // An interactively-run setup (the wizard TUI was used) is a TTY context
@@ -709,6 +799,9 @@ async fn cmd_setup(a: &[String], name: &str) -> ExitCode {
         .await;
         let code = summarize(&s, verb);
         render_outro();
+        if s.failed.is_empty() {
+            return maybe_run_then_task(a, &cfg, &outcome.vars, tui_used).await;
+        }
         return code;
     }
     // tui_used + interactive_tasks == Some(false): env-only, so no prompt can
@@ -731,6 +824,9 @@ async fn cmd_setup(a: &[String], name: &str) -> ExitCode {
     bar.finish();
     let code = summarize(&s, verb);
     render_outro();
+    if s.failed.is_empty() {
+        return maybe_run_then_task(a, &cfg, &outcome.vars, tui_used).await;
+    }
     code
 }
 
