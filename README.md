@@ -3,7 +3,7 @@
 ![version](https://img.shields.io/github/v/release/walangstudio/insmaller?sort=semver&color=blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![rust](https://img.shields.io/badge/rust-1.95-orange)
-![tests](https://img.shields.io/badge/tests-542%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-547%20passing-brightgreen)
 
 <sub>*(it's "insmaller" — "inshorter" just didn't sound right.)*</sub>
 
@@ -180,10 +180,10 @@ an ASCII banner, emoji, or ANSI color.
 version   = "0.1.0"
 copyright = "© 2026 walang.studio"
 version_template = """
-{{ name | bold | cyan }} {{ version }} 🐾
-{{ about }}
+{{ name | gradient("818cf8", "f472b6") | bold }} {{ version }} 🐾
+{{ about | dim }}
 {{ copyright }} · {{ extra.license }}
-engine: insmaller {{ engine_version }}
+{{ ("engine: insmaller " ~ engine_version) | gray }}
 """
 
 [project.extra]
@@ -192,12 +192,18 @@ license = "MIT"
 
 Template vars: `name` (the program/binary name), `version`, `engine_version`
 (insmaller's own version), `about`, `copyright`, and every `[project.extra]`
-key under `extra.<key>`. Style filters — `bold`, `dim`, `italic`, `underline`,
-and `black`/`red`/`green`/`yellow`/`blue`/`magenta`/`cyan`/`white`/`gray` —
-emit ANSI when stdout is a TTY and `NO_COLOR` is unset, and pass through
-otherwise (clean text when piped). Filters stack: `{{ name | bold | cyan }}`.
-A broken template falls back to `<name> <engine_version>`. Requires insmaller
->= 0.10.0.
+key under `extra.<key>`. Style filters emit ANSI when stdout is a TTY and
+`NO_COLOR` is unset, and pass through otherwise (clean text when piped). They
+stack (`{{ name | gradient("818cf8","f472b6") | bold }}`):
+
+- named: `bold`, `dim`, `italic`, `underline`, and
+  `black`/`red`/`green`/`yellow`/`blue`/`magenta`/`cyan`/`white`/`gray`.
+- truecolor (insmaller >= 0.11.0): `rgb("rrggbb")` (solid 24-bit) and
+  `gradient("from","to")` (per-character lerp; chain `| bold` to keep bold
+  across the run).
+
+A broken template falls back to `<name> <engine_version>`, so `--version` never
+fails. Requires insmaller >= 0.10.0 (truecolor filters >= 0.11.0).
 
 ### Cross-field validation
 
@@ -300,7 +306,7 @@ installer can trip AV heuristics and how to reduce it.
 
 ## Status
 
-The engine is built and passing: `cargo test --workspace` is 542 tests, no
+The engine is built and passing: `cargo test --workspace` is 547 tests, no
 failures, no ignored, clippy clean. It works on its own through the CLI today.
 
 The optional native plugin transport builds with `--features cdylib`. The WASM

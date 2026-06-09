@@ -1407,10 +1407,16 @@ impl<'a> WizardSession<'a> {
 
     fn active(&self, i: usize) -> bool {
         self.def.pages.get(i).is_some_and(|p| {
-            p.condition
+            let cond_ok = p
+                .condition
                 .as_deref()
                 .map(|c| eval_condition(c, &self.vars))
-                .unwrap_or(true)
+                .unwrap_or(true);
+            // Skip a page that declared fields but has none left after gating /
+            // `selected.inputs` expansion (e.g. a keyless CLI on an API-keys
+            // page renders blank otherwise). Info-only pages — no declared
+            // fields at all — stay visible.
+            cond_ok && (p.fields.is_empty() || !self.fields_of(p).is_empty())
         })
     }
     fn next_active_from(&self, start: usize) -> Option<usize> {
@@ -1432,9 +1438,14 @@ impl<'a> WizardSession<'a> {
     /// own `condition`). Returns owned fields because synthetic ones are not
     /// part of `WizardDef`.
     pub fn fields(&self) -> Vec<Field> {
-        let Some(p) = self.current() else {
-            return Vec::new();
-        };
+        self.current().map(|p| self.fields_of(p)).unwrap_or_default()
+    }
+
+    /// Visible fields of a given page — field conditions applied, and a
+    /// `selected.inputs` field expanded into one synthetic field per declared
+    /// input of the currently-selected entries. Page-agnostic (does not read
+    /// `self.idx`) so `active()` can test any page for emptiness.
+    fn fields_of(&self, p: &Page) -> Vec<Field> {
         let mut out: Vec<Field> = Vec::new();
         for f in &p.fields {
             if f.condition
@@ -1648,6 +1659,54 @@ mod tests {
         .unwrap();
         assert_eq!(o.selected_keys, vec!["node"]);
         assert!(o.vars.get("OPENAI_API_KEY").is_none());
+    }
+
+    #[test]
+    fn page_with_empty_selected_inputs_is_skipped() {
+        // 'kilo' needs no key; 'pi' needs ANTHROPIC_API_KEY. An api-keys page
+        // sourced from selected.inputs must be skipped (not rendered blank) for
+        // a keyless CLI, and shown for one that declares an input.
+        let c = Catalog::from_json_str(
+            r#"{ "clis":[
+              {"key":"kilo","install":"npm:x"},
+              {"key":"pi","install":"npm:y","requires_input":[
+                {"id":"ANTHROPIC_API_KEY","type":"secret","required":false}]}
+            ]}"#,
+        )
+        .unwrap();
+        let wiz = r#"
+            [[page]]
+            id = "cli"
+            [[page.field]]
+            id = "CODING_CLI"
+            type = "single_select"
+            source = "catalog.clis"
+
+            [[page]]
+            id = "api_keys"
+            [[page.field]]
+            id = "_api_keys"
+            type = "text"
+            source = "selected.inputs"
+        "#;
+        let d = WizardDef::from_str(wiz).unwrap();
+
+        // keyless CLI → api_keys page has zero fields → skipped → done.
+        let mut s = WizardSession::new(&d, &c, vec![]);
+        assert_eq!(s.current().unwrap().id, "cli");
+        let mut pick = Map::new();
+        pick.insert("CODING_CLI".into(), Value::String("kilo".into()));
+        s.submit(pick).unwrap();
+        assert!(s.is_done(), "blank api_keys page must be skipped for kilo");
+
+        // CLI that declares an input → api_keys page shows that one field.
+        let mut s2 = WizardSession::new(&d, &c, vec![]);
+        let mut pick2 = Map::new();
+        pick2.insert("CODING_CLI".into(), Value::String("pi".into()));
+        s2.submit(pick2).unwrap();
+        assert_eq!(s2.current().unwrap().id, "api_keys");
+        assert_eq!(s2.fields().len(), 1);
+        assert_eq!(s2.fields()[0].id, "ANTHROPIC_API_KEY");
     }
 
     #[test]
