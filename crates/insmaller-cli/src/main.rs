@@ -265,7 +265,15 @@ async fn main() -> ExitCode {
             "task" | "run" => return cmd_task(&args[1..], &name).await,
             "status" | "query" => return cmd_status(&args[1..], &name).await,
             "-V" | "--version" | "version" => {
-                println!("{name} {}", env!("CARGO_PKG_VERSION"));
+                let engine_version = env!("CARGO_PKG_VERSION");
+                let color =
+                    std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+                let path = discover_config(None, &name);
+                let project = insmaller_core::probe_project_meta(Path::new(&path));
+                println!(
+                    "{}",
+                    insmaller_core::render_about(project.as_ref(), &name, engine_version, color)
+                );
                 return ExitCode::SUCCESS;
             }
             "-h" | "--help" | "help" => {

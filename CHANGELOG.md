@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.10.0] - 2026-06-09
+
+### Added
+- **App version + `--version` about block, decoupled from the engine version.**
+  `[project] version` sets the app's own version; `--version` then prints
+  `<name> <version> (insmaller <engine_version>)` instead of the bare engine
+  version. The whole block is overridable with `[project] version_template`
+  (minijinja) — vars: `name`, `version`, `engine_version`, `about`, `copyright`,
+  and every `[project.extra]` key under `extra.<key>`. Style filters (`bold`,
+  `dim`, `italic`, `underline`, and the eight named colors + `gray`) emit ANSI
+  when stdout is a TTY and `NO_COLOR` is unset, else pass through; filters stack
+  (`{{ name | bold | cyan }}`). Emoji is just UTF-8 in the template. A broken
+  template falls back to `<name> <engine_version>`, so `--version` never fails.
+
+### Internal
+- New `insmaller_core::about` module (`probe_project_meta` + `render_about`);
+  `--version` best-effort reads only `[project]` from the discovered config
+  (tolerant parse — a malformed-but-present config can't break `--version`).
+
 ## [0.9.0] - 2026-06-09
 
 ### Added

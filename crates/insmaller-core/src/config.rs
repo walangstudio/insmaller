@@ -32,6 +32,19 @@ pub struct EngineConfig {
 pub struct ProjectMeta {
     #[serde(default)]
     pub name: Option<String>,
+    /// App version shown by `--version`, independent of the engine's own
+    /// (`CARGO_PKG_VERSION`). When unset, `--version` shows the engine version.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Copyright/legal line exposed to `version_template` as `{{ copyright }}`.
+    #[serde(default)]
+    pub copyright: Option<String>,
+    /// minijinja template for the `--version`/about block. Vars: `name`,
+    /// `version`, `engine_version`, `about`, `copyright`, and `extra.<key>`.
+    /// Style filters (`bold`/`dim`/`red`/`cyan`/…) emit ANSI when stdout is a
+    /// TTY and `NO_COLOR` is unset, else pass through.
+    #[serde(default)]
+    pub version_template: Option<String>,
     #[serde(default)]
     pub about: Option<String>,
     #[serde(default)]
