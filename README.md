@@ -3,7 +3,7 @@
 ![version](https://img.shields.io/github/v/release/walangstudio/insmaller?sort=semver&color=blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![rust](https://img.shields.io/badge/rust-1.95-orange)
-![tests](https://img.shields.io/badge/tests-535%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-542%20passing-brightgreen)
 
 <sub>*(it's "insmaller" — "inshorter" just didn't sound right.)*</sub>
 
@@ -168,6 +168,37 @@ runs it is skipped unless `--run` is passed; `--no-run` always skips. A
 `setup_then_task` that names a non-existent task is rejected at config load.
 Requires insmaller >= 0.9.0.
 
+### `[project]` version / about block — custom `--version`
+
+`--version` (and `-V`) prints the app's own version, not the engine's. Set
+`[project] version` and it shows `<name> <version> (insmaller <engine_version>)`.
+Override the whole block with a `version_template` (minijinja) for copyright,
+an ASCII banner, emoji, or ANSI color.
+
+```toml
+[project]
+version   = "0.1.0"
+copyright = "© 2026 walang.studio"
+version_template = """
+{{ name | bold | cyan }} {{ version }} 🐾
+{{ about }}
+{{ copyright }} · {{ extra.license }}
+engine: insmaller {{ engine_version }}
+"""
+
+[project.extra]
+license = "MIT"
+```
+
+Template vars: `name` (the program/binary name), `version`, `engine_version`
+(insmaller's own version), `about`, `copyright`, and every `[project.extra]`
+key under `extra.<key>`. Style filters — `bold`, `dim`, `italic`, `underline`,
+and `black`/`red`/`green`/`yellow`/`blue`/`magenta`/`cyan`/`white`/`gray` —
+emit ANSI when stdout is a TTY and `NO_COLOR` is unset, and pass through
+otherwise (clean text when piped). Filters stack: `{{ name | bold | cyan }}`.
+A broken template falls back to `<name> <engine_version>`. Requires insmaller
+>= 0.10.0.
+
 ### Cross-field validation
 
 Any field can carry `assert` and `assert_error` to compare its value against
@@ -269,7 +300,7 @@ installer can trip AV heuristics and how to reduce it.
 
 ## Status
 
-The engine is built and passing: `cargo test --workspace` is 535 tests, no
+The engine is built and passing: `cargo test --workspace` is 542 tests, no
 failures, no ignored, clippy clean. It works on its own through the CLI today.
 
 The optional native plugin transport builds with `--features cdylib`. The WASM
