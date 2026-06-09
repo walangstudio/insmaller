@@ -3,7 +3,7 @@
 ![version](https://img.shields.io/github/v/release/walangstudio/insmaller?sort=semver&color=blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![rust](https://img.shields.io/badge/rust-1.95-orange)
-![tests](https://img.shields.io/badge/tests-547%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-548%20passing-brightgreen)
 
 <sub>*(it's "insmaller" — "inshorter" just didn't sound right.)*</sub>
 
@@ -168,6 +168,21 @@ runs it is skipped unless `--run` is passed; `--no-run` always skips. A
 `setup_then_task` that names a non-existent task is rejected at config load.
 Requires insmaller >= 0.9.0.
 
+### Wizard review page
+
+A `[[page]]` with `review = true` and no fields renders a read-only summary of
+every collected answer (secrets masked) as a final step — Enter confirms and
+finishes, ← / Esc goes back to edit. Put it last:
+
+```toml
+[[page]]
+id = "review"
+title = "Review"
+review = true
+```
+
+Requires insmaller >= 0.12.0.
+
 ### `[project]` version / about block — custom `--version`
 
 `--version` (and `-V`) prints the app's own version, not the engine's. Set
@@ -198,12 +213,12 @@ stack (`{{ name | gradient("818cf8","f472b6") | bold }}`):
 
 - named: `bold`, `dim`, `italic`, `underline`, and
   `black`/`red`/`green`/`yellow`/`blue`/`magenta`/`cyan`/`white`/`gray`.
-- truecolor (insmaller >= 0.11.0): `rgb("rrggbb")` (solid 24-bit) and
+- truecolor (insmaller >= 0.12.0): `rgb("rrggbb")` (solid 24-bit) and
   `gradient("from","to")` (per-character lerp; chain `| bold` to keep bold
   across the run).
 
 A broken template falls back to `<name> <engine_version>`, so `--version` never
-fails. Requires insmaller >= 0.10.0 (truecolor filters >= 0.11.0).
+fails. Requires insmaller >= 0.10.0 (truecolor filters >= 0.12.0).
 
 ### Cross-field validation
 
@@ -306,7 +321,7 @@ installer can trip AV heuristics and how to reduce it.
 
 ## Status
 
-The engine is built and passing: `cargo test --workspace` is 547 tests, no
+The engine is built and passing: `cargo test --workspace` is 548 tests, no
 failures, no ignored, clippy clean. It works on its own through the CLI today.
 
 The optional native plugin transport builds with `--features cdylib`. The WASM
