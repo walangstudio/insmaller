@@ -3,7 +3,7 @@
 ![version](https://img.shields.io/github/v/release/walangstudio/insmaller?sort=semver&color=blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![rust](https://img.shields.io/badge/rust-1.95-orange)
-![tests](https://img.shields.io/badge/tests-534%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-535%20passing-brightgreen)
 
 <sub>*(it's "insmaller" — "inshorter" just didn't sound right.)*</sub>
 
@@ -68,7 +68,8 @@ Beyond installing, the config can declare: per-entry `condition` (offer/skip an
 entry on a predicate); `requires_input` on an entry plus a `selected.inputs`
 wizard page that collects the union of declared inputs of the selection;
 `[settings.setup_output]` to emit the resolved vars to a single env file
-atomically; named `[task.*]` lifecycle pipelines (`insmaller task <name>`) with
+atomically; `[settings] setup_then_task` to end `setup` with a default-yes
+"run this task now?" prompt (see below); named `[task.*]` lifecycle pipelines (`insmaller task <name>`) with
 `needs` ordering, per-task `parallel`/`when`/`unless`, and per-OS step
 overrides; field validators (`pattern`, `format`, `min`/`max`,
 `min_length`/`max_length`); field-level API validation (`[page.field.api]`); and
@@ -147,6 +148,25 @@ leaf under an existing parent is accepted.
 
 **Dropdown search.** The popup opens with a `Search:` line; typing filters the
 list in real time; `[no matches]` shown when nothing matches.
+
+### `[settings] setup_then_task` — run a task right after setup
+
+End `setup` with a default-yes prompt that runs a lifecycle task in-process,
+carrying the wizard's answers into it — so a single `setup` flows straight into
+"start it now" without a second command.
+
+```toml
+[settings]
+setup_then_task = "run"            # must name a real [task.*]
+setup_then_task_prompt = "Run {product} now?"   # optional; {product} = project.name
+```
+
+On an interactive TTY, after the wizard + outro the engine prints
+`Run <product> now? [Y/n]` (Enter or `y` = yes, `n` = skip) and, on yes, runs
+the task with the collected answers as task vars. On non-TTY / `--answers`
+runs it is skipped unless `--run` is passed; `--no-run` always skips. A
+`setup_then_task` that names a non-existent task is rejected at config load.
+Requires insmaller >= 0.9.0.
 
 ### Cross-field validation
 
@@ -249,7 +269,7 @@ installer can trip AV heuristics and how to reduce it.
 
 ## Status
 
-The engine is built and passing: `cargo test --workspace` is 283 tests, no
+The engine is built and passing: `cargo test --workspace` is 535 tests, no
 failures, no ignored, clippy clean. It works on its own through the CLI today.
 
 The optional native plugin transport builds with `--features cdylib`. The WASM
