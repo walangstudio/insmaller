@@ -12,6 +12,7 @@
 //! Build order: B1 core model (this) → B2 config/desugar → B3 processors →
 //! B4 orchestrator/sentinel → B5 EntrySource + e2e.
 
+pub mod about;
 pub mod config;
 pub mod ctx;
 pub mod desugar;
@@ -32,6 +33,7 @@ pub mod step;
 pub mod tasks;
 pub mod wizard;
 
+pub use about::{probe_project_meta, render_about};
 pub use config::{
     peek_dispatch_settings, CompiledTask, EngineConfig, LoadedConfig, OutputFormat, ParseKind,
     ProjectMeta, Recipe, SentinelScope, Settings, SetupOutput, TaskDef, ThemeColors,
