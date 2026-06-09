@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.9.0] - 2026-06-09
+
+### Added
+- **`[settings] setup_then_task`.** After `setup` finishes (including the
+  `setup_writes_config_only` path), the engine can end with a default-yes
+  `Run <product> now? [Y/n]` prompt and, on yes, run the named `[task.*]`
+  in-process with the wizard's collected answers as task vars. The prompt text
+  is overridable via `[settings] setup_then_task_prompt` (`{product}` expands to
+  `project.name`). Skipped on non-TTY / `--answers` runs unless the new `--run`
+  flag forces it; the new `--no-run` flag always skips. A `setup_then_task` that
+  names a task absent from `[task.*]` is rejected at config load.
+
+### Internal
+- `cmd_setup` runs the hook at every success exit (no-packages, config-only, and
+  both install paths), gating the install paths on a clean summary so a failed
+  install never auto-runs the follow-up task.
+
 ## [0.8.0] - 2026-06-03
 
 ### Added
