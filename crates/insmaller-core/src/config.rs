@@ -231,6 +231,14 @@ pub struct Settings {
     /// always honored, and non-`parallel` tasks always run exclusively.
     #[serde(default)]
     pub max_parallel_tasks: usize,
+    /// Path (may contain `${VAR}` wizard-variable placeholders) to an env-format
+    /// file whose `KEY=value` entries are used as **default overrides** for
+    /// matching wizard fields (prefill-on-edit).  Resolved lazily once all
+    /// `${VAR}`s in the path accumulate non-empty values from prior pages.
+    /// Missing file is a no-op (supports new-container flow where the file
+    /// doesn't exist yet).  Engines before v0.13.0 ignore this key.
+    #[serde(default)]
+    pub defaults_from_file: Option<String>,
     /// After `setup` finishes, prompt (default-yes) to run this `[task.*]`, and
     /// on yes run it in-process with the wizard's collected answers. Absent ⇒
     /// no prompt. Skipped on non-TTY / `--answers` runs unless `--run` forces
@@ -335,6 +343,7 @@ impl Default for Settings {
             default_args: vec![],
             interactive_tasks: None,
             max_parallel_tasks: 0,
+            defaults_from_file: None,
             setup_then_task: None,
             setup_then_task_prompt: None,
         }
@@ -880,6 +889,23 @@ mod tests {
         assert!(peek_dispatch_settings("[settings]\ndefault_args = [123]\n").is_err());
         // Strict: a non-string default_command is a type error.
         assert!(peek_dispatch_settings("[settings]\ndefault_command = 42\n").is_err());
+    }
+
+    #[test]
+    fn defaults_from_file_round_trip_and_default_none() {
+        let def = LoadedConfig::from_str("").unwrap();
+        assert!(def.settings.defaults_from_file.is_none());
+        let cfg = LoadedConfig::from_str(
+            r#"
+            [settings]
+            defaults_from_file = "~/.app/containers/${CONTAINER_NAME}.env"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.settings.defaults_from_file.as_deref(),
+            Some("~/.app/containers/${CONTAINER_NAME}.env")
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@
 ![version](https://img.shields.io/github/v/release/walangstudio/insmaller?sort=semver&color=blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![rust](https://img.shields.io/badge/rust-1.95-orange)
-![tests](https://img.shields.io/badge/tests-548%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-569%20passing-brightgreen)
 
 <sub>*(it's "insmaller" — "inshorter" just didn't sound right.)*</sub>
 
@@ -321,7 +321,7 @@ installer can trip AV heuristics and how to reduce it.
 
 ## Status
 
-The engine is built and passing: `cargo test --workspace` is 548 tests, no
+The engine is built and passing: `cargo test --workspace` is 569 tests, no
 failures, no ignored, clippy clean. It works on its own through the CLI today.
 
 The optional native plugin transport builds with `--features cdylib`. The WASM
