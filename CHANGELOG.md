@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.14.0] - 2026-06-10
+
+### Added
+- **Per-entry catalog `uninstall`.** A catalog entry may declare an `uninstall`
+  shell command, run by `uninstall <key>` in addition to any recipe uninstall.
+  This covers entries installed via a bare `install = "curl … | bash"` (the
+  `shell-pipe` recipe, which has no uninstall) — they previously cleared their
+  sentinel without removing the installed binary. The command runs as a real
+  `shell` step (so it gets the full step machinery) before the sentinel is
+  cleared, so a failed uninstall leaves the sentinel for a later retry.
+
 ## [0.13.0] - 2026-06-10
 
 ### Added
