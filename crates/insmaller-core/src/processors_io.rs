@@ -155,15 +155,55 @@ fn render_env_body(
     out
 }
 
+/// Expand `${VAR}` (and `{{ VAR }}`) placeholders in `template` using `vars`.
+/// Errors if a referenced variable is undefined, so a missing var fails loudly
+/// instead of silently producing a wrong path — e.g. an unset `${CONTAINER_NAME}`
+/// must NOT collapse to `~/.app/containers/.env` and overwrite the wrong slot.
+fn expand_vars(template: &str, vars: &serde_json::Map<String, serde_json::Value>) -> Result<String> {
+    use minijinja::{Environment, UndefinedBehavior};
+    let mut env = Environment::new();
+    env.set_undefined_behavior(UndefinedBehavior::Strict);
+    // Convert ${VAR} to {{ VAR }} so minijinja can render it, but also accept
+    // {{ VAR }} directly.  We do the ${} → {{}} substitution first so both
+    // syntaxes work in the same string.
+    let jinja_template = {
+        let mut out = String::with_capacity(template.len());
+        let mut rest = template;
+        while let Some(start) = rest.find("${") {
+            out.push_str(&rest[..start]);
+            rest = &rest[start + 2..];
+            if let Some(end) = rest.find('}') {
+                let name = &rest[..end];
+                out.push_str("{{ ");
+                out.push_str(name);
+                out.push_str(" }}");
+                rest = &rest[end + 1..];
+            } else {
+                // Malformed ${…} — pass through literally.
+                out.push_str("${");
+            }
+        }
+        out.push_str(rest);
+        out
+    };
+    env.render_str(&jinja_template, vars).with_context(|| {
+        format!("setup_output path template '{template}' references an undefined variable")
+    })
+}
+
 /// Render the resolved vars to the configured setup-output file. Used by the
 /// CLI after the wizard; the `write_env` processor reuses the same core so a
 /// recipe can compose it too. Absent config is a no-op (caller-checked).
+///
+/// `so.path` is rendered against `vars` before home-expansion, so
+/// `~/.app/containers/{{ CONTAINER_NAME }}.env` resolves correctly.
 pub fn write_setup_output(
     so: &crate::config::SetupOutput,
     vars: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<()> {
     let crate::config::OutputFormat::Env = so.format;
-    let path = expand_home(&so.path)?;
+    let rendered_path = expand_vars(&so.path, vars)?;
+    let path = expand_home(&rendered_path)?;
     let body = render_env_body(vars, so.header.as_deref(), so.include.as_deref());
     atomic_write(Path::new(&path), body.as_bytes(), so.mode)
         .with_context(|| format!("write_setup_output {path}"))?;
@@ -1263,6 +1303,49 @@ mod tests {
 
     fn jmap(pairs: &[(&str, serde_json::Value)]) -> serde_json::Map<String, serde_json::Value> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+    }
+
+    #[test]
+    fn expand_vars_substitutes_dollar_brace_and_jinja_syntax() {
+        let vars = jmap(&[("CONTAINER_NAME", serde_json::json!("work-claude"))]);
+        // ${VAR} syntax
+        let result = super::expand_vars("~/.app/containers/${CONTAINER_NAME}.env", &vars).unwrap();
+        assert_eq!(result, "~/.app/containers/work-claude.env");
+        // {{ VAR }} syntax
+        let result2 =
+            super::expand_vars("~/.app/containers/{{ CONTAINER_NAME }}.env", &vars).unwrap();
+        assert_eq!(result2, "~/.app/containers/work-claude.env");
+    }
+
+    #[test]
+    fn expand_vars_errors_on_undefined_var() {
+        // A missing var must fail loudly, NOT silently collapse to "" and write
+        // a wrong path (~/.app/.env). Guards against overwriting the wrong slot.
+        let err = super::expand_vars("~/.app/${MISSING}.env", &serde_json::Map::new());
+        assert!(err.is_err(), "undefined var must be an error, not a silent empty");
+    }
+
+    #[test]
+    fn write_setup_output_path_template_rendered_from_vars() {
+        let dir = tempfile::tempdir().unwrap();
+        // Use an absolute path so home-expansion does not interfere.
+        let expected = dir.path().join("work-claude.env");
+        let path_template = format!("{}/{{{{ CONTAINER_NAME }}}}.env", p(dir.path()));
+        let so = crate::config::SetupOutput {
+            path: path_template,
+            format: crate::config::OutputFormat::Env,
+            header: None,
+            include: None,
+            mode: None,
+        };
+        let vars = jmap(&[
+            ("CONTAINER_NAME", serde_json::json!("work-claude")),
+            ("TOKEN", serde_json::json!("abc")),
+        ]);
+        write_setup_output(&so, &vars).unwrap();
+        assert!(expected.exists(), "rendered path must exist");
+        let body = std::fs::read_to_string(&expected).unwrap();
+        assert!(body.contains("TOKEN=abc"));
     }
 
     #[test]

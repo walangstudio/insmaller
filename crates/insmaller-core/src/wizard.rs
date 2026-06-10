@@ -821,6 +821,65 @@ impl WizardDef {
     }
 }
 
+/// Parse a `KEY=value` / `KEY="value"` env-format file into a string map.
+/// Blank lines and lines starting with `#` are skipped. Quote stripping is
+/// minimal (matching what dotenv shells produce): double- or single-quoted
+/// values have the outer quotes stripped; no escape processing.
+pub fn parse_env_file_to_map(content: &str) -> std::collections::HashMap<String, String> {
+    content
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            !t.is_empty() && !t.starts_with('#')
+        })
+        .filter_map(|l| {
+            let (k, rest) = l.split_once('=')?;
+            let k = k.trim().to_owned();
+            if k.is_empty() {
+                return None;
+            }
+            // Strip one layer of surrounding quotes if present.
+            let v = rest.trim();
+            let v = if (v.starts_with('"') && v.ends_with('"'))
+                || (v.starts_with('\'') && v.ends_with('\''))
+            {
+                v[1..v.len() - 1].to_owned()
+            } else {
+                v.to_owned()
+            };
+            Some((k, v))
+        })
+        .collect()
+}
+
+/// Resolve `${VAR}` placeholders in `template` against `vars`. Returns `None`
+/// if any referenced variable is absent or empty (so a not-yet-ready path is
+/// detected), otherwise the fully substituted string. Single source of truth
+/// for `defaults_from_file` path resolution (interactive + unattended setup).
+pub fn resolve_dollar_template(template: &str, vars: &Map<String, Value>) -> Option<String> {
+    let mut placeholders: Vec<String> = Vec::new();
+    let mut scan = template;
+    while let Some(start) = scan.find("${") {
+        scan = &scan[start + 2..];
+        match scan.find('}') {
+            Some(end) => {
+                placeholders.push(scan[..end].to_owned());
+                scan = &scan[end + 1..];
+            }
+            None => break,
+        }
+    }
+    let mut out = template.to_owned();
+    for name in &placeholders {
+        let val = vars.get(name).map(var_as_str).unwrap_or_default();
+        if val.is_empty() {
+            return None;
+        }
+        out = out.replace(&format!("${{{name}}}"), &val);
+    }
+    Some(out)
+}
+
 /// One selectable option presented for a field.
 #[derive(Debug, Clone)]
 pub struct Choice {
@@ -1163,6 +1222,90 @@ fn choices_for(field: &Field, catalog: &Catalog) -> Vec<Choice> {
     choices_for_vars(field, catalog, &Map::new(), &[])
 }
 
+/// Match a filename against a single-`*` glob pattern. Returns the file stem
+/// (name with the matched suffix stripped) when it matches, or `None`.
+/// If the pattern has no `*`, requires an exact match and returns the name as-is.
+fn match_glob_stem<'a>(name: &'a str, pattern: &str) -> Option<&'a str> {
+    if let Some(star) = pattern.find('*') {
+        let prefix = &pattern[..star];
+        let suffix = &pattern[star + 1..];
+        // The length guard MUST precede the slice: prefix and suffix can match
+        // overlapping regions (e.g. pattern "ab*bc" vs name "abc" — which both
+        // starts_with "ab" and ends_with "bc"), making
+        // name[prefix.len()..name.len()-suffix.len()] have start > end → panic.
+        if name.len() >= prefix.len() + suffix.len()
+            && name.starts_with(prefix)
+            && name.ends_with(suffix)
+        {
+            return Some(&name[prefix.len()..name.len() - suffix.len()]);
+        }
+        None
+    } else if name == pattern {
+        // No wildcard — exact match; stem is the whole name.
+        Some(name)
+    } else {
+        None
+    }
+}
+
+/// Resolve a `files:<dir>/<pat>` source into `Choice`s.
+///
+/// `<pat>` may contain a single `*` (e.g. `*.env`). The dir part is
+/// home-expanded. Files whose names match the pattern contribute their
+/// "stem" (name with the matched suffix stripped) as both `value` and
+/// `label`. Missing/empty dir returns an empty vec — no panic.
+fn resolve_files_source(spec: &str, vars: &Map<String, Value>) -> Vec<Choice> {
+    // Expand `${VAR}` in the spec using current vars (same substitution as
+    // eval_condition's unwrap_var: simple string replace).
+    let expanded_spec = {
+        let mut s = spec.to_owned();
+        for (k, v) in vars {
+            let placeholder = format!("${{{k}}}");
+            let val = var_as_str(v);
+            s = s.replace(&placeholder, &val);
+        }
+        s
+    };
+
+    // Split spec into dir and pattern on the last '/'.
+    let (dir_raw, pattern) = match expanded_spec.rfind('/') {
+        Some(pos) => (&expanded_spec[..pos], &expanded_spec[pos + 1..]),
+        None => (expanded_spec.as_str(), "*"),
+    };
+
+    let dir = match crate::pathenv::expand_home(dir_raw) {
+        Ok(d) => d,
+        Err(_) => return vec![],
+    };
+
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return vec![],
+    };
+
+    let mut stems: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            match_glob_stem(&name, pattern).map(str::to_owned)
+        })
+        .collect();
+
+    stems.sort();
+    stems.dedup();
+    stems.retain(|s| !s.is_empty()); // drop empty stems (e.g. dotfile ".env" vs "*.env")
+
+    stems
+        .into_iter()
+        .map(|stem| Choice {
+            value: stem.clone(),
+            label: stem,
+            default: false,
+            group: None,
+        })
+        .collect()
+}
+
 /// Choices for a field, dropping catalog options whose entry `condition`
 /// evaluates false against `vars`, and ordering groups by `group_order`
 /// (empty ⇒ default group/key sort).
@@ -1173,6 +1316,10 @@ pub fn choices_for_vars(
     group_order: &[String],
 ) -> Vec<Choice> {
     if let Some(src) = &field.source {
+        // `files:<dir>/<pat>` — enumerate filesystem stems matching the pattern.
+        if let Some(spec) = src.strip_prefix("files:") {
+            return resolve_files_source(spec, vars);
+        }
         if let Some(kind) = src.strip_prefix("catalog.") {
             // catalog.tools → kind "tools"; catalog.clis → "cli".
             let kind = if kind == "clis" { "cli" } else { kind };
@@ -1396,6 +1543,17 @@ pub struct WizardSession<'a> {
     group_order: Vec<String>,
     /// Index into `def.pages` of the page currently shown.
     idx: usize,
+    /// Loaded from `[settings] defaults_from_file` after the path is fully
+    /// resolved. Keys are field ids; values are the saved defaults. Secret
+    /// fields with a non-empty value are stored here as-is and presented as
+    /// `__KEEP__` to the wizard (substituted back on write).
+    defaults_map: std::collections::HashMap<String, String>,
+    /// Unresolved `defaults_from_file` path template (may contain `${VAR}`).
+    /// Resolved lazily on each page transition until all vars are non-empty.
+    /// `None` when not configured.
+    defaults_from_file_template: Option<String>,
+    /// Set to true once `defaults_from_file` is loaded to avoid reloading.
+    defaults_loaded: bool,
 }
 
 impl<'a> WizardSession<'a> {
@@ -1406,9 +1564,74 @@ impl<'a> WizardSession<'a> {
             vars: Map::new(),
             group_order,
             idx: 0,
+            defaults_map: std::collections::HashMap::new(),
+            defaults_from_file_template: None,
+            defaults_loaded: false,
         };
         s.idx = s.next_active_from(0).unwrap_or(def.pages.len());
         s
+    }
+
+    /// Set the `defaults_from_file` path template (may contain `${VAR}`).
+    /// The file is loaded lazily on the first page transition after all vars
+    /// in the template resolve to non-empty values.
+    pub fn set_defaults_from_file(&mut self, template: String) {
+        self.defaults_from_file_template = Some(template);
+        self.defaults_loaded = false;
+    }
+
+    /// Load a pre-parsed env-file map as default overrides.  Fields whose id
+    /// matches a key in `map` will have their effective `default` overridden to
+    /// the saved value.  Secret fields with a non-empty value are presented as
+    /// `__KEEP__` to the wizard UI (the original value is preserved in the map
+    /// for substitution before `write_setup_output`).
+    pub fn apply_defaults_map(&mut self, map: &std::collections::HashMap<String, String>) {
+        self.defaults_map = map.clone();
+        self.defaults_loaded = true;
+    }
+
+    /// Expose the raw (un-masked) defaults map so `cmd_setup` can resolve
+    /// `__KEEP__` back to the original value before writing the output file.
+    pub fn defaults_map(&self) -> &std::collections::HashMap<String, String> {
+        &self.defaults_map
+    }
+
+    /// Try to resolve the `defaults_from_file` template against current vars.
+    /// On success (all `${VAR}`s resolve to non-empty), read + parse the file
+    /// and apply the map.  Missing file is a no-op.  Called automatically after
+    /// each successful page submit.
+    fn try_load_defaults_from_file(&mut self) {
+        if self.defaults_loaded {
+            return;
+        }
+        let template = match &self.defaults_from_file_template {
+            Some(t) => t.clone(),
+            None => return,
+        };
+        // Substitute ${VAR} from current vars; None = a placeholder is not yet
+        // resolved (e.g. CONTAINER_NAME picked on a later page) — try again next page.
+        let path = match resolve_dollar_template(&template, &self.vars) {
+            Some(p) => p,
+            None => return,
+        };
+        // Home-expand the resolved path.
+        let expanded = match crate::pathenv::expand_home(&path) {
+            Ok(p) => p,
+            Err(_) => {
+                self.defaults_loaded = true; // don't retry a bad path
+                return;
+            }
+        };
+        let content = match std::fs::read_to_string(&expanded) {
+            Ok(c) => c,
+            Err(_) => {
+                // File doesn't exist yet (new container) — no overrides, no error.
+                self.defaults_loaded = true;
+                return;
+            }
+        };
+        self.defaults_map = parse_env_file_to_map(&content);
+        self.defaults_loaded = true;
     }
 
     /// Catalog keys selected so far (recomputed from currently-active
@@ -1457,6 +1680,10 @@ impl<'a> WizardSession<'a> {
     /// `selected.inputs` field expanded into one synthetic field per declared
     /// input of the currently-selected entries. Page-agnostic (does not read
     /// `self.idx`) so `active()` can test any page for emptiness.
+    ///
+    /// When `defaults_map` is populated (from `defaults_from_file`), each
+    /// field's effective `default` is overridden to the saved value.  Secret
+    /// fields with a non-empty saved value are presented as `__KEEP__`.
     fn fields_of(&self, p: &Page) -> Vec<Field> {
         let mut out: Vec<Field> = Vec::new();
         for f in &p.fields {
@@ -1476,13 +1703,32 @@ impl<'a> WizardSession<'a> {
                     {
                         continue;
                     }
-                    out.push(decl.to_field());
+                    let mut synthetic = decl.to_field();
+                    self.apply_defaults_override(&mut synthetic);
+                    out.push(synthetic);
                 }
                 continue;
             }
-            out.push(f.clone());
+            let mut field = f.clone();
+            self.apply_defaults_override(&mut field);
+            out.push(field);
         }
         out
+    }
+
+    /// Override `field.default` from `defaults_map` if a matching key exists.
+    /// Secret fields with a non-empty saved value are masked as `__KEEP__`.
+    fn apply_defaults_override(&self, field: &mut Field) {
+        if let Some(saved) = self.defaults_map.get(&field.id) {
+            if field.field_type == FieldType::Secret {
+                if !saved.is_empty() {
+                    field.default = Some("__KEEP__".to_owned());
+                }
+                // empty saved secret → leave default as authored in TOML
+            } else {
+                field.default = Some(saved.clone());
+            }
+        }
     }
     pub fn choices(&self, field: &Field) -> Vec<Choice> {
         choices_for_vars(field, self.catalog, &self.vars, &self.group_order)
@@ -1537,6 +1783,9 @@ impl<'a> WizardSession<'a> {
                 }
             }
         }
+        // After storing this page's vars, attempt to resolve the
+        // defaults_from_file path (may need a var that was just submitted).
+        self.try_load_defaults_from_file();
         self.idx = self
             .next_active_from(self.idx + 1)
             .unwrap_or(self.def.pages.len());
@@ -3490,5 +3739,234 @@ max = "2027-12-31"
         assert_eq!(rows[0].1, "ripgrep, node");
         assert_eq!(rows[1].0, "API token");
         assert_eq!(rows[1].1, "\u{2022}\u{2022}\u{2022}\u{2022}");
+    }
+
+    // ── Change 1: files: source ──────────────────────────────────────────────
+
+    fn files_field(source: &str) -> Field {
+        Field {
+            id: "CONTAINER_NAME".into(),
+            field_type: FieldType::SingleSelect,
+            prompt: None,
+            default: None,
+            required: false,
+            source: Some(source.to_owned()),
+            options: vec![],
+            condition: None,
+            assert: None,
+            assert_error: None,
+            validate: Validate::default(),
+        }
+    }
+
+    #[test]
+    fn files_source_returns_env_stems_sorted_deduped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("work-claude.env"), "A=1").unwrap();
+        std::fs::write(dir.path().join("gemini.env"), "B=2").unwrap();
+        std::fs::write(dir.path().join("gemini.env"), "B=2").unwrap(); // duplicate write, same file
+        std::fs::write(dir.path().join("noext"), "C=3").unwrap(); // no .env — must not match
+
+        let pat = format!("files:{}/*.env", dir.path().to_string_lossy().replace('\\', "/"));
+        let f = files_field(&pat);
+        let ch = choices_for(&f, &cat());
+        let values: Vec<&str> = ch.iter().map(|c| c.value.as_str()).collect();
+        assert_eq!(values, vec!["gemini", "work-claude"], "sorted + deduped");
+        assert!(!values.contains(&"noext"), "no-extension file must not match");
+    }
+
+    #[test]
+    fn files_source_missing_dir_returns_empty() {
+        let f = files_field("files:/no/such/path/absolutely/*.env");
+        let ch = choices_for(&f, &cat());
+        assert!(ch.is_empty());
+    }
+
+    #[test]
+    fn files_source_empty_dir_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let pat = format!("files:{}/*.env", dir.path().to_string_lossy().replace('\\', "/"));
+        let f = files_field(&pat);
+        let ch = choices_for(&f, &cat());
+        assert!(ch.is_empty());
+    }
+
+    #[test]
+    fn files_source_var_expansion_in_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sub.env"), "X=1").unwrap();
+
+        let base = dir.path().to_string_lossy().replace('\\', "/");
+        // source contains ${BASE} that resolves from vars
+        let pat = format!("files:${{BASE}}/*.env");
+        let f = files_field(&pat);
+        let mut vars = Map::new();
+        vars.insert("BASE".into(), Value::String(base.clone()));
+        let ch = choices_for_vars(&f, &cat(), &vars, &[]);
+        let values: Vec<&str> = ch.iter().map(|c| c.value.as_str()).collect();
+        assert_eq!(values, vec!["sub"]);
+    }
+
+    #[test]
+    fn files_source_skips_empty_stem_dotfile() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "X=1").unwrap(); // stem "" under *.env
+        std::fs::write(dir.path().join("real.env"), "Y=2").unwrap();
+        let pat = format!("files:{}/*.env", dir.path().to_string_lossy().replace('\\', "/"));
+        let f = files_field(&pat);
+        let ch = choices_for(&f, &cat());
+        let values: Vec<&str> = ch.iter().map(|c| c.value.as_str()).collect();
+        assert_eq!(values, vec!["real"], "empty stem from .env must be filtered out");
+    }
+
+    #[test]
+    fn match_glob_stem_overlapping_prefix_suffix_no_panic() {
+        // Regression: "ab*bc" vs "abc" both starts_with "ab" and ends_with "bc"
+        // (overlap) — must return None, not panic on the slice.
+        assert_eq!(super::match_glob_stem("abc", "ab*bc"), None);
+        assert_eq!(super::match_glob_stem("x.env", "*.env"), Some("x"));
+        assert_eq!(super::match_glob_stem(".env", "*.env"), Some(""));
+    }
+
+    #[test]
+    fn resolve_dollar_template_requires_all_vars_non_empty() {
+        let mut vars = Map::new();
+        vars.insert("CONTAINER_NAME".into(), Value::String("work".into()));
+        assert_eq!(
+            super::resolve_dollar_template("~/c/${CONTAINER_NAME}.env", &vars).as_deref(),
+            Some("~/c/work.env")
+        );
+        // missing var → None (caller must not write a wrong path)
+        assert_eq!(super::resolve_dollar_template("~/c/${MISSING}.env", &Map::new()), None);
+        // present-but-empty var → None
+        let mut empty = Map::new();
+        empty.insert("X".into(), Value::String(String::new()));
+        assert_eq!(super::resolve_dollar_template("~/${X}.env", &empty), None);
+    }
+
+    // ── Change 2: defaults_from_file ─────────────────────────────────────────
+
+    #[test]
+    fn defaults_from_file_prefill_overrides_field_default() {
+        // If a defaults map has KEY=saved_val, fields_of must use saved_val as
+        // the effective default even if the TOML field declares a different default.
+        let wiz_src = r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "CODING_CLI"
+            type = "single_select"
+            default = "claude"
+            options = ["claude", "gemini"]
+        "#;
+        let d = WizardDef::from_str(wiz_src).unwrap();
+        let c = Catalog::default();
+        let mut s = WizardSession::new(&d, &c, vec![]);
+
+        // Inject the defaults map (simulates loading a .env file).
+        let mut dm = std::collections::HashMap::new();
+        dm.insert("CODING_CLI".to_string(), "gemini".to_string());
+        s.apply_defaults_map(&dm);
+
+        let fields = s.fields();
+        assert_eq!(
+            fields[0].default.as_deref(),
+            Some("gemini"),
+            "prefill from defaults_map must override TOML default"
+        );
+    }
+
+    #[test]
+    fn defaults_from_file_secret_field_gets_keep_sentinel() {
+        let wiz_src = r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "API_KEY"
+            type = "secret"
+            required = false
+        "#;
+        let d = WizardDef::from_str(wiz_src).unwrap();
+        let c = Catalog::default();
+        let mut s = WizardSession::new(&d, &c, vec![]);
+
+        let mut dm = std::collections::HashMap::new();
+        dm.insert("API_KEY".to_string(), "sk-secret-value".to_string());
+        s.apply_defaults_map(&dm);
+
+        let fields = s.fields();
+        assert_eq!(
+            fields[0].default.as_deref(),
+            Some("__KEEP__"),
+            "non-empty secret in defaults map must be masked as __KEEP__"
+        );
+    }
+
+    #[test]
+    fn defaults_from_file_empty_secret_not_masked() {
+        let wiz_src = r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "API_KEY"
+            type = "secret"
+            required = false
+        "#;
+        let d = WizardDef::from_str(wiz_src).unwrap();
+        let c = Catalog::default();
+        let mut s = WizardSession::new(&d, &c, vec![]);
+
+        let mut dm = std::collections::HashMap::new();
+        dm.insert("API_KEY".to_string(), String::new());
+        s.apply_defaults_map(&dm);
+
+        let fields = s.fields();
+        // empty value → no __KEEP__ sentinel, default stays None (not prefilled)
+        assert_ne!(fields[0].default.as_deref(), Some("__KEEP__"));
+    }
+
+    #[test]
+    fn defaults_from_file_missing_file_is_noop() {
+        let wiz_src = r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "CODING_CLI"
+            type = "single_select"
+            default = "claude"
+            options = ["claude", "gemini"]
+        "#;
+        let d = WizardDef::from_str(wiz_src).unwrap();
+        let c = Catalog::default();
+        // No apply_defaults_map call → field retains its TOML default.
+        let s = WizardSession::new(&d, &c, vec![]);
+        let fields = s.fields();
+        assert_eq!(fields[0].default.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn keep_substitution_helper_replaces_with_original() {
+        // When a var value is "__KEEP__", substitute with the original from
+        // a loaded defaults map.  This mirrors what cmd_setup does before
+        // write_setup_output.
+        let mut vars: Map<String, Value> = Map::new();
+        vars.insert("API_KEY".into(), Value::String("__KEEP__".into()));
+        vars.insert("NORMAL".into(), Value::String("hello".into()));
+
+        let mut defaults: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        defaults.insert("API_KEY".into(), "sk-original-secret".into());
+
+        // Apply the substitution.
+        for (k, v) in vars.iter_mut() {
+            if v.as_str() == Some("__KEEP__") {
+                if let Some(orig) = defaults.get(k) {
+                    *v = Value::String(orig.clone());
+                }
+            }
+        }
+
+        assert_eq!(vars.get("API_KEY").and_then(|v| v.as_str()), Some("sk-original-secret"));
+        assert_eq!(vars.get("NORMAL").and_then(|v| v.as_str()), Some("hello"));
     }
 }

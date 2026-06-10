@@ -4,6 +4,30 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.13.0] - 2026-06-10
+
+### Added
+- **`files:` wizard source.** A field `source = "files:<dir>/<pattern>"` (single
+  `*`, e.g. `files:~/.app/containers/*.env`) lists matching files' stems as
+  choices. The dir part expands `~` and `${VAR}`; a missing or empty dir yields
+  an empty list (no panic). Drives a "pick an existing item" page from the
+  filesystem.
+- **`[settings] defaults_from_file`.** Path (with `${VAR}` placeholders resolved
+  from prior wizard answers) to an env-format file whose `KEY=value` entries
+  prefill matching wizard fields as their effective default — for "edit
+  existing" flows. Loaded lazily once the path's vars resolve; a missing file is
+  a no-op. Secret fields with a saved value present as `__KEEP__`; the original
+  is substituted back before writing and never displayed.
+- **Positional task argument.** `insmaller task run <arg>` exposes a trailing
+  non-task token to shell steps as `$CT_ARG` (and `{{ CT_ARG }}`). A non-task
+  token is treated as the argument only when it is the last token and every
+  earlier token is a known task; otherwise it stays a (failing) task name, so a
+  typo is never silently swallowed.
+- **`setup_output.path` templating.** The configured path is rendered with the
+  resolved wizard vars (`${VAR}` or `{{ VAR }}`) before home-expansion, so a
+  per-item path like `~/.app/containers/{{ CONTAINER_NAME }}.env` works. An
+  undefined variable is an error, never a silent wrong-path write.
+
 ## [0.12.0] - 2026-06-09
 
 ### Added
