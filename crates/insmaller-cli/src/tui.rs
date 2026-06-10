@@ -1157,6 +1157,138 @@ pub fn run_wizard_tui(
     let mut grad_cache: (usize, Vec<ratatui::style::Color>) = (0, Vec::new());
 
     while !session.is_done() {
+        if session.current().is_some_and(|p| p.review) {
+            let (title, desc) = session
+                .current()
+                .map(|p| (p.title.clone(), p.description.clone()))
+                .unwrap_or_default();
+            let (step, total) = session.progress();
+            loop {
+                let rows_data = session.summary_rows();
+                let can_back = session.can_back();
+                term.draw(|fr| {
+                    let rows = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Length(4),
+                            Constraint::Min(3),
+                            Constraint::Length(3),
+                        ])
+                        .split(fr.area());
+
+                    let ratio = (step as f64 / total as f64).clamp(0.0, 1.0);
+                    let htitle = format!(" insmaller setup — {title}  (step {step}/{total}) ");
+                    if pal.colored() {
+                        let block = panel(htitle, false, &pal);
+                        let inner = block.inner(rows[0]);
+                        fr.render_widget(block, rows[0]);
+                        let w = inner.width.max(1) as usize;
+                        let filled = (ratio * w as f64).round() as usize;
+                        if grad_cache.0 != w {
+                            grad_cache = (w, gradient(pal.accent, pal.accent2, w));
+                        }
+                        let cols = &grad_cache.1;
+                        let phase = (frame as usize) % w;
+                        let bar: Vec<Span> = (0..w)
+                            .map(|i| {
+                                let col = cols[(i + phase) % w];
+                                if i < filled {
+                                    Span::styled("▰", Style::default().fg(col))
+                                } else {
+                                    Span::styled("▱", Style::default().fg(pal.border))
+                                }
+                            })
+                            .collect();
+                        let lines = vec![
+                            Line::from(bar),
+                            Line::from(Span::styled(desc.clone(), Style::default().fg(pal.muted))),
+                        ];
+                        fr.render_widget(Paragraph::new(lines), inner);
+                    } else {
+                        let g = Gauge::default()
+                            .block(Block::default().borders(Borders::ALL).title(htitle))
+                            .gauge_style(Style::default().fg(pal.accent))
+                            .ratio(ratio)
+                            .label(desc.clone());
+                        fr.render_widget(g, rows[0]);
+                    }
+
+                    let label_width = rows_data
+                        .iter()
+                        .map(|(l, _)| l.len())
+                        .max()
+                        .unwrap_or(0);
+                    let items: Vec<ListItem> = rows_data
+                        .iter()
+                        .map(|(label, val)| {
+                            ListItem::new(Line::from(vec![
+                                Span::styled(
+                                    format!("{label:<label_width$}  "),
+                                    Style::default().add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(val.clone(), Style::default().fg(pal.muted)),
+                            ]))
+                        })
+                        .collect();
+                    let body = ratatui::widgets::List::new(items)
+                        .block(panel(" Review ", false, &pal));
+                    fr.render_widget(body, rows[1]);
+
+                    let mut foot_spans = Vec::new();
+                    if can_back {
+                        foot_spans.push(Span::styled(
+                            " ◄ Back ",
+                            Style::default().fg(pal.accent),
+                        ));
+                        foot_spans.push(Span::raw("  "));
+                    }
+                    foot_spans.push(Span::styled(
+                        " Confirm ►► ",
+                        Style::default().fg(pal.accent),
+                    ));
+                    foot_spans.push(Span::raw("   "));
+                    let hint = if can_back {
+                        "Enter confirm · ← back · q quit"
+                    } else {
+                        "Enter confirm · q quit"
+                    };
+                    foot_spans.push(Span::styled(hint, Style::default().fg(pal.muted)));
+                    fr.render_widget(
+                        Paragraph::new(Line::from(foot_spans))
+                            .block(panel("", false, &pal)),
+                        rows[2],
+                    );
+                })?;
+
+                if animate && !event::poll(Duration::from_millis(80))? {
+                    frame = frame.wrapping_add(1);
+                    continue;
+                }
+                let Event::Key(k) = event::read()? else { continue };
+                if k.kind != KeyEventKind::Press {
+                    continue;
+                }
+                if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
+                    return Ok(false);
+                }
+                match k.code {
+                    KeyCode::Enter => {
+                        session.submit(serde_json::Map::new())?;
+                        break;
+                    }
+                    KeyCode::Left | KeyCode::Esc | KeyCode::Backspace => {
+                        if can_back {
+                            session.back();
+                        }
+                        break;
+                    }
+                    KeyCode::Char('q') => return Ok(false),
+                    _ => {}
+                }
+            }
+            continue;
+        }
+
         let fields: Vec<Field> = session.fields();
         let mut widgets: Vec<Widget> =
             fields.iter().map(|f| init_widget(f, session, gd, &collapse)).collect();

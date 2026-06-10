@@ -803,6 +803,9 @@ pub struct Page {
     pub condition: Option<String>,
     #[serde(default, rename = "field")]
     pub fields: Vec<Field>,
+    /// Read-only summary page: renders all collected answers, no fields.
+    #[serde(default)]
+    pub review: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1372,6 +1375,15 @@ pub fn collect_outcome(def: &WizardDef, vars: &Map<String, Value>) -> WizardOutc
     out
 }
 
+fn fmt_value(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Array(a) => a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "),
+        Value::Bool(b) => b.to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// Navigable wizard state machine for interactive frontends (TUI). Pure: it
 /// holds answers and computes which pages/fields are active given current
 /// answers, and supports free back/forward. Conditions are re-evaluated on
@@ -1407,10 +1419,16 @@ impl<'a> WizardSession<'a> {
 
     fn active(&self, i: usize) -> bool {
         self.def.pages.get(i).is_some_and(|p| {
-            p.condition
+            let cond_ok = p
+                .condition
                 .as_deref()
                 .map(|c| eval_condition(c, &self.vars))
-                .unwrap_or(true)
+                .unwrap_or(true);
+            // Skip a page that declared fields but has none left after gating /
+            // `selected.inputs` expansion (e.g. a keyless CLI on an API-keys
+            // page renders blank otherwise). Info-only pages — no declared
+            // fields at all — stay visible.
+            cond_ok && (p.fields.is_empty() || !self.fields_of(p).is_empty())
         })
     }
     fn next_active_from(&self, start: usize) -> Option<usize> {
@@ -1432,9 +1450,14 @@ impl<'a> WizardSession<'a> {
     /// own `condition`). Returns owned fields because synthetic ones are not
     /// part of `WizardDef`.
     pub fn fields(&self) -> Vec<Field> {
-        let Some(p) = self.current() else {
-            return Vec::new();
-        };
+        self.current().map(|p| self.fields_of(p)).unwrap_or_default()
+    }
+
+    /// Visible fields of a given page — field conditions applied, and a
+    /// `selected.inputs` field expanded into one synthetic field per declared
+    /// input of the currently-selected entries. Page-agnostic (does not read
+    /// `self.idx`) so `active()` can test any page for emptiness.
+    fn fields_of(&self, p: &Page) -> Vec<Field> {
         let mut out: Vec<Field> = Vec::new();
         for f in &p.fields {
             if f.condition
@@ -1543,6 +1566,54 @@ impl<'a> WizardSession<'a> {
     pub fn finish(&self) -> WizardOutcome {
         collect_outcome(self.def, &self.vars)
     }
+
+    /// `(label, display_value)` for every collected answer, in page→field order.
+    /// Secret values are masked as `"••••"`. Used by review pages.
+    pub fn summary_rows(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let selected_keys = self.current_selected_keys();
+        for page in &self.def.pages {
+            for f in &page.fields {
+                if f.source.as_deref() == Some(SELECTED_INPUTS) {
+                    for decl in self.catalog.required_inputs(&selected_keys) {
+                        if !seen.insert(decl.id.clone()) {
+                            continue;
+                        }
+                        let Some(v) = self.vars.get(&decl.id) else { continue };
+                        let label = decl.prompt.as_deref().unwrap_or(&decl.id).to_string();
+                        let display = if decl.r#type == FieldType::Secret {
+                            if v.as_str().map(|s| !s.is_empty()).unwrap_or(false) {
+                                "\u{2022}\u{2022}\u{2022}\u{2022}".to_string()
+                            } else {
+                                String::new()
+                            }
+                        } else {
+                            fmt_value(v)
+                        };
+                        out.push((label, display));
+                    }
+                } else {
+                    if !seen.insert(f.id.clone()) {
+                        continue;
+                    }
+                    let Some(v) = self.vars.get(&f.id) else { continue };
+                    let label = f.prompt.as_deref().unwrap_or(&f.id).to_string();
+                    let display = if f.field_type == FieldType::Secret {
+                        if v.as_str().map(|s| !s.is_empty()).unwrap_or(false) {
+                            "\u{2022}\u{2022}\u{2022}\u{2022}".to_string()
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        fmt_value(v)
+                    };
+                    out.push((label, display));
+                }
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -1648,6 +1719,54 @@ mod tests {
         .unwrap();
         assert_eq!(o.selected_keys, vec!["node"]);
         assert!(o.vars.get("OPENAI_API_KEY").is_none());
+    }
+
+    #[test]
+    fn page_with_empty_selected_inputs_is_skipped() {
+        // 'kilo' needs no key; 'pi' needs ANTHROPIC_API_KEY. An api-keys page
+        // sourced from selected.inputs must be skipped (not rendered blank) for
+        // a keyless CLI, and shown for one that declares an input.
+        let c = Catalog::from_json_str(
+            r#"{ "clis":[
+              {"key":"kilo","install":"npm:x"},
+              {"key":"pi","install":"npm:y","requires_input":[
+                {"id":"ANTHROPIC_API_KEY","type":"secret","required":false}]}
+            ]}"#,
+        )
+        .unwrap();
+        let wiz = r#"
+            [[page]]
+            id = "cli"
+            [[page.field]]
+            id = "CODING_CLI"
+            type = "single_select"
+            source = "catalog.clis"
+
+            [[page]]
+            id = "api_keys"
+            [[page.field]]
+            id = "_api_keys"
+            type = "text"
+            source = "selected.inputs"
+        "#;
+        let d = WizardDef::from_str(wiz).unwrap();
+
+        // keyless CLI → api_keys page has zero fields → skipped → done.
+        let mut s = WizardSession::new(&d, &c, vec![]);
+        assert_eq!(s.current().unwrap().id, "cli");
+        let mut pick = Map::new();
+        pick.insert("CODING_CLI".into(), Value::String("kilo".into()));
+        s.submit(pick).unwrap();
+        assert!(s.is_done(), "blank api_keys page must be skipped for kilo");
+
+        // CLI that declares an input → api_keys page shows that one field.
+        let mut s2 = WizardSession::new(&d, &c, vec![]);
+        let mut pick2 = Map::new();
+        pick2.insert("CODING_CLI".into(), Value::String("pi".into()));
+        s2.submit(pick2).unwrap();
+        assert_eq!(s2.current().unwrap().id, "api_keys");
+        assert_eq!(s2.fields().len(), 1);
+        assert_eq!(s2.fields()[0].id, "ANTHROPIC_API_KEY");
     }
 
     #[test]
@@ -3329,5 +3448,47 @@ max = "2027-12-31"
             assert_error = "end must be after start"
         "#).unwrap();
         assert!(validate_wizard_schema(&wiz).is_ok());
+    }
+
+    #[test]
+    fn summary_rows_labels_values_and_masks_secrets() {
+        let wiz_src = r#"
+            [[page]]
+            id = "pick"
+            [[page.field]]
+            id = "INSTALL_TOOLS"
+            type = "multiselect"
+            prompt = "Dev tools"
+            source = "catalog.tools"
+
+            [[page]]
+            id = "keys"
+            condition = "'ripgrep' in ${INSTALL_TOOLS}"
+            [[page.field]]
+            id = "SECRET_TOKEN"
+            type = "secret"
+            prompt = "API token"
+            required = false
+        "#;
+        let d = WizardDef::from_str(wiz_src).unwrap();
+        let c = cat();
+        let mut s = WizardSession::new(&d, &c, vec![]);
+
+        // pick ripgrep → keys page activates.
+        let mut a1 = Map::new();
+        a1.insert("INSTALL_TOOLS".into(), serde_json::json!(["ripgrep", "node"]));
+        s.submit(a1).unwrap();
+
+        let mut a2 = Map::new();
+        a2.insert("SECRET_TOKEN".into(), Value::String("hunter2".into()));
+        s.submit(a2).unwrap();
+        assert!(s.is_done());
+
+        let rows = s.summary_rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "Dev tools");
+        assert_eq!(rows[0].1, "ripgrep, node");
+        assert_eq!(rows[1].0, "API token");
+        assert_eq!(rows[1].1, "\u{2022}\u{2022}\u{2022}\u{2022}");
     }
 }

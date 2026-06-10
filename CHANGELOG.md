@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.12.0] - 2026-06-09
+
+### Added
+- **Wizard review page.** A `[[page]]` with `review = true` (and no fields)
+  renders a read-only summary of every collected answer (secrets masked) as the
+  final step; Enter confirms and finishes, ← / Esc goes back to edit. New
+  `WizardSession::summary_rows()` builds the labelled, masked rows.
+- **Truecolor about-block filters.** `version_template` now supports
+  `{{ x | rgb("818cf8") }}` (24-bit solid color) and a per-character
+  `{{ x | gradient("818cf8","f472b6") }}`. `gradient` sets a color per char and
+  resets once at the end, so chaining `| bold` keeps bold across the whole run.
+  Both pass their text through unchanged when stdout isn't a TTY, `NO_COLOR` is
+  set, or the hex is malformed.
+
+### Fixed
+- **Wizard skips a page left empty by `selected.inputs`.** A page whose only
+  field is `source = "selected.inputs"` rendered blank when the selected
+  entries declared no inputs (e.g. an API-keys page for a CLI that needs no
+  key). Such a page — one that declared fields but has none after gating /
+  expansion — is now skipped during forward/back navigation and progress
+  counts. Info-only pages (no declared fields) still show.
+
 ## [0.10.0] - 2026-06-09
 
 ### Added
