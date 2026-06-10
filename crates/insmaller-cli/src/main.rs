@@ -18,9 +18,9 @@ mod theme;
 mod tui;
 
 use insmaller_core::{
-    builtins, run_wizard, Catalog, Ctx, EnvResolver, FieldType, InputResolver, InstallSummary,
-    LoadedConfig, Reporter, Sentinel, SentinelData, Settings, StaticAnswerer, StdoutReporter,
-    WizardDef, WizardOutcome, WizardSession,
+    builtins, parse_env_file_to_map, run_wizard, Catalog, Ctx, EnvResolver, FieldType,
+    InputResolver, InstallSummary, LoadedConfig, Reporter, Sentinel, SentinelData, Settings,
+    StaticAnswerer, StdoutReporter, WizardDef, WizardOutcome, WizardSession,
 };
 use serde_json::{Map, Value};
 use std::io::{IsTerminal, Write};
@@ -656,17 +656,30 @@ async fn cmd_setup(a: &[String], name: &str) -> ExitCode {
     let palette = theme::Palette::resolve(&cfg.settings);
     let no_api_validate = has(a, "--no-api-validate");
     let unattended = has(a, "--answers") || !std::io::stdin().is_terminal();
-    let (outcome, tui_used): (WizardOutcome, bool) = if unattended {
+    let (outcome, tui_used, final_defaults_map): (
+        WizardOutcome,
+        bool,
+        std::collections::HashMap<String, String>,
+    ) = if unattended {
         let f = opt(a, "--answers", "answers.toml");
         let raw = std::fs::read_to_string(&f).unwrap_or_default();
-        let m: Map<String, Value> = toml::from_str::<toml::Table>(&raw)
+        let mut m: Map<String, Value> = toml::from_str::<toml::Table>(&raw)
             .ok()
             .and_then(|t| serde_json::to_value(t).ok())
             .and_then(|v| v.as_object().cloned())
             .or_else(|| serde_json::from_str(&raw).ok())
             .unwrap_or_default();
+        // For the unattended path, pre-apply defaults_from_file if the path
+        // resolves against the answers map (answers supply the template vars).
+        let dff_defaults = cfg.settings.defaults_from_file.as_deref().map(|tmpl| {
+            load_defaults_from_file_with_vars(tmpl, &m)
+        }).unwrap_or_default();
+        // Merge: answers file wins; defaults fill in gaps.
+        for (k, v) in &dff_defaults {
+            m.entry(k.clone()).or_insert_with(|| Value::String(v.clone()));
+        }
         match run_wizard(&wiz, &cat, &StaticAnswerer(m), &group_order) {
-            Ok(o) => (o, false),
+            Ok(o) => (o, false, dff_defaults),
             Err(e) => {
                 eprintln!("wizard error: {e}");
                 return ExitCode::FAILURE;
@@ -674,13 +687,20 @@ async fn cmd_setup(a: &[String], name: &str) -> ExitCode {
         }
     } else {
         let mut session = WizardSession::new(&wiz, &cat, group_order.clone());
+        // Wire up defaults_from_file lazy loading.
+        if let Some(tmpl) = cfg.settings.defaults_from_file.clone() {
+            session.set_defaults_from_file(tmpl);
+        }
         let gd = tui::GroupDefaults {
             collapsed_default: cfg.settings.start_groups_collapsed,
             collapsed: cfg.settings.collapsed_groups.clone(),
             expanded: cfg.settings.expanded_groups.clone(),
         };
         match tui::run_wizard_tui(&mut session, palette, &gd, no_api_validate) {
-            Ok(true) => (session.finish(), true),
+            Ok(true) => {
+                let dm = session.defaults_map().clone();
+                (session.finish(), true, dm)
+            }
             Ok(false) => {
                 println!("Setup cancelled.");
                 return ExitCode::SUCCESS;
@@ -705,7 +725,22 @@ async fn cmd_setup(a: &[String], name: &str) -> ExitCode {
     // P1-C: emit the resolved vars to the configured sink (runs before the
     // install phase so it's present even on --dry-run).
     if let Some(so) = cfg.settings.setup_output.as_ref() {
-        if let Err(e) = insmaller_core::write_setup_output(so, &outcome.vars) {
+        // Before writing, substitute __KEEP__ back to the original secret values
+        // from the defaults map so we never write the sentinel to disk.
+        let mut write_vars = outcome.vars.clone();
+        for (k, v) in write_vars.iter_mut() {
+            if v.as_str() == Some("__KEEP__") {
+                if let Some(orig) = final_defaults_map.get(k) {
+                    *v = Value::String(orig.clone());
+                }
+            }
+        }
+        // Never persist a leftover sentinel: a kept secret is substituted above
+        // (its original is in the defaults map); any remaining __KEEP__ is a
+        // stray (e.g. a non-secret field literally set to it) — drop the key
+        // rather than write the sentinel string to disk.
+        write_vars.retain(|_, v| v.as_str() != Some("__KEEP__"));
+        if let Err(e) = insmaller_core::write_setup_output(so, &write_vars) {
             eprintln!("setup_output error: {e:#}");
             return ExitCode::FAILURE;
         }
@@ -838,6 +873,31 @@ async fn cmd_setup(a: &[String], name: &str) -> ExitCode {
     code
 }
 
+/// Resolve `defaults_from_file` path template against the answers map (for the
+/// unattended path where the wizard hasn't run yet).  Substitutes `${VAR}` from
+/// `answers`, home-expands the result, reads + parses the file.  Returns an
+/// empty map on any error (missing file, unresolved vars, etc.).
+fn load_defaults_from_file_with_vars(
+    template: &str,
+    answers: &Map<String, Value>,
+) -> std::collections::HashMap<String, String> {
+    // Shared `${VAR}` resolver (same logic the interactive session uses):
+    // None = a placeholder is unresolved/empty → no defaults.
+    let path = match insmaller_core::resolve_dollar_template(template, answers) {
+        Some(p) => p,
+        None => return std::collections::HashMap::new(),
+    };
+    let expanded = match insmaller_core::pathenv::expand_home(&path) {
+        Ok(p) => p,
+        Err(_) => return std::collections::HashMap::new(),
+    };
+    let content = std::fs::read_to_string(&expanded).unwrap_or_default();
+    if content.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    parse_env_file_to_map(&content)
+}
+
 /// Inject `self_exe`/`exe_dir` task vars from the running binary's path so a
 /// recipe can `copy {{ self_exe }}` and `{{ exe_dir }}/payload/*` from any cwd.
 /// `or_insert` so an existing project.extra/env value of the same name wins.
@@ -860,9 +920,41 @@ fn inject_exe_vars(run_vars: &mut Map<String, Value>, exe: Option<PathBuf>) {
 /// task pipelines. `run_vars` = project.extra + process env + self_exe/exe_dir
 /// (so task scripts template the consumer's image_tag/container_name/etc and
 /// the running binary's own location).
+///
+/// `CT_ARG` positional argument: a trailing token that is NOT a known
+/// `[task.*]` name is treated as a positional argument and exposed to all task
+/// shell steps as the env var `CT_ARG`.  Disambiguation rule:
+///
+/// - tokens matching a known task name → task list (run in sequence)
+/// - a single non-task token in the LAST position (every earlier token is a
+///   task) → CT_ARG
+/// - an unknown token anywhere else (e.g. a leading typo) stays in the task
+///   list so the run path errors naming it — never silently promoted to CT_ARG
+///
+/// Backward compatible: no trailing non-task token → CT_ARG not set (scripts
+/// read `${CT_ARG:-}` and fall back to their own defaults).
+fn partition_task_tokens(
+    tokens: &[String],
+    is_task: impl Fn(&str) -> bool,
+) -> (Vec<String>, Option<String>) {
+    if tokens.is_empty() {
+        return (vec![], None);
+    }
+    if tokens.iter().all(|t| is_task(t)) {
+        return (tokens.to_vec(), None);
+    }
+    // Accept the last token as the positional arg only when every preceding
+    // token is a known task (so `run work-claude` works, `work-claude run` errors).
+    let (head, last) = tokens.split_at(tokens.len() - 1);
+    if !is_task(&last[0]) && head.iter().all(|t| is_task(t)) {
+        return (head.to_vec(), Some(last[0].clone()));
+    }
+    (tokens.to_vec(), None)
+}
+
 async fn cmd_task(a: &[String], name: &str) -> ExitCode {
     let cfg_p = discover_config(opt_opt(a, "--config"), name);
-    let names = collect_keys(a);
+    let raw_tokens = collect_keys(a);
     let cfg = match LoadedConfig::from_path(std::path::Path::new(&cfg_p)) {
         Ok(c) => c,
         Err(e) => {
@@ -870,7 +962,11 @@ async fn cmd_task(a: &[String], name: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if names.is_empty() {
+
+    // Partition tokens into the task-run list + an optional trailing CT_ARG.
+    let (task_names, ct_arg) = partition_task_tokens(&raw_tokens, |t| cfg.tasks.contains_key(t));
+
+    if task_names.is_empty() {
         eprintln!("usage: {name} task <name…>  (available: {:?})", cfg.tasks.keys().collect::<Vec<_>>());
         return ExitCode::FAILURE;
     }
@@ -884,6 +980,20 @@ async fn cmd_task(a: &[String], name: &str) -> ExitCode {
         run_vars.entry(k).or_insert(Value::String(v));
     }
     inject_exe_vars(&mut run_vars, std::env::current_exe().ok());
+
+    // Inject CT_ARG so shell steps can read the positional argument as
+    // `${CT_ARG:-}` (falls back to empty when not set).
+    // Two channels:
+    //   1. run_vars → Ctx → available as {{ CT_ARG }} in templated step params.
+    //   2. std::env::set_var → inherited by subprocesses spawned by run_sh/run_cmd,
+    //      so plain `$CT_ARG` in shell script bodies works too.
+    if let Some(arg) = ct_arg {
+        run_vars.insert("CT_ARG".to_string(), Value::String(arg.clone()));
+        // SAFETY: set before run_tasks; no concurrent threads mutate the env here.
+        #[allow(deprecated)]
+        std::env::set_var("CT_ARG", &arg);
+    }
+
     let mut reg = builtins(&cfg.settings);
     insmaller_core::register_external(&mut reg, &cfg.plugins);
 
@@ -908,7 +1018,7 @@ async fn cmd_task(a: &[String], name: &str) -> ExitCode {
 
     let resolver = make_resolver(&cfg.settings, ResolverPurpose::Task);
     match insmaller_core::run_tasks(
-        &names,
+        &task_names,
         &cfg,
         &reg,
         &StdoutReporter,
@@ -1012,11 +1122,57 @@ fn format_answer_value(v: &Value, is_secret: bool) -> String {
 mod tests {
     use super::{
         app_home_candidates_posix, app_home_candidates_windows, discover_config_in,
-        find_config, format_answer_value, inject_exe_vars, program_name_from, resolve_sibling,
-        usage_text, CONFIG_NAMES,
+        find_config, format_answer_value, inject_exe_vars, partition_task_tokens,
+        program_name_from, resolve_sibling, usage_text, CONFIG_NAMES,
     };
     use serde_json::{Map, Value};
     use std::path::{Path, PathBuf};
+
+    fn toks(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+    // Known tasks for the partition tests.
+    fn is_known(t: &str) -> bool {
+        ["run", "build", "stop"].contains(&t)
+    }
+
+    #[test]
+    fn ct_arg_trailing_non_task_becomes_arg() {
+        let (tasks, arg) = partition_task_tokens(&toks(&["run", "work-claude"]), is_known);
+        assert_eq!(tasks, toks(&["run"]));
+        assert_eq!(arg.as_deref(), Some("work-claude"));
+    }
+
+    #[test]
+    fn ct_arg_leading_unknown_stays_in_task_list() {
+        // A non-task token that is NOT trailing must NOT become CT_ARG; it stays
+        // so the run path errors naming the unknown task.
+        let (tasks, arg) = partition_task_tokens(&toks(&["work-claude", "run"]), is_known);
+        assert_eq!(tasks, toks(&["work-claude", "run"]));
+        assert_eq!(arg, None);
+    }
+
+    #[test]
+    fn ct_arg_multiple_known_tasks_no_arg() {
+        let (tasks, arg) = partition_task_tokens(&toks(&["build", "run"]), is_known);
+        assert_eq!(tasks, toks(&["build", "run"]));
+        assert_eq!(arg, None);
+    }
+
+    #[test]
+    fn ct_arg_single_task_no_arg() {
+        let (tasks, arg) = partition_task_tokens(&toks(&["run"]), is_known);
+        assert_eq!(tasks, toks(&["run"]));
+        assert_eq!(arg, None);
+    }
+
+    #[test]
+    fn ct_arg_multiple_unknown_no_arg() {
+        // Two unknowns → not promoted; kept so the run path errors.
+        let (tasks, arg) = partition_task_tokens(&toks(&["run", "foo", "bar"]), is_known);
+        assert_eq!(tasks, toks(&["run", "foo", "bar"]));
+        assert_eq!(arg, None);
+    }
 
     #[test]
     fn find_config_closest_dir_wins_then_name_priority() {
