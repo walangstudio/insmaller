@@ -28,6 +28,17 @@ const STYLES: &[(&str, u8)] = &[
     ("grey", 90),
 ];
 
+/// `#rrggbb` / `rrggbb` → `(r, g, b)`. `None` on malformed input so the
+/// truecolor filters degrade to passing their text through unchanged.
+fn parse_hex6(s: &str) -> Option<(u8, u8, u8)> {
+    let h = s.strip_prefix('#').unwrap_or(s);
+    if h.len() != 6 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let n = u32::from_str_radix(h, 16).ok()?;
+    Some(((n >> 16) as u8, (n >> 8) as u8, n as u8))
+}
+
 /// Best-effort read of just the `[project]` table from a config file, for
 /// `--version`. Tolerant: `None` on any read/parse error so `--version` never
 /// fails on a malformed-but-present config (only `[project]` is type-checked;
@@ -72,6 +83,41 @@ pub fn render_about(
             }
         });
     }
+    // Truecolor: `{{ x | rgb("818cf8") }}` and a per-character
+    // `{{ x | gradient("818cf8","f472b6") }}`. Both pass text through when
+    // color is off or the hex is malformed. `gradient` sets a color per char
+    // and resets once at the end, so chaining `| bold` keeps bold across the
+    // whole run.
+    env.add_filter("rgb", move |v: String, hex: String| {
+        match (color, parse_hex6(&hex)) {
+            (true, Some((r, g, b))) => format!("\x1b[38;2;{r};{g};{b}m{v}\x1b[0m"),
+            _ => v,
+        }
+    });
+    env.add_filter("gradient", move |v: String, from: String, to: String| {
+        let (Some(a), Some(b)) = (parse_hex6(&from), parse_hex6(&to)) else {
+            return v;
+        };
+        let chars: Vec<char> = v.chars().collect();
+        if !color || chars.is_empty() {
+            return v;
+        }
+        let n = chars.len();
+        let mut out = String::new();
+        for (i, ch) in chars.iter().enumerate() {
+            let t = if n <= 1 { 0.0 } else { i as f32 / (n - 1) as f32 };
+            let lerp = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+            out.push_str(&format!(
+                "\x1b[38;2;{};{};{}m",
+                lerp(a.0, b.0),
+                lerp(a.1, b.1),
+                lerp(a.2, b.2)
+            ));
+            out.push(*ch);
+        }
+        out.push_str("\x1b[0m");
+        out
+    });
 
     let mut ctx: Map<String, Value> = Map::new();
     ctx.insert("name".into(), json!(program_name));
@@ -164,5 +210,39 @@ mod tests {
     fn undefined_extra_is_empty_not_error() {
         let p = pm(Some("0.1.0"), Some("{{ name }}{{ extra.missing }}"));
         assert_eq!(render_about(Some(&p), "ct", "0.9.0", false), "ct");
+    }
+
+    #[test]
+    fn rgb_filter_emits_truecolor_when_on_and_passes_through_off() {
+        let p = pm(Some("0.1.0"), Some(r#"{{ name | rgb("818cf8") }}"#));
+        assert_eq!(
+            render_about(Some(&p), "ct", "0.10.0", true),
+            "\x1b[38;2;129;140;248mct\x1b[0m"
+        );
+        assert_eq!(render_about(Some(&p), "ct", "0.10.0", false), "ct");
+    }
+
+    #[test]
+    fn rgb_bad_hex_passes_through() {
+        let p = pm(Some("0.1.0"), Some(r#"{{ name | rgb("nothex") }}"#));
+        assert_eq!(render_about(Some(&p), "ct", "0.10.0", true), "ct");
+    }
+
+    #[test]
+    fn gradient_colors_each_char_and_resets_once() {
+        // "ab": first char = from (#000000), last = to (#0000ff).
+        let p = pm(Some("0.1.0"), Some(r#"{{ name | gradient("000000","0000ff") }}"#));
+        let out = render_about(Some(&p), "ab", "0.10.0", true);
+        assert_eq!(out, "\x1b[38;2;0;0;0ma\x1b[38;2;0;0;255mb\x1b[0m");
+        // off → plain.
+        assert_eq!(render_about(Some(&p), "ab", "0.10.0", false), "ab");
+    }
+
+    #[test]
+    fn gradient_then_bold_keeps_bold_across_run() {
+        let p = pm(Some("0.1.0"), Some(r#"{{ name | gradient("000000","0000ff") | bold }}"#));
+        let out = render_about(Some(&p), "ab", "0.10.0", true);
+        assert!(out.starts_with("\x1b[1m"), "bold opens the run: {out:?}");
+        assert!(out.ends_with("\x1b[0m"));
     }
 }
