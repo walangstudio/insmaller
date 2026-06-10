@@ -30,6 +30,9 @@ pub struct EntryRef {
     /// Availability / install guard. Evaluated against the run's vars; false
     /// ⇒ the entry is skipped (reported, not failed).
     pub condition: Option<String>,
+    /// Optional shell command run on `uninstall`, for entries whose recipe has
+    /// no uninstall steps (e.g. `shell-pipe` / `curl … | bash` installs).
+    pub uninstall: Option<String>,
 }
 
 pub trait EntrySource: Send + Sync {
@@ -486,6 +489,18 @@ async fn uninstall_one(ec: &EngineCtx<'_>, key: &str, opts: RunOpts) -> Result<(
             run_steps(ec.reg, ec.rep, ec.inp, &recipe.uninstall, &ctx, key, false).await?;
         }
     }
+    // Per-entry uninstall command: runs in addition to any recipe uninstall.
+    // For shell-pipe entries (no recipe uninstall) this is the primary cleanup.
+    if let Some(cmd) = &e.uninstall {
+        let mut m = serde_json::Map::new();
+        m.insert("type".into(), serde_json::Value::String("shell".into()));
+        m.insert("script".into(), serde_json::Value::String(cmd.clone()));
+        let step = Step::from_json(m).map_err(|err| EngineError::Config(format!(
+            "entry '{key}' uninstall command is invalid: {err}"
+        )))?;
+        let ctx = build_ctx(key, &serde_json::Map::new(), false)?;
+        run_steps(ec.reg, ec.rep, ec.inp, &[step], &ctx, key, false).await?;
+    }
     // Clear both markers so a later reinstall re-fires install + post_install
     // (verbatim reference-installer registry::uninstall semantics).
     sent.remove(&e.kind, key)?;
@@ -639,6 +654,7 @@ mod tests {
             deps: deps.iter().map(|s| s.to_string()).collect(),
             post_install: vec![],
             condition: None,
+            uninstall: None,
         }
     }
     fn rig() -> (ProcessorRegistry, Arc<Mutex<Vec<String>>>) {
@@ -682,6 +698,7 @@ mod tests {
             deps: vec![],
             post_install: vec![],
             condition: None,
+            uninstall: None,
         }
     }
     fn rig2() -> (ProcessorRegistry, Arc<Mutex<Vec<String>>>) {
@@ -847,6 +864,7 @@ mod tests {
                 deps: vec![],
                 post_install: vec![],
                 condition: None,
+                uninstall: None,
             },
         );
         let d = tempfile::tempdir().unwrap();
@@ -992,6 +1010,7 @@ mod tests {
                 deps: vec![],
                 post_install: vec![],
                 condition: None,
+                uninstall: None,
             },
         );
         let d = tempfile::tempdir().unwrap();
@@ -1042,6 +1061,7 @@ mod tests {
                 deps: vec![],
                 post_install: vec![],
                 condition: None,
+                uninstall: None,
             },
         );
         let src = Src(m);
@@ -1091,6 +1111,7 @@ mod tests {
             deps,
             post_install: vec![],
             condition: None,
+            uninstall: None,
         };
         let mut m = HashMap::new();
         m.insert("dep".to_string(), mk(vec![]));
@@ -1404,5 +1425,132 @@ mod tests {
         )
         .await;
         assert_eq!(s.failed.len(), 1);
+    }
+
+    /// `uninstall` field on an `EntryRef` is executed as a shell step and the
+    /// sentinel is cleared. Uses the builtins registry (real `ShellProcessor`)
+    /// with a no-op command that exits 0 on both Unix (bash) and Windows (PS).
+    #[tokio::test]
+    async fn entry_uninstall_cmd_runs_and_clears_sentinel() {
+        let d = tempfile::tempdir().unwrap();
+        let proof = d.path().join("uninstall_ran");
+        // Cross-platform: write a file as proof the shell command ran.
+        // bash: `touch <path>`; PowerShell: `New-Item -Force -ItemType File '<path>'`
+        let cmd = if cfg!(unix) {
+            format!("touch \"{}\"", proof.display())
+        } else {
+            format!(
+                "New-Item -Force -ItemType File '{}' | Out-Null",
+                proof.display()
+            )
+        };
+        let reg = crate::processors::builtins(&crate::config::Settings::default());
+        let mut m: HashMap<String, EntryRef> = HashMap::new();
+        // Install via inline steps (sentinel_meta avoids real subprocess).
+        let install_step = Step::from_json({
+            let mut mm = serde_json::Map::new();
+            mm.insert("type".into(), serde_json::Value::String("sentinel_meta".into()));
+            mm
+        })
+        .unwrap();
+        m.insert(
+            "k".to_string(),
+            EntryRef {
+                kind: "tools".into(),
+                spec: None,
+                steps: Some(vec![install_step]),
+                deps: vec![],
+                post_install: vec![],
+                condition: None,
+                uninstall: Some(cmd),
+            },
+        );
+        let sent = Sentinel::with_base(d.path().into());
+        // Install first.
+        let is = install_many(
+            &Src(m.clone()),
+            &cfg(),
+            &reg,
+            &NullReporter,
+            &EnvResolver,
+            &sent,
+            &["k".into()],
+        )
+        .await;
+        assert_eq!(is.completed, vec!["k"], "install must succeed: {:?}", is.failed);
+        assert!(sent.is_installed("tools", "k"));
+
+        // Uninstall: per-entry shell command should run, then sentinel cleared.
+        let us = uninstall_many(
+            &Src(m),
+            &cfg(),
+            &reg,
+            &NullReporter,
+            &EnvResolver,
+            &sent,
+            &["k".into()],
+        )
+        .await;
+        assert_eq!(us.completed, vec!["k"], "uninstall must succeed: {:?}", us.failed);
+        assert!(!sent.is_installed("tools", "k"), "sentinel must be cleared after uninstall");
+        assert!(proof.exists(), "per-entry uninstall shell command must have run (proof file absent)");
+    }
+
+    /// A failing per-entry uninstall command surfaces as a per-key error, just
+    /// like a failing recipe uninstall step.
+    #[tokio::test]
+    async fn entry_uninstall_cmd_failure_propagates_error() {
+        let d = tempfile::tempdir().unwrap();
+        let reg = crate::processors::builtins(&crate::config::Settings::default());
+        let mut m: HashMap<String, EntryRef> = HashMap::new();
+        let install_step = Step::from_json({
+            let mut mm = serde_json::Map::new();
+            mm.insert("type".into(), serde_json::Value::String("sentinel_meta".into()));
+            mm
+        })
+        .unwrap();
+        // A command that always fails on both Unix and Windows.
+        let failing_cmd = if cfg!(unix) {
+            "exit 1".to_string()
+        } else {
+            "exit 1".to_string()
+        };
+        m.insert(
+            "k".to_string(),
+            EntryRef {
+                kind: "tools".into(),
+                spec: None,
+                steps: Some(vec![install_step]),
+                deps: vec![],
+                post_install: vec![],
+                condition: None,
+                uninstall: Some(failing_cmd),
+            },
+        );
+        let sent = Sentinel::with_base(d.path().into());
+        let is = install_many(
+            &Src(m.clone()),
+            &cfg(),
+            &reg,
+            &NullReporter,
+            &EnvResolver,
+            &sent,
+            &["k".into()],
+        )
+        .await;
+        assert_eq!(is.completed, vec!["k"]);
+
+        let us = uninstall_many(
+            &Src(m),
+            &cfg(),
+            &reg,
+            &NullReporter,
+            &EnvResolver,
+            &sent,
+            &["k".into()],
+        )
+        .await;
+        assert_eq!(us.failed.len(), 1, "failing uninstall command must be an error");
+        assert_eq!(us.completed, Vec::<String>::new(), "key must not be in completed when uninstall fails");
     }
 }
