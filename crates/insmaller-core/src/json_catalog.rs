@@ -57,6 +57,10 @@ struct RawEntry {
     description: Option<String>,
     #[serde(default)]
     default: bool,
+    /// Optional shell command run by `uninstall`, for entries whose install
+    /// recipe has no uninstall — e.g. `curl … | bash` installs.
+    #[serde(default)]
+    uninstall: Option<String>,
 }
 
 #[derive(Debug)]
@@ -73,6 +77,9 @@ pub struct CatalogEntry {
     pub name: Option<String>,
     pub description: Option<String>,
     pub default: bool,
+    /// Optional shell command run by `uninstall`, for entries whose install
+    /// recipe has no uninstall — e.g. `curl … | bash` installs.
+    pub uninstall: Option<String>,
 }
 
 /// A selectable catalog option for the wizard (kind = cli/tools/plugins).
@@ -145,6 +152,7 @@ fn resolve(raw: RawEntry, kind: &'static str) -> crate::Result<CatalogEntry> {
         name: raw.name,
         description: raw.description,
         default: raw.default,
+        uninstall: raw.uninstall,
     })
 }
 
@@ -255,6 +263,7 @@ impl EntrySource for Catalog {
             deps: e.deps.clone(),
             post_install: e.post_install.clone(),
             condition: e.condition.clone(),
+            uninstall: e.uninstall.clone(),
         })
     }
 }
@@ -488,5 +497,28 @@ mod tests {
         let steps = cat.entry("t").unwrap().steps.unwrap();
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].kind, "check_command");
+    }
+
+    #[test]
+    fn uninstall_field_round_trips_through_entry_ref() {
+        let cat = Catalog::from_json_str(
+            r#"{ "clis":[{"key":"claude","install":"curl-pipe:x",
+                 "uninstall":"rm -f \"$HOME/.local/bin/claude\""}]}"#,
+        )
+        .unwrap();
+        let e = cat.entry("claude").unwrap();
+        assert_eq!(
+            e.uninstall.as_deref(),
+            Some("rm -f \"$HOME/.local/bin/claude\"")
+        );
+    }
+
+    #[test]
+    fn uninstall_absent_defaults_to_none() {
+        let cat = Catalog::from_json_str(
+            r#"{ "clis":[{"key":"tool","install":"npm:x"}]}"#,
+        )
+        .unwrap();
+        assert!(cat.entry("tool").unwrap().uninstall.is_none());
     }
 }
