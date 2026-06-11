@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.15.0] - 2026-06-11
+
+### Added
+- **Field `label`.** A `[[page.field]]` (and a catalog `requires_input` entry)
+  may declare a concise `label` for display in the review page, the post-setup
+  "Answers:" summary, and the TUI question header. Display precedence is
+  `label` → `prompt` → `id`, so a field keeps a verbose input `prompt` while
+  reading cleanly in summaries. Previously a `single_select` without a `prompt`
+  surfaced its raw variable id (e.g. `CODETAINYRRR_RUNTIME = podman`); it now
+  shows `Container runtime = podman`. The inline input header still prefers
+  `prompt` (its hint text), falling back to `label` then `id`.
+
+### Fixed
+- README test-count badge corrected to the actual `cargo test --workspace`
+  total (546); the manually-tracked count had drifted upward across releases.
+
 ## [0.14.0] - 2026-06-10
 
 ### Added

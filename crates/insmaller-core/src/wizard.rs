@@ -713,6 +713,12 @@ pub struct Field {
     pub field_type: FieldType,
     #[serde(default)]
     pub prompt: Option<String>,
+    /// Concise display name for summaries/review (review page + the post-setup
+    /// "Answers:" list + the TUI question header). Falls back to `prompt`, then
+    /// `id`. Lets a field keep a verbose input `prompt` while reading cleanly in
+    /// summaries.
+    #[serde(default)]
+    pub label: Option<String>,
     #[serde(default)]
     pub default: Option<String>,
     #[serde(default = "default_true")]
@@ -740,6 +746,17 @@ pub struct Field {
     pub validate: Validate,
 }
 
+impl Field {
+    /// Display name for summaries, the review page, and the TUI question
+    /// header: `label` → `prompt` → `id`.
+    pub fn display_label(&self) -> &str {
+        self.label
+            .as_deref()
+            .or(self.prompt.as_deref())
+            .unwrap_or(&self.id)
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -765,6 +782,8 @@ pub struct InputDecl {
     #[serde(default)]
     pub condition: Option<String>,
     #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
     pub assert: Option<String>,
     #[serde(default)]
     pub assert_error: Option<String>,
@@ -780,6 +799,7 @@ impl InputDecl {
             id: self.id.clone(),
             field_type: self.r#type,
             prompt: self.prompt.clone(),
+            label: self.label.clone(),
             default: self.default.clone(),
             required: self.required,
             source: None,
@@ -1830,7 +1850,12 @@ impl<'a> WizardSession<'a> {
                             continue;
                         }
                         let Some(v) = self.vars.get(&decl.id) else { continue };
-                        let label = decl.prompt.as_deref().unwrap_or(&decl.id).to_string();
+                        let label = decl
+                            .label
+                            .as_deref()
+                            .or(decl.prompt.as_deref())
+                            .unwrap_or(&decl.id)
+                            .to_string();
                         let display = if decl.r#type == FieldType::Secret {
                             if v.as_str().map(|s| !s.is_empty()).unwrap_or(false) {
                                 "\u{2022}\u{2022}\u{2022}\u{2022}".to_string()
@@ -1847,7 +1872,7 @@ impl<'a> WizardSession<'a> {
                         continue;
                     }
                     let Some(v) = self.vars.get(&f.id) else { continue };
-                    let label = f.prompt.as_deref().unwrap_or(&f.id).to_string();
+                    let label = f.display_label().to_string();
                     let display = if f.field_type == FieldType::Secret {
                         if v.as_str().map(|s| !s.is_empty()).unwrap_or(false) {
                             "\u{2022}\u{2022}\u{2022}\u{2022}".to_string()
@@ -2188,6 +2213,7 @@ mod tests {
             id: "x".into(),
             field_type: FieldType::Multiselect,
             prompt: None,
+            label: None,
             default: None,
             required: false,
             source: Some("catalog.clis".into()),
@@ -2211,6 +2237,7 @@ mod tests {
             id: "x".into(),
             field_type: FieldType::Multiselect,
             prompt: None,
+            label: None,
             default: None,
             required: false,
             source: Some("catalog.clis".into()),
@@ -3435,6 +3462,7 @@ max = "2027-12-31"
             id: id.into(),
             field_type: FieldType::Text,
             prompt: Some(prompt.into()),
+            label: None,
             default: None,
             required: false,
             source: None,
@@ -3488,6 +3516,7 @@ max = "2027-12-31"
             id: "x".into(),
             field_type: FieldType::Text,
             prompt: None,
+            label: None,
             default: None,
             required: false,
             source: None,
@@ -3498,6 +3527,27 @@ max = "2027-12-31"
             validate: Validate::default(),
         };
         assert!(check_field_assert(&f, &Map::new()).is_ok());
+    }
+
+    #[test]
+    fn display_label_precedence_label_then_prompt_then_id() {
+        let mk = |label: Option<&str>, prompt: Option<&str>| Field {
+            id: "RUNTIME".into(),
+            field_type: FieldType::SingleSelect,
+            prompt: prompt.map(Into::into),
+            label: label.map(Into::into),
+            default: None,
+            required: false,
+            source: None,
+            options: vec![],
+            condition: None,
+            assert: None,
+            assert_error: None,
+            validate: Validate::default(),
+        };
+        assert_eq!(mk(Some("Container runtime"), Some("Pick:")).display_label(), "Container runtime");
+        assert_eq!(mk(None, Some("Pick a runtime:")).display_label(), "Pick a runtime:");
+        assert_eq!(mk(None, None).display_label(), "RUNTIME");
     }
 
     // ── run_wizard end-to-end with assert ────────────────────────────────────
@@ -3748,6 +3798,7 @@ max = "2027-12-31"
             id: "CONTAINER_NAME".into(),
             field_type: FieldType::SingleSelect,
             prompt: None,
+            label: None,
             default: None,
             required: false,
             source: Some(source.to_owned()),

@@ -783,13 +783,29 @@ async fn cmd_setup(a: &[String], name: &str) -> ExitCode {
     }
 
     if !outcome.vars.is_empty() {
+        // Map each var id to its display label (label → prompt → id) so the
+        // summary reads "Container runtime = podman", not the raw env-var key.
+        let mut labels: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for f in wiz.pages.iter().flat_map(|p| p.fields.iter()) {
+            labels.insert(f.id.clone(), f.display_label().to_string());
+        }
+        for decl in cat.required_inputs(&outcome.selected_keys) {
+            let label = decl
+                .label
+                .as_deref()
+                .or(decl.prompt.as_deref())
+                .unwrap_or(&decl.id)
+                .to_string();
+            labels.entry(decl.id.clone()).or_insert(label);
+        }
         println!("Answers:");
         let mut keys: Vec<&String> = outcome.vars.keys().collect();
         keys.sort();
         for k in keys {
             if let Some(v) = outcome.vars.get(k) {
                 let display = format_answer_value(v, secret_ids.contains(k));
-                println!("  {k} = {display}");
+                let label = labels.get(k).map(|s| s.as_str()).unwrap_or(k.as_str());
+                println!("  {label} = {display}");
             }
         }
     }
