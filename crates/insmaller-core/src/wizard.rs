@@ -730,6 +730,17 @@ pub struct Field {
     /// Static options (alternative to `source`).
     #[serde(default)]
     pub options: Vec<String>,
+    /// Optional display labels for `options`, aligned by index. A missing or
+    /// short list falls back to the raw option value. Lets a `single_select`
+    /// show "Create a new container" while storing the value "new".
+    #[serde(default)]
+    pub option_labels: Option<Vec<String>>,
+    /// A transient field drives wizard navigation/conditions only — it is
+    /// excluded from the review page, the post-setup "Answers:" summary, and the
+    /// `setup_output` file (and dropped from the answers handed to a follow-up
+    /// `setup_then_task`). Use for control flags like a new/edit mode selector.
+    #[serde(default)]
+    pub transient: bool,
     #[serde(default)]
     pub condition: Option<String>,
     /// Cross-field assertion expression, e.g. `${end} >= ${start}`. Both
@@ -804,6 +815,8 @@ impl InputDecl {
             required: self.required,
             source: None,
             options: Vec::new(),
+            option_labels: None,
+            transient: false,
             condition: None,
             assert: self.assert.clone(),
             assert_error: self.assert_error.clone(),
@@ -1369,9 +1382,15 @@ pub fn choices_for_vars(
     field
         .options
         .iter()
-        .map(|v| Choice {
+        .enumerate()
+        .map(|(i, v)| Choice {
             value: v.clone(),
-            label: v.clone(),
+            label: field
+                .option_labels
+                .as_ref()
+                .and_then(|labels| labels.get(i))
+                .cloned()
+                .unwrap_or_else(|| v.clone()),
             default: false,
             group: None,
         })
@@ -1868,6 +1887,9 @@ impl<'a> WizardSession<'a> {
                         out.push((label, display));
                     }
                 } else {
+                    if f.transient {
+                        continue;
+                    }
                     if !seen.insert(f.id.clone()) {
                         continue;
                     }
@@ -2214,6 +2236,8 @@ mod tests {
             field_type: FieldType::Multiselect,
             prompt: None,
             label: None,
+            option_labels: None,
+            transient: false,
             default: None,
             required: false,
             source: Some("catalog.clis".into()),
@@ -2238,6 +2262,8 @@ mod tests {
             field_type: FieldType::Multiselect,
             prompt: None,
             label: None,
+            option_labels: None,
+            transient: false,
             default: None,
             required: false,
             source: Some("catalog.clis".into()),
@@ -3463,6 +3489,8 @@ max = "2027-12-31"
             field_type: FieldType::Text,
             prompt: Some(prompt.into()),
             label: None,
+            option_labels: None,
+            transient: false,
             default: None,
             required: false,
             source: None,
@@ -3517,6 +3545,8 @@ max = "2027-12-31"
             field_type: FieldType::Text,
             prompt: None,
             label: None,
+            option_labels: None,
+            transient: false,
             default: None,
             required: false,
             source: None,
@@ -3536,6 +3566,8 @@ max = "2027-12-31"
             field_type: FieldType::SingleSelect,
             prompt: prompt.map(Into::into),
             label: label.map(Into::into),
+            option_labels: None,
+            transient: false,
             default: None,
             required: false,
             source: None,
@@ -3548,6 +3580,59 @@ max = "2027-12-31"
         assert_eq!(mk(Some("Container runtime"), Some("Pick:")).display_label(), "Container runtime");
         assert_eq!(mk(None, Some("Pick a runtime:")).display_label(), "Pick a runtime:");
         assert_eq!(mk(None, None).display_label(), "RUNTIME");
+    }
+
+    #[test]
+    fn option_labels_drive_choice_display() {
+        let wiz = WizardDef::from_str(
+            r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "MODE"
+            type = "single_select"
+            options = ["new", "edit"]
+            option_labels = ["Create a new container", "Edit an existing container"]
+            "#,
+        )
+        .unwrap();
+        let c = Catalog::from_json_str(r#"{"clis":[]}"#).unwrap();
+        let field = &wiz.pages[0].fields[0];
+        let choices = choices_for_vars(field, &c, &Map::new(), &[]);
+        assert_eq!(choices[0].value, "new");
+        assert_eq!(choices[0].label, "Create a new container");
+        assert_eq!(choices[1].value, "edit");
+        assert_eq!(choices[1].label, "Edit an existing container");
+    }
+
+    #[test]
+    fn transient_field_excluded_from_summary() {
+        let wiz = WizardDef::from_str(
+            r#"
+            [[page]]
+            id = "p"
+            [[page.field]]
+            id = "MODE"
+            type = "single_select"
+            options = ["new", "edit"]
+            transient = true
+            [[page.field]]
+            id = "NAME"
+            type = "text"
+            label = "Container name"
+            "#,
+        )
+        .unwrap();
+        let c = Catalog::from_json_str(r#"{"clis":[]}"#).unwrap();
+        let mut s = WizardSession::new(&wiz, &c, vec![]);
+        s.vars.insert("MODE".into(), Value::String("new".into()));
+        s.vars.insert("NAME".into(), Value::String("devbox".into()));
+        let rows = s.summary_rows();
+        assert!(rows.iter().any(|(l, v)| l == "Container name" && v == "devbox"));
+        assert!(
+            !rows.iter().any(|(l, v)| l == "MODE" || v == "new"),
+            "transient field must not appear in the summary"
+        );
     }
 
     // ── run_wizard end-to-end with assert ────────────────────────────────────
@@ -3799,6 +3884,8 @@ max = "2027-12-31"
             field_type: FieldType::SingleSelect,
             prompt: None,
             label: None,
+            option_labels: None,
+            transient: false,
             default: None,
             required: false,
             source: Some(source.to_owned()),

@@ -656,7 +656,7 @@ async fn cmd_setup(a: &[String], name: &str) -> ExitCode {
     let palette = theme::Palette::resolve(&cfg.settings);
     let no_api_validate = has(a, "--no-api-validate");
     let unattended = has(a, "--answers") || !std::io::stdin().is_terminal();
-    let (outcome, tui_used, final_defaults_map): (
+    let (mut outcome, tui_used, final_defaults_map): (
         WizardOutcome,
         bool,
         std::collections::HashMap<String, String>,
@@ -711,6 +711,23 @@ async fn cmd_setup(a: &[String], name: &str) -> ExitCode {
             }
         }
     };
+
+    // Drop transient fields (wizard navigation/control flags like a new/edit
+    // mode selector). They drove conditions during the wizard but must not be
+    // seeded into the env, written to setup_output, shown in the summary, or
+    // handed to a follow-up setup_then_task.
+    {
+        let transient_ids: std::collections::HashSet<&str> = wiz
+            .pages
+            .iter()
+            .flat_map(|p| p.fields.iter())
+            .filter(|f| f.transient)
+            .map(|f| f.id.as_str())
+            .collect();
+        if !transient_ids.is_empty() {
+            outcome.vars.retain(|k, _| !transient_ids.contains(k.as_str()));
+        }
+    }
 
     // Seed scalar answers into the env so prompt/save_input/EnvResolver use
     // them, then install the selected keys.
