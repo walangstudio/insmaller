@@ -1359,7 +1359,7 @@ pub fn run_wizard_tui(
                     let head = format!(
                         "{} {}",
                         if focused { "▶" } else { " " },
-                        f.prompt.as_deref().unwrap_or(&f.id)
+                        f.prompt.as_deref().or(f.label.as_deref()).unwrap_or(&f.id)
                     );
                     items.push(ListItem::new(Span::styled(
                         head,
@@ -2750,7 +2750,7 @@ mod tests {
     #[test]
     fn dropdown_filter_selects_correct_original_index() {
         // choices[0]="alpha", choices[1]="beta", choices[2]="alphabet"
-        let choices = vec!["alpha".to_string(), "beta".to_string(), "alphabet".to_string()];
+        let choices = ["alpha".to_string(), "beta".to_string(), "alphabet".to_string()];
         let filter = "bet".to_string();
 
         // The filtered list in order: only "beta" (index 1) and potentially
@@ -2774,7 +2774,7 @@ mod tests {
     #[test]
     fn dropdown_filter_empty_result_keeps_popup_open() {
         // If no choices match, `filtered.is_empty()` → popup stays open.
-        let choices = vec!["alpha".to_string(), "beta".to_string()];
+        let choices = ["alpha".to_string(), "beta".to_string()];
         let filter = "zzz".to_string();
         let filtered: Vec<usize> = choices
             .iter()
@@ -3441,6 +3441,7 @@ mod tests {
             id: "go_live".to_string(),
             field_type: FieldType::Date,
             prompt: Some("Go-live date".to_string()),
+            label: None,
             default: None, required: true, source: None,
             options: vec![], condition: None,
             assert: None, assert_error: None,
@@ -3461,7 +3462,7 @@ mod tests {
         use insmaller_core::{Field, FieldType, Validate};
         let field = Field {
             id: "dt".to_string(), field_type: FieldType::Date,
-            prompt: None, default: None, required: false, source: None,
+            prompt: None, label: None, default: None, required: false, source: None,
             options: vec![], condition: None, assert: None, assert_error: None,
             validate: Validate::default(),
         };
@@ -3477,7 +3478,7 @@ mod tests {
         let digits = parse_date_digits("2026-09-15");
         let field = Field {
             id: "dt".to_string(), field_type: FieldType::Date,
-            prompt: None, default: None, required: true, source: None,
+            prompt: None, label: None, default: None, required: true, source: None,
             options: vec![], condition: None, assert: None, assert_error: None,
             validate: Validate::default(),
         };
@@ -3628,6 +3629,7 @@ mod tests {
             id: id.to_string(),
             field_type: insmaller_core::FieldType::Date,
             prompt: Some(id.to_string()),
+            label: None,
             default: None,
             required: false,
             source: None,
@@ -3673,6 +3675,7 @@ mod tests {
             id: "name".to_string(),
             field_type: FieldType::Text,
             prompt: None,
+            label: None,
             default: None,
             required: false,
             source: None,

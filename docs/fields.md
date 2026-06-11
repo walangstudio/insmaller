@@ -20,7 +20,8 @@ Reference for everything a consumer can put in a `wizard.toml` field, a catalog
 |------|------|---------|---------|
 | `id` | string | — | variable name (required) |
 | `type` | see above | — | required |
-| `prompt` | string | id | label shown |
+| `prompt` | string | id | inline input header / hint shown next to the field |
+| `label` | string | prompt→id | concise name for the review page, the post-setup "Answers:" summary, and the question header (precedence `label`→`prompt`→`id`) |
 | `default` | string | — | prefill |
 | `required` | bool | `true` | must be answered |
 | `source` | string | — | `catalog.clis` / `catalog.tools` / `catalog.plugins` (answers are install keys), or `selected.inputs` |
