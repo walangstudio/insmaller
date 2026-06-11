@@ -26,6 +26,8 @@ Reference for everything a consumer can put in a `wizard.toml` field, a catalog
 | `required` | bool | `true` | must be answered |
 | `source` | string | — | `catalog.clis` / `catalog.tools` / `catalog.plugins` (answers are install keys), or `selected.inputs` |
 | `options` | string[] | — | static choices (instead of `source`) |
+| `option_labels` | string[] | — | display labels for `options`, aligned by index; missing/short falls back to the value (show "Create new" / store "new") |
+| `transient` | bool | `false` | drives conditions only; excluded from the review page, the "Answers:" summary, `setup_output`, and `setup_then_task` (use for a new/edit mode flag) |
 | `condition` | expr | — | show the field only if the predicate holds |
 
 ## Validators (text / secret / path fields)

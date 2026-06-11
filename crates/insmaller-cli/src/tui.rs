@@ -3442,6 +3442,8 @@ mod tests {
             field_type: FieldType::Date,
             prompt: Some("Go-live date".to_string()),
             label: None,
+            option_labels: None,
+            transient: false,
             default: None, required: true, source: None,
             options: vec![], condition: None,
             assert: None, assert_error: None,
@@ -3462,7 +3464,7 @@ mod tests {
         use insmaller_core::{Field, FieldType, Validate};
         let field = Field {
             id: "dt".to_string(), field_type: FieldType::Date,
-            prompt: None, label: None, default: None, required: false, source: None,
+            prompt: None, label: None, option_labels: None, transient: false, default: None, required: false, source: None,
             options: vec![], condition: None, assert: None, assert_error: None,
             validate: Validate::default(),
         };
@@ -3478,7 +3480,7 @@ mod tests {
         let digits = parse_date_digits("2026-09-15");
         let field = Field {
             id: "dt".to_string(), field_type: FieldType::Date,
-            prompt: None, label: None, default: None, required: true, source: None,
+            prompt: None, label: None, option_labels: None, transient: false, default: None, required: true, source: None,
             options: vec![], condition: None, assert: None, assert_error: None,
             validate: Validate::default(),
         };
@@ -3630,6 +3632,8 @@ mod tests {
             field_type: insmaller_core::FieldType::Date,
             prompt: Some(id.to_string()),
             label: None,
+            option_labels: None,
+            transient: false,
             default: None,
             required: false,
             source: None,
@@ -3676,6 +3680,8 @@ mod tests {
             field_type: FieldType::Text,
             prompt: None,
             label: None,
+            option_labels: None,
+            transient: false,
             default: None,
             required: false,
             source: None,

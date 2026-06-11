@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.16.0] - 2026-06-11
+
+### Added
+- **Field `option_labels`.** A `single_select`/`dropdown`/`multiselect` field
+  with static `options` may declare an index-aligned `option_labels` list so the
+  radio shows a friendly label (e.g. "Create a new container") while storing the
+  raw value ("new"). A missing/short list falls back to the option value.
+- **Field `transient`.** A field marked `transient = true` drives wizard
+  navigation/conditions only — it is excluded from the review page, the
+  post-setup "Answers:" summary, the `setup_output` file, AND the answers handed
+  to a follow-up `setup_then_task` (and is never seeded into the process env).
+  Use it for control flags like a new/edit mode selector.
+
+### Fixed
+- README test-count badge set to **576** — the full `cargo test --workspace`
+  passing total. The v0.15.0 figure (546) was an undercount: a timing-sensitive
+  integration test had aborted the remaining test binaries during the local
+  count, so the original ~573 was essentially correct all along.
+
 ## [0.15.0] - 2026-06-11
 
 ### Added
@@ -17,8 +36,9 @@ All notable changes to this project are documented here. The format follows
   `prompt` (its hint text), falling back to `label` then `id`.
 
 ### Fixed
-- README test-count badge corrected to the actual `cargo test --workspace`
-  total (546); the manually-tracked count had drifted upward across releases.
+- README test-count badge set to 546. (Superseded in 0.16.0: this was an
+  undercount — a flaky timing test aborted the integration suites mid-count;
+  the true total is 576.)
 
 ## [0.14.0] - 2026-06-10
 
